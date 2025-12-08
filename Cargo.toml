@@ -1,0 +1,17 @@
+[package]
+name = "ubq"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+atomic_list = "1.7.0"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
+async-channel = "1.9"
+crossbeam-channel = "0.5"
+
+[[bench]]
+name = "ubq_perf"
+harness = false
