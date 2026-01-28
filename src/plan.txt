@@ -1,0 +1,128 @@
+UBQ FULL FUNCTIONING (from src/ubq.rs + src/block.rs)
+====================================================
+
+High-level shape
+----------------
+- UBQ is a lock-free queue built from a linked list of fixed-size blocks.
+- Two shared cursors drive progress:
+  - phead: producer cursor (where pushes try to allocate a slot).
+  - chead: consumer cursor (where pops try to reserve a slot).
+- The list is managed by atomic_list::sync::Node + cursor::Cursor so clones
+  share the same atomic position for each head.
+
+Example list (logical):
+  [Block0] <-> [Block1] <-> [Block2]
+   ^phead                    ^chead
+
+Invariants / bounds
+-------------------
+- bounds.min blocks are allocated on startup; bounds.max is the cap.
+- UBQ maintains at least one block at all times (min >= 1).
+- currently_allocated tracks how many blocks exist.
+- default_block_size is used when new blocks are created.
+
+Block internals
+---------------
+Each Block<T> owns:
+- array: fixed-size Box<[UnsafeCell<MaybeUninit<T>>]>
+- pcon (producer control) and ccon (consumer control), each with:
+  - take: reservation counter (claiming a slot)
+  - give: completion counter (commit/release)
+
+WrappedU64 encoding (in a single AtomicU64):
+  [bits:8][version:(56-bits)][index:bits]
+  - bits determines index width (derived from capacity = len + max_access).
+  - version increments when the counter wraps back to index 0.
+
+Purpose of max_access:
+- max_access is the maximum number of concurrent threads that can call
+  allocate/reserve at once (per block).
+- Block capacity for indexing is len + max_access to avoid overflow while
+  threads are reserving.
+- When max_access grows/shrinks across clones, the top "bits" field may need
+  to expand/contract; Block::maybe_double_max_access / maybe_halve_max_access
+  handle that when len + max_access hits a power-of-two boundary.
+
+Initialization (UBQ::new)
+--------------------------
+1) Build a Node<Block<T>> list with bounds.min blocks of default_block_size.
+2) phead and chead cursors both start at the same initial node.
+3) Set max_access = 1, currently_allocated = bounds.min.
+4) Store bounds and default_block_size.
+
+Producer path (UBQ::push)
+-------------------------
+Loop:
+1) Reload phead to catch up with other producers.
+2) Try to allocate a slot in the current phead block:
+   - Block::allocate() uses pcon.take.fetch_update to bump index.
+   - On success it returns UninitRes; writing the value, then dropping the
+     reservation increments pcon.give (commit).
+3) If allocation failed (block full):
+   a) Peek the next block in the list:
+      - If next is NOT "focus of consumers", or if it is completely new,
+        then advance phead (incr_phead) and try again.
+      - If next IS focus of consumers and NOT completely new, attempt to
+        allocate a new block (respecting bounds.max).
+   b) Block allocation:
+      - currently_allocated.fetch_update increments count if <= bounds.max.
+      - New block is inserted before the consumer focus using
+        phead.push_before(Block::is_focus_of_consumers).
+      - If insertion succeeds, advance phead so producers write into the new
+        block immediately.
+      - If insertion fails, cache the unused block for reuse later.
+   c) If bounds.max is reached, return PushErr::BlockAllocBoundsReached.
+   d) If the list is gone (peek == None), return PushErr::ListHasBeenDeallocated.
+
+Consumer path (UBQ::pop)
+------------------------
+Loop:
+1) Reload chead to catch up with other consumers.
+2) Try to reserve a slot in the current chead block:
+   - Block::reserve() checks that:
+     - ccon.take index is not past len (else BlockDone).
+     - pcon.give has advanced to the same version (else NoEntry).
+     - committed index != reserved index (else NoEntry).
+     - if committed index != len, then pcon.take == pcon.give
+       (else NotAvailable: producer reserved but not committed).
+     - if it can claim, it bumps ccon.take and returns InitRes.
+   - Reading the value and dropping InitRes increments ccon.give (release).
+3) Error handling:
+   - NoEntry -> PopErr::Empty (nothing to read in this block).
+   - NotAvailable -> PopErr::Busy (producer still committing).
+   - BlockDone -> advance chead (incr_chead) and try the next block.
+
+Block rotation and versioning
+-----------------------------
+- incr_phead:
+  - Cursor::increment moves the shared producer cursor to the next block.
+  - reset_pcon may bump producer version if consumers have advanced.
+- incr_chead:
+  - Cursor::increment moves the shared consumer cursor to the next block.
+  - reset_ccon may bump consumer version once the block is fully consumed.
+- Version bumps prevent ABA and let a block be reused after wraparound.
+
+Clone / Drop behavior
+---------------------
+- Clone:
+  - max_access is incremented.
+  - All blocks update their counters' index bit-width if needed.
+  - phead/chead cursors and counters are shared across clones.
+- Drop:
+  - max_access is decremented.
+  - When it reaches zero, UBQ frees the shared atomics and bounds.
+
+Key error semantics
+-------------------
+- push -> Ok(()) if a slot was reserved and committed.
+- push -> Err((val, BlockAllocBoundsReached)) if bounds.max hit.
+- push -> Err((val, ListHasBeenDeallocated)) if list is gone.
+- pop -> Ok(T) if a committed value was reserved and read.
+- pop -> Err(Empty) if no committed entries exist in the current block.
+- pop -> Err(Busy) if a producer reserved a slot but has not committed yet.
+
+One-line flow summary
+---------------------
+UBQ = linked blocks + two shared cursors; producers reserve/commit via pcon,
+consumers reserve/release via ccon, and the list grows (within bounds) when
+producers reach consumer-focused blocks.
