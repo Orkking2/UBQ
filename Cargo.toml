@@ -6,7 +6,6 @@ description = "Lock-free queue built from linked blocks for concurrent producers
 license = "MIT"
 
 [dependencies]
-atomic_list = "2.0.0"
 crossbeam-utils = "0.8.21"
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
 
@@ -26,8 +25,10 @@ flume = "0.12"
 env_logger = "0.11"
 rand = "0.8"
 paste = "1.0"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [[bench]]
-name = "ubq_perf"
+name = "ubq_bench"
 harness = false
+

@@ -89,12 +89,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomic_list"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdbea342e8d2ac0a8c6b4ace4b7a9467071dff364ae3ceaa17c555ee563c55fe"
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -789,7 +783,6 @@ name = "ubq"
 version = "1.0.0"
 dependencies = [
  "async-channel",
- "atomic_list",
  "criterion",
  "crossbeam-channel",
  "crossbeam-utils",
@@ -798,6 +791,7 @@ dependencies = [
  "log",
  "paste",
  "rand",
+ "serde",
  "serde_json",
  "tokio",
 ]
