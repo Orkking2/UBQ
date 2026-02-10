@@ -3,9 +3,11 @@ use crossbeam_utils::{Backoff, CachePadded};
 use std::{
     alloc::{Layout, alloc_zeroed, handle_alloc_error},
     cell::UnsafeCell,
+    fmt::{Debug, Write},
     mem::MaybeUninit,
+    num::NonZeroUsize,
     ptr::NonNull,
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence},
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
 /// The maximum number of threads that can increment allocated
@@ -19,18 +21,54 @@ pub struct UBQ<T> {
     chead: Head<T>,
 }
 
+impl<T> Debug for UBQ<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let original = self.phead.load().1;
+        let chead = self.chead.load().1;
+
+        let mut out_str = String::new();
+        writeln!(out_str, "\tphead: {:p}", original)?;
+        writeln!(out_str, "\tchead: {:p}", chead)?;
+
+        let mut current = unsafe { original.as_ref() };
+        writeln!(out_str, "\tblocks: [")?;
+        loop {
+            let allocated = Cursor::from_raw(current.allocated.load(Ordering::Relaxed));
+            let committed = Cursor::from_raw(current.committed.load(Ordering::Relaxed));
+            let reserved = Cursor::from_raw(current.reserved.load(Ordering::Relaxed));
+            let consumed = Cursor::from_raw(current.consumed.load(Ordering::Relaxed));
+
+            writeln!(
+                out_str,
+                "\t\t{:p} ACRC {allocated}, {committed}, {reserved}, {consumed}",
+                current as *const Block<T>
+            )?;
+
+            let next = unsafe { NonNull::new_unchecked(current.next.load(Ordering::Relaxed)) };
+
+            if next == original {
+                break;
+            }
+
+            current = unsafe { next.as_ref() }
+        }
+        writeln!(out_str, "\t]")?;
+
+        write!(f, "UBQ {{\n{out_str}}}")
+    }
+}
+
 impl<T> Drop for UBQ<T> {
     fn drop(&mut self) {
+        // SAFETY: self.copies is created by Box::into_raw
         let left = unsafe { self.copies.as_ref() }.fetch_sub(1, Ordering::Relaxed);
 
         if left == 1 {
             // We are the last UBQ being dropped
             let (_, original) = self.phead.load();
 
-            for head in [&mut self.phead, &mut self.chead] {
-                // SAFETY: We are the last UBQ being dropped
-                unsafe { head.destroy() };
-            }
+            unsafe { self.phead.destroy() };
+            unsafe { self.chead.destroy() };
 
             let mut cur = original;
 
@@ -77,7 +115,7 @@ enum PushState<T> {
         #[cfg(test)]
         slot: usize,
     },
-    GotoNext {
+    Goto {
         next: NonNull<Block<T>>,
         version: usize,
         #[cfg(test)]
@@ -98,7 +136,7 @@ enum PopState<T> {
         #[cfg(test)]
         slot: usize,
     },
-    GotoNext {
+    Goto {
         e: T,
         next: NonNull<Block<T>>,
         version: usize,
@@ -128,19 +166,27 @@ impl<T> UBQ<T> {
         '_outer: loop {
             // SAFETY: e_opt is always Some(e) when entering 'outer
             match Self::push_to(phead, version, unsafe { e_opt.take().unwrap_unchecked() }) {
-                PushState::Success { .. } => return,
-                PushState::GotoNext { version, next, .. } => {
-                    self.phead.store(version, next);
-                    return;
-                }
                 PushState::Reload { e } => {
-                    backoff.snooze();
-
-                    (version, phead) = self.phead.load();
                     e_opt = Some(e);
+
+                    '_inner: loop {
+                        let (new_version, new_phead) = self.phead.load();
+
+                        if version != new_version || phead != new_phead {
+                            (version, phead) = (new_version, new_phead);
+                            break;
+                        }
+
+                        backoff.snooze();
+                    }
 
                     continue;
                 }
+                PushState::Goto { version, next, .. } => {
+                    self.phead.store(version, next);
+                    return;
+                }
+                PushState::Success { .. } => return,
             }
         }
     }
@@ -154,8 +200,23 @@ impl<T> UBQ<T> {
         '_outer: loop {
             // SAFETY: e_opt is always Some(e) when entering 'outer
             match Self::push_to(phead, version, unsafe { e_opt.take().unwrap_unchecked() }) {
-                PushState::Success { slot } => return (phead, slot),
-                PushState::GotoNext {
+                PushState::Reload { e } => {
+                    e_opt = Some(e);
+
+                    '_inner: loop {
+                        let (new_version, new_phead) = self.phead.load();
+
+                        if version != new_version || phead != new_phead {
+                            (version, phead) = (new_version, new_phead);
+                            break;
+                        }
+
+                        backoff.snooze();
+                    }
+
+                    continue;
+                }
+                PushState::Goto {
                     version,
                     next,
                     slot,
@@ -163,14 +224,7 @@ impl<T> UBQ<T> {
                     self.phead.store(version, next);
                     return (phead, slot);
                 }
-                PushState::Reload { e } => {
-                    backoff.snooze();
-
-                    (version, phead) = self.phead.load();
-                    e_opt = Some(e);
-
-                    continue;
-                }
+                PushState::Success { slot } => return (phead, slot),
             }
         }
     }
@@ -180,38 +234,48 @@ impl<T> UBQ<T> {
         let this_ref = unsafe { this.as_ref() };
         let allocated = Cursor::from_raw(this_ref.allocated.load(Ordering::Relaxed));
 
-        crate::ubq_log!(
+        crate::log!(
             tag: "push.enter",
-            "block={:p} allocated={} committed={}",
+            "block={:p} allocated={} version={}",
             this,
             allocated,
-            this_ref.committed.load(Ordering::Relaxed)
+            version,
         );
 
-        if allocated.vsn() > version || allocated.off() >= this_ref.len() {
-            // TODO: Fix log -- if allocated.vsn() > version, somehow we have been paused and now have invalid data,
-            // thus we need to reload. If otherwise, this block is fully allocated, we are also out of sync and
-            // should reload.
-            crate::ubq_log!(
-                tag: "push.await_full",
-                "block={:p} allocated={} len={}",
+        if allocated.vsn() > version {
+            crate::log!(
+                tag: "push.reload_stale",
+                "block={:p} allocated={} local_version={} reason=stale_version",
                 this,
                 allocated,
-                this_ref.len()
+                version,
             );
+
+            PushState::Reload { e }
+        } else if allocated.off() >= this_ref.len() {
+            crate::log!(
+                tag: "push.await_full",
+                "block={:p} allocated={} len={} version={} reason=full_block",
+                this,
+                allocated,
+                this_ref.len(),
+                version,
+            );
+
             PushState::Reload { e }
         } else {
-            let old = this_ref.allocated.fetch_add(1, Ordering::Relaxed);
+            let old_allocated =
+                Cursor::from_raw(this_ref.allocated.fetch_add(1, Ordering::Relaxed));
 
-            crate::ubq_log!(
+            crate::log!(
                 tag: "push.allocate",
                 "block={:p} slot={} len={}",
                 this,
-                old,
+                old_allocated,
                 this_ref.len()
             );
 
-            if old >= this_ref.len() {
+            if old_allocated.off() >= this_ref.len() {
                 // The following was commented out because it is not necessary
                 // for allocated to equal committed, if committed is >= BLOCK_CAP
                 //
@@ -219,32 +283,36 @@ impl<T> UBQ<T> {
                 // so we do not need a Release fence here, or any fance at all.
                 // this_ref.committed.fetch_add(1, Ordering::Relaxed);
 
-                crate::ubq_log!(
+                crate::log!(
                     tag: "push.over_alloc",
                     "block={:p} slot={} len={}",
                     this,
-                    old,
+                    old_allocated.off(),
                     this_ref.len()
                 );
 
                 PushState::Reload { e }
             } else {
                 // SAFETY: We reserved this slot when we fetch_add'ed earlier.
-                unsafe { this_ref.array[old].get().write(MaybeUninit::new(e)) };
+                unsafe {
+                    this_ref.array[old_allocated.off()]
+                        .get()
+                        .write(MaybeUninit::new(e))
+                };
                 // Ordering: We need the write above to be visible to any consumers,
                 // so we need at least a Release ordering here.
                 this_ref.committed.fetch_add(1, Ordering::Release);
-                crate::ubq_log!(
+                crate::log!(
                     tag: "push.write",
                     "block={:p} slot={}",
                     this,
-                    old
+                    old_allocated.off(),
                 );
 
                 // Note: We are already synchronized at this point, so we do
                 // not have to worry about our fellow producers contending to
                 // reset next.
-                if old + 1 == this_ref.len() {
+                if old_allocated.off() + 1 == this_ref.len() {
                     let next = this_ref.next.load(Ordering::Acquire);
 
                     // Note: When we have just one block, it will not point anywhere. We also
@@ -255,45 +323,46 @@ impl<T> UBQ<T> {
 
                         this_ref.next.store(new.as_ptr(), Ordering::Release);
 
-                        PushState::GotoNext {
+                        PushState::Goto {
                             next: new,
                             version,
                             #[cfg(test)]
-                            slot: old,
+                            slot: old_allocated.off(),
                         }
                     } else {
-                        match unsafe { next.as_ref().unwrap_unchecked() }.p_reset(version) {
-                            usize::MAX => {
-                                let new = Block::new(unsafe { NonNull::new_unchecked(next) });
-
-                                this_ref.next.store(new.as_ptr(), Ordering::Release);
-
-                                PushState::GotoNext {
-                                    next: new,
-                                    version,
-                                    #[cfg(test)]
-                                    slot: old,
-                                }
-                            }
-                            version => PushState::GotoNext {
+                        if let Some(version) =
+                            unsafe { next.as_ref().unwrap_unchecked() }.reset_p(version)
+                        {
+                            PushState::Goto {
                                 next: unsafe { NonNull::new_unchecked(next) },
+                                version: version.get(),
+                                #[cfg(test)]
+                                slot: old_allocated.off(),
+                            }
+                        } else {
+                            let new = Block::new(unsafe { NonNull::new_unchecked(next) });
+
+                            this_ref.next.store(new.as_ptr(), Ordering::Release);
+
+                            PushState::Goto {
+                                next: new,
                                 version,
                                 #[cfg(test)]
-                                slot: old,
-                            },
+                                slot: old_allocated.off(),
+                            }
                         }
                     }
                 } else {
-                    crate::ubq_log!(
+                    crate::log!(
                         tag: "push.success",
                         "block={:p} slot={}",
                         this,
-                        old
+                        old_allocated.off(),
                     );
                     // We have succeeded, return.
                     PushState::Success {
                         #[cfg(test)]
-                        slot: old,
+                        slot: old_allocated.off(),
                     }
                 }
             }
@@ -306,21 +375,28 @@ impl<T> UBQ<T> {
 
         '_outer: loop {
             match Self::pop_from(chead, version) {
-                PopState::Empty => return None,
-                PopState::Success { e, .. } => return Some(e),
-                PopState::GotoNext {
+                PopState::Reload => {
+                    '_inner: loop {
+                        let (new_version, new_chead) = self.chead.load();
+
+                        if version != new_version || chead != new_chead {
+                            (version, chead) = (new_version, new_chead);
+                            break;
+                        }
+
+                        backoff.snooze();
+                    }
+
+                    continue;
+                }
+                PopState::Goto {
                     e, version, next, ..
                 } => {
                     self.chead.store(version, next);
                     return Some(e);
                 }
-                PopState::Reload => {
-                    backoff.snooze();
-
-                    (version, chead) = self.chead.load();
-
-                    continue;
-                }
+                PopState::Success { e, .. } => return Some(e),
+                PopState::Empty => return None,
             }
         }
     }
@@ -332,9 +408,21 @@ impl<T> UBQ<T> {
 
         '_outer: loop {
             match Self::pop_from(chead, version) {
-                PopState::Empty => return (None, chead, None),
-                PopState::Success { e, slot } => return (Some(e), chead, Some(slot)),
-                PopState::GotoNext {
+                PopState::Reload => {
+                    '_inner: loop {
+                        let (new_version, new_chead) = self.chead.load();
+
+                        if version != new_version || chead != new_chead {
+                            (version, chead) = (new_version, new_chead);
+                            break;
+                        }
+
+                        backoff.snooze();
+                    }
+
+                    continue;
+                }
+                PopState::Goto {
                     e,
                     version,
                     next,
@@ -343,19 +431,21 @@ impl<T> UBQ<T> {
                     self.chead.store(version, next);
                     return (Some(e), chead, Some(slot));
                 }
-                PopState::Reload => {
-                    backoff.snooze();
-
-                    (version, chead) = self.chead.load();
-
-                    continue;
-                }
+                PopState::Success { e, slot } => return (Some(e), chead, Some(slot)),
+                PopState::Empty => return (None, chead, None),
             }
         }
     }
 
     fn pop_from(this: NonNull<Block<T>>, version: usize) -> PopState<T> {
         let backoff = Backoff::new();
+
+        crate::log!(
+            tag: "pop.enter",
+            "block={:p} version={}",
+            this,
+            version,
+        );
 
         loop {
             // SAFETY: `this` is always created from a NonNull::from_ref or Box::into_raw
@@ -372,16 +462,8 @@ impl<T> UBQ<T> {
                 // those writes to be visible when we read it later (if we read it).
                 let committed = Cursor::from_raw(this_ref.committed.load(Ordering::Acquire));
 
-                crate::ubq_log!(
-                    tag: "pop.check",
-                    "block={:p} reserved={} committed={}",
-                    this,
-                    reserved,
-                    committed
-                );
-
                 if committed.off() <= reserved.off() {
-                    crate::ubq_log!(
+                    crate::log!(
                         tag: "pop.empty",
                         "block={:p} reserved={} committed={}",
                         this,
@@ -397,7 +479,7 @@ impl<T> UBQ<T> {
 
                     // Is allocated.off() < committed.off() ever possible?
                     if allocated.off() > /* != */ committed.off() {
-                        crate::ubq_log!(
+                        crate::log!(
                             tag: "pop.wait_commit",
                             "block={:p} allocated={} committed={}",
                             this,
@@ -416,18 +498,21 @@ impl<T> UBQ<T> {
                     Ordering::SeqCst, /* Relaxed */
                 ) == reserved.into_raw()
                 {
-                    crate::ubq_log!(
+                    crate::log!(
                         tag: "pop.reserve",
-                        "block={:p} slot={} committed={}",
-                        this,
-                        reserved,
-                        committed
+                        "block={this:p} slot={reserved} committed={committed}, BLOCK_CAP={BLOCK_CAP}",
                     );
 
                     let e = unsafe { this_ref.array[reserved.off()].get().read().assume_init() };
-                    let consumed = this_ref.consumed.fetch_add(1, Ordering::Release);
+                    let consumed = Cursor::from_raw(this_ref.consumed.fetch_add(1, Ordering::Release));
 
-                    if consumed + 1 == BLOCK_CAP {
+                    if consumed.off() + 1 == BLOCK_CAP {
+                        // We don't actually need to print consumed + 1, as we do know for certain they are equal
+                        crate::log!(
+                            tag: "pop.ilc",
+                            "block={this:p}",
+                        );
+
                         loop {
                             let next = this_ref.next.load(Ordering::Acquire);
 
@@ -436,25 +521,27 @@ impl<T> UBQ<T> {
                                 crate::debug::maybe_flush();
                                 continue;
                             } else {
-                                crate::ubq_log!(
+                                crate::log!(
                                     tag: "pop.goto_next",
                                     "block={:p} next={:p}",
                                     this,
                                     next
                                 );
+
                                 // SAFETY: next is not null
-                                return PopState::GotoNext {
-                                    e,
-                                    version: unsafe { next.as_ref().unwrap_unchecked() }
-                                        .c_reset(version),
-                                    next: unsafe { NonNull::new_unchecked(next) },
-                                    #[cfg(test)]
-                                    slot: reserved.off(),
+                                return unsafe {
+                                    PopState::Goto {
+                                        e,
+                                        version: next.as_ref().unwrap_unchecked().reset_c(version),
+                                        next: NonNull::new_unchecked(next),
+                                        #[cfg(test)]
+                                        slot: reserved.off(),
+                                    }
                                 };
                             }
                         }
                     } else {
-                        crate::ubq_log!(
+                        crate::log!(
                             tag: "pop.success",
                             "block={:p} slot={}",
                             this,
@@ -467,7 +554,7 @@ impl<T> UBQ<T> {
                         };
                     }
                 } else {
-                    crate::ubq_log!(
+                    crate::log!(
                         tag: "pop.reserve_fail",
                         "block={:p} slot={}",
                         this,
@@ -480,7 +567,7 @@ impl<T> UBQ<T> {
             }
 
             // We are not the one that needs to reset next.
-            crate::ubq_log!(
+            crate::log!(
                 tag: "pop.await_next",
                 "block={:p} reserved={}",
                 this,
@@ -570,75 +657,90 @@ impl<T> Block<T> {
     pub fn new(next: NonNull<Self>) -> NonNull<Self> {
         let out = Self::new_zero();
 
-        // if version != 0 {
-        //     for atomic in [&out.allocated, &out.committed, &out.reserved, &out.consumed] {
-        //         atomic.store(
-        //             Cursor::for_version(version).into_raw(),
-        //             Ordering::SeqCst, /* Relaxed */
-        //         );
-        //     }
-        // }
-
         out.next.store(next.as_ptr(), Ordering::Release);
 
         unsafe { NonNull::new_unchecked(Box::into_raw(out)) }
     }
 
-    pub fn p_reset(&self, mut version: usize) -> usize {
+    pub fn reset_p(&self, mut version: usize) -> Option<NonZeroUsize> {
         let consumed = Cursor::from_raw(self.consumed.load(Ordering::Acquire));
         let len = self.len();
 
-        crate::ubq_log!(
-            tag: "reset.attempt",
-            "block={:p} consumed={} len={}",
+        crate::log!(
+            tag: "reset.p.attempt",
+            "block={:p} consumed={} len={} version={} -> {}",
             self as *const Self,
             consumed,
-            len
+            len,
+            version,
+            version.max(consumed.vsn() + 1),
         );
 
         version = version.max(consumed.vsn() + 1);
 
         if consumed.off() >= len {
             for push_atomic in [&self.allocated, &self.committed] {
-                push_atomic.fetch_max(
-                    Cursor::for_version(version).into_raw(),
-                    Ordering::SeqCst, /* Relaxed */
-                );
+                let new = Cursor::for_version(version);
+
+                let maxxed = Cursor::from_raw(
+                    push_atomic.fetch_max(new.into_raw(), Ordering::SeqCst /* Relaxed */),
+                )
+                .max(new);
+
+                if maxxed.off() != 0 {
+                    crate::log!(
+                        tag: "reset.p.atm_max_fail",
+                        "block={:p} maxxed={}",
+                        self as *const Self,
+                        maxxed
+                    );
+
+                    return None;
+                };
             }
 
-            fence(Ordering::SeqCst);
-
-            crate::ubq_log!(
-                tag: "reset.success",
+            crate::log!(
+                tag: "reset.p.success",
                 "block={:p} consumed={} len={}",
                 self as *const Self,
                 consumed,
                 len
             );
 
-            version
+            // SAFETY: version was set above with vsn.max(c_vsn + 1 > 0)
+            Some(unsafe { NonZeroUsize::new_unchecked(version) })
         } else {
-            crate::ubq_log!(
-                tag: "reset.skip",
+            crate::log!(
+                tag: "reset.p.skip",
                 "block={:p} consumed={} len={}",
                 self as *const Self,
                 consumed,
                 len
             );
-            usize::MAX
+
+            None
         }
     }
 
-    pub fn c_reset(&self, version: usize) -> usize {
+    #[allow(unused_variables)]
+    pub fn reset_c(&self, version: usize) -> usize {
         let allocated = Cursor::from_raw(self.allocated.load(Ordering::Acquire));
         let version = version.max(allocated.vsn());
+        let new = Cursor::for_version(version).into_raw();
 
-        for pop_atomic in [&self.reserved, &self.committed] {
-            pop_atomic.fetch_max(
-                Cursor::for_version(version).into_raw(),
-                Ordering::SeqCst, /* Relaxed */
-            );
-        }
+        let reserved = Cursor::from_raw(self.reserved.fetch_max(new, Ordering::Relaxed));
+        let consumed = Cursor::from_raw(self.consumed.fetch_max(new, Ordering::Relaxed));
+
+        let new = Cursor::from_raw(new);
+
+        crate::log!(
+            tag: "reset.c.with",
+            "Alloc: {allocated}, Res: {} -> {}, Cons: {} -> {}",
+            reserved,
+            reserved.max(new),
+            consumed,
+            consumed.max(new),
+        );
 
         version
     }
@@ -656,35 +758,9 @@ mod test {
     use std::sync::{
         Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc,
     };
     use std::thread;
-
-    struct LogGuard {
-        tx: Option<mpsc::Sender<Vec<debug::LogEntry>>>,
-        out_dir: Option<PathBuf>,
-    }
-
-    impl LogGuard {
-        fn new(tx: mpsc::Sender<Vec<debug::LogEntry>>, out_dir: Option<PathBuf>) -> Self {
-            Self {
-                tx: Some(tx),
-                out_dir,
-            }
-        }
-    }
-
-    impl Drop for LogGuard {
-        fn drop(&mut self) {
-            let entries = debug::take();
-            if let Some(dir) = &self.out_dir {
-                let _ = debug::write_to_dir(&entries, dir);
-            }
-            if let Some(tx) = self.tx.take() {
-                let _ = tx.send(entries);
-            }
-        }
-    }
+    use std::time::Duration;
 
     #[allow(dead_code)]
     struct TraceState<T> {
@@ -721,7 +797,7 @@ mod test {
     #[allow(unused_variables)]
     fn log_trace_push(queue: &UBQ<u64>, value: u64, block: NonNull<Block<u64>>, slot: usize) {
         let state = trace_state(queue, block);
-        crate::ubq_log!(
+        crate::log!(
             tag: "test.pop",
             "value={value} block={block:p} slot={slot} alloc={} committed={} reserved={} consumed={} next={:p} phead={:p} vsn={} chead={:p} vsn={}",
             state.allocated,
@@ -739,7 +815,7 @@ mod test {
     #[allow(unused_variables)]
     fn log_trace_pop(queue: &UBQ<u64>, value: u64, block: NonNull<Block<u64>>, slot: usize) {
         let state = trace_state(queue, block);
-        crate::ubq_log!(
+        crate::log!(
             tag: "test.pop",
             "value={value} block={block:p} slot={slot} alloc={} committed={} reserved={} consumed={} next={:p} phead={:p} vsn={} chead={:p} vsn={}",
             state.allocated,
@@ -809,7 +885,7 @@ mod test {
     UBQ_TEST_ITEMS=5000 \
     UBQ_TEST_TRACE_MAX=1024 \
     UBQ_DEBUG_FLUSH_MS=500 \
-    UBQ_DEBUG_DIR=ubq_logs \
+    UBQ_DEBUG_DIR=logs \
     cargo test --features ubq_debug mpmc_integrity_smoke -- --nocapture
          */
 
@@ -845,15 +921,17 @@ mod test {
                 .collect::<Vec<_>>(),
         );
 
-        let (log_tx, log_rx) = mpsc::channel::<Vec<debug::LogEntry>>();
         let log_dir = std::env::var_os("UBQ_DEBUG_DIR").map(PathBuf::from);
-        let _stdout_guard = if let Some(dir) = &log_dir {
+        if let Some(dir) = &log_dir {
             if let Err(err) = debug::prepare_log_dir(dir) {
                 eprintln!(
                     "ubq debug: failed to prepare log dir {}: {err}",
                     dir.display()
                 );
             }
+        }
+        debug::init();
+        let _stdout_guard = if let Some(dir) = &log_dir {
             match debug::capture_stdout(dir) {
                 Ok(guard) => {
                     debug::install_stdout_panic_hook();
@@ -887,21 +965,50 @@ mod test {
         } else {
             None
         };
+        crate::log!(
+            tag: "test.start",
+            "producers={producers} consumers={consumers} items_per_producer={items_per_producer} trace_max={trace_max}"
+        );
         let error_count = Arc::new(AtomicUsize::new(0));
+        let produced_count = Arc::new(AtomicUsize::new(0));
+        let consumed_count = Arc::new(AtomicUsize::new(0));
         let first_error = Arc::new(Mutex::new(None::<String>));
         let start = Arc::new(Barrier::new(producers + consumers + 1));
+        let _progress_log = debug::register(Duration::from_millis(500), {
+            let produced_count = Arc::clone(&produced_count);
+            let consumed_count = Arc::clone(&consumed_count);
+            let error_count = Arc::clone(&error_count);
+            move || {
+                let produced = produced_count.load(Ordering::Relaxed);
+                let consumed = consumed_count.load(Ordering::Relaxed);
+                let errors = error_count.load(Ordering::Relaxed);
+                crate::log!(
+                    tag: "test.progress",
+                    "produced={produced} consumed={consumed} errors={errors}"
+                );
+            }
+        });
+
+        let _ubq_log = debug::register(Duration::from_millis(50), {
+            let queue = queue.clone();
+            move || {
+                crate::log!(
+                    tag: "test.ubq",
+                    "{:?}",
+                    &*queue
+                );
+            }
+        });
 
         let mut producer_handles = Vec::with_capacity(producers);
         for producer_id in 0..producers {
             let queue = queue.clone();
             let start = start.clone();
-            let log_tx = log_tx.clone();
-            let log_dir = log_dir.clone();
+            let produced_count = Arc::clone(&produced_count);
             let trace_max = trace_max;
             let items_per_producer = items_per_producer;
             producer_handles.push(thread::spawn(move || {
                 debug::set_thread_label(format!("producer-{producer_id}"));
-                let _guard = LogGuard::new(log_tx, log_dir);
                 start.wait();
                 let base = producer_id * items_per_producer;
                 for offset in 0..items_per_producer {
@@ -912,6 +1019,7 @@ mod test {
                     } else {
                         queue.push(value);
                     }
+                    produced_count.fetch_add(1, Ordering::Relaxed);
                 }
             }));
         }
@@ -921,14 +1029,12 @@ mod test {
             let queue = queue.clone();
             let start = start.clone();
             let seen = seen.clone();
-            let log_tx = log_tx.clone();
-            let log_dir = log_dir.clone();
             let error_count = error_count.clone();
             let first_error = first_error.clone();
+            let consumed_count = Arc::clone(&consumed_count);
             let trace_max = trace_max;
             consumer_handles.push(thread::spawn(move || {
                 debug::set_thread_label(format!("consumer-{consumer_id}"));
-                let _guard = LogGuard::new(log_tx, log_dir);
                 start.wait();
                 loop {
                     let (value_opt, block, slot_opt) = if trace_max != 0 {
@@ -944,7 +1050,7 @@ mod test {
                             if let Some(slot) = slot_opt {
                                 log_trace_pop(&queue, value, block, slot);
                             } else {
-                                crate::ubq_log!(
+                                crate::log!(
                                     tag: "test.pop",
                                     "value={value} block={block:p} slot=?"
                                 );
@@ -967,6 +1073,7 @@ mod test {
                                 format!("duplicate value {value}"),
                             );
                         }
+                        consumed_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }));
@@ -974,30 +1081,57 @@ mod test {
 
         start.wait();
 
+        crate::log!(tag: "test.start_wait", "passed start.wait() on the main thread");
+
         let mut had_panic = false;
-        for handle in producer_handles {
+
+        crate::log!(tag: "test.producers", "entering the producer handle loop to check for panics");
+
+        for (i, handle) in producer_handles.into_iter().enumerate() {
+            crate::log!(tag: "test.producers", "trying to join producer thread {i}");
+
+            let mut loc = false;
+
             if handle.join().is_err() {
                 had_panic = true;
+                loc = true;
+            }
+
+            if loc {
+                crate::log!(tag: "test.producers", "producer thread {i} panic'ed");
             }
         }
+
+        crate::log!(tag: "test.consumers", "pushing sentinels to the queue");
 
         for _ in 0..consumers {
             queue.push(SENTINEL);
         }
 
-        for handle in consumer_handles {
+        crate::log!(tag: "test.consumers", "sentinels pushed, attempting to join");
+
+        for (i, handle) in consumer_handles.into_iter().enumerate() {
+            crate::log!(tag: "test.consumers", "trying to join consumer thread {i}");
+
+            let mut loc = false;
+
             if handle.join().is_err() {
                 had_panic = true;
+                loc = true;
+            }
+
+            if loc {
+                crate::log!(tag: "test.consumers", "consumer thread {i} panic'ed");
             }
         }
 
-        drop(log_tx);
-        let mut logs: Vec<debug::LogEntry> = Vec::new();
-        for mut chunk in log_rx {
-            logs.append(&mut chunk);
-        }
-        logs.append(&mut debug::take());
+        crate::log!(tag: "test.consumers", "consumer threads joined");
+
+        drop(_progress_log);
+        debug::flush();
+        let mut logs: Vec<debug::LogEntry> = debug::snapshot();
         logs.sort_by_key(|entry| entry.ts_ns);
+        debug::shutdown();
 
         let mut missing_count = 0usize;
         let mut missing_samples = Vec::new();

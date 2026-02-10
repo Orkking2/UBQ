@@ -1,13 +1,19 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 use crate::{BLOCK_CAP, OFFSET_PAD};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Cursor {
     inner: usize,
 }
 
 impl Display for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Debug for Cursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.vsn(), self.off())
     }
@@ -64,23 +70,23 @@ impl Cursor {
         self.inner >> OFFSET_BITS
     }
 
-    #[inline]
-    /// Clears self.off()
-    pub const fn incr_vsn(self) -> Self {
-        Self {
-            inner: (self.inner & !OFFSET_MASK) + (1usize << OFFSET_BITS),
-        }
-    }
+    // #[inline]
+    // Clears self.off()
+    // pub const fn incr_vsn(self) -> Self {
+    //     Self {
+    //         inner: (self.inner & !OFFSET_MASK) + (1usize << OFFSET_BITS),
+    //     }
+    // }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
+// #[cfg(test)]
+// mod test {
+//     use super::*;
 
-    #[test]
-    fn incr_vsn_clears_off() {
-        for i in (0..OFFSET_MASK).map(Cursor::from_raw) {
-            assert!(i.incr_vsn().off() == 0);
-        }
-    }
-}
+//     #[test]
+//     fn incr_vsn_clears_off() {
+//         for i in (0..OFFSET_MASK).map(Cursor::from_raw) {
+//             assert!(i.incr_vsn().off() == 0);
+//         }
+//     }
+// }

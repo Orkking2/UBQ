@@ -124,28 +124,28 @@ fn recv(receiver: &Receiver) -> u64 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScenarioKind {
-    Spsc,
-    Mpsc,
-    Spmc,
-    Mpmc,
+    SPSC,
+    MPSC,
+    SPMC,
+    MPMC,
 }
 
 impl ScenarioKind {
     fn name(self) -> &'static str {
         match self {
-            ScenarioKind::Spsc => "spsc",
-            ScenarioKind::Mpsc => "mpsc",
-            ScenarioKind::Spmc => "spmc",
-            ScenarioKind::Mpmc => "mpmc",
+            ScenarioKind::SPSC => "spsc",
+            ScenarioKind::MPSC => "mpsc",
+            ScenarioKind::SPMC => "spmc",
+            ScenarioKind::MPMC => "mpmc",
         }
     }
 
     fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
-            "spsc" => Some(ScenarioKind::Spsc),
-            "mpsc" => Some(ScenarioKind::Mpsc),
-            "spmc" => Some(ScenarioKind::Spmc),
-            "mpmc" => Some(ScenarioKind::Mpmc),
+            "spsc" => Some(ScenarioKind::SPSC),
+            "mpsc" => Some(ScenarioKind::MPSC),
+            "spmc" => Some(ScenarioKind::SPMC),
+            "mpmc" => Some(ScenarioKind::MPMC),
             _ => None,
         }
     }
@@ -355,22 +355,22 @@ fn parse_args() -> BenchConfig {
 
     let scenarios = vec![
         ScenarioConfig {
-            kind: ScenarioKind::Spsc,
+            kind: ScenarioKind::SPSC,
             producers: 1,
             consumers: 1,
         },
         ScenarioConfig {
-            kind: ScenarioKind::Mpsc,
+            kind: ScenarioKind::MPSC,
             producers: mpsc_producers,
             consumers: 1,
         },
         ScenarioConfig {
-            kind: ScenarioKind::Spmc,
+            kind: ScenarioKind::SPMC,
             producers: 1,
             consumers: spmc_consumers,
         },
         ScenarioConfig {
-            kind: ScenarioKind::Mpmc,
+            kind: ScenarioKind::MPMC,
             producers: mpmc_producers,
             consumers: mpmc_consumers,
         },

@@ -10,70 +10,103 @@ pub struct LogEntry {
 #[cfg(feature = "ubq_debug")]
 mod imp {
     use super::LogEntry;
+    use crossbeam_queue::SegQueue;
     use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::fmt;
+    use std::fmt::Write as FmtWrite;
     use std::fs;
     #[cfg(unix)]
     use std::io::Read;
     use std::io::{self, Write};
     #[cfg(unix)]
     use std::os::unix::io::{FromRawFd, RawFd};
-    #[cfg(unix)]
     use std::panic;
     use std::path::{Path, PathBuf};
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    #[cfg(unix)]
-    use std::sync::{Arc, Mutex, Once};
-    #[cfg(unix)]
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, Once, OnceLock};
     use std::thread;
-    use std::time::Instant;
+    use std::thread::ThreadId;
+    use std::time::{Duration, Instant};
 
     static START: OnceLock<Instant> = OnceLock::new();
     static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
     static CONFIG: OnceLock<Config> = OnceLock::new();
-    #[cfg(unix)]
+    static LOGGER: OnceLock<Logger> = OnceLock::new();
+    static LOG_TOTAL: AtomicU64 = AtomicU64::new(0);
     static PANIC_HOOK: Once = Once::new();
     #[cfg(unix)]
     static STDOUT_LOG: OnceLock<Mutex<Option<Arc<StdoutLog>>>> = OnceLock::new();
     #[cfg(unix)]
     static STDERR_LOG: OnceLock<Mutex<Option<Arc<StderrLog>>>> = OnceLock::new();
 
-    const DEFAULT_FLUSH_MS: u64 = 500;
+    const DEFAULT_FLUSH_MS: u64 = 200;
+    const DEFAULT_BUFFER_BYTES: usize = 64 * 1024;
+    const DEFAULT_RING_MAX: usize = 50_000;
+    const DEFAULT_TICK_MS: u64 = 50;
+    const DEFAULT_WHEEL_SLOTS: usize = 256;
+    const DEFAULT_FLUSH_WAIT_MS: u64 = 500;
+    const DEFAULT_SHUTDOWN_WAIT_MS: u64 = 1_000;
+
+    thread_local! {
+        static THREAD_ID: u64 = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+        static THREAD_LABEL: RefCell<Option<String>> = RefCell::new(None);
+        static LOG_COUNT: Cell<u64> = Cell::new(0);
+        static LAST_MAYBE_FLUSH_NS: Cell<u64> = Cell::new(0);
+    }
 
     #[derive(Clone, Debug)]
     struct Config {
         sample_rate: u64,
         max_entries: usize,
         tag_filters: Option<Vec<String>>,
-        flush_ms: Option<u64>,
-        log_dir: Option<PathBuf>,
+        flush_ms: u64,
+        log_dir: PathBuf,
+        log_path: PathBuf,
+        buffer_bytes: usize,
+        ring_max: usize,
+        tick_ms: u64,
+        wheel_slots: usize,
     }
 
-    thread_local! {
-        static THREAD_ID: u64 = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
-        static THREAD_LABEL: RefCell<Option<String>> = RefCell::new(None);
-        static LOGS: RefCell<Vec<LogEntry>> = RefCell::new(Vec::new());
-        static LOG_COUNT: RefCell<u64> = RefCell::new(0);
-        static LOG_TOTAL: RefCell<u64> = RefCell::new(0);
-        static LAST_FLUSH_NS: Cell<u64> = Cell::new(0);
+    struct Logger {
+        queue: SegQueue<LogEntry>,
+        thread: OnceLock<thread::Thread>,
+        thread_id: OnceLock<ThreadId>,
+        handle: OnceLock<thread::JoinHandle<()>>,
+        recent: Mutex<VecDeque<LogEntry>>,
+        flush_request: AtomicU64,
+        flush_done: AtomicU64,
+        shutdown_requested: AtomicBool,
+        shutdown_complete: AtomicBool,
+        wheel: Mutex<TimerWheel>,
+    }
+
+    struct PeriodicTask {
+        ticks: usize,
+        rounds: usize,
+        enabled: Arc<AtomicBool>,
+        callback: Box<dyn FnMut() + Send>,
+    }
+
+    struct TimerWheel {
+        slots: Vec<Vec<PeriodicTask>>,
+        cursor: usize,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Registration {
+        enabled: Arc<AtomicBool>,
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            self.enabled.store(false, Ordering::Release);
+        }
     }
 
     fn now_ns() -> u64 {
         START.get_or_init(Instant::now).elapsed().as_nanos() as u64
-    }
-
-    pub fn set_thread_label(label: impl Into<String>) {
-        let value = label.into();
-        THREAD_LABEL.with(|slot| {
-            *slot.borrow_mut() = Some(value);
-        });
-    }
-
-    pub fn clear_thread_label() {
-        THREAD_LABEL.with(|slot| {
-            *slot.borrow_mut() = None;
-        });
     }
 
     fn config() -> &'static Config {
@@ -99,11 +132,59 @@ mod imp {
                     Some(filters)
                 }
             });
-            let log_dir = std::env::var_os("UBQ_DEBUG_DIR").map(PathBuf::from);
-            let flush_ms = match std::env::var("UBQ_DEBUG_FLUSH_MS") {
-                Ok(value) => value.parse::<u64>().ok().filter(|value| *value > 0),
-                Err(_) => log_dir.as_ref().map(|_| DEFAULT_FLUSH_MS),
-            };
+
+            let log_dir = std::env::var_os("UBQ_DEBUG_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+            let mut log_name = std::env::var("UBQ_DEBUG_FILE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| {
+                    let base = std::env::var("UBQ_DEBUG_NAME")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| thread::current().name().map(|name| name.to_string()))
+                        .unwrap_or_else(|| "ubq".to_string());
+                    let mut sanitized = sanitize_label(&base);
+                    if sanitized.is_empty() {
+                        sanitized = "ubq".to_string();
+                    }
+                    sanitized
+                });
+            if !log_name.ends_with(".log") {
+                log_name.push_str(".log");
+            }
+            let log_path = log_dir.join(&log_name);
+
+            let flush_ms = std::env::var("UBQ_DEBUG_FLUSH_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_FLUSH_MS);
+
+            let buffer_bytes = std::env::var("UBQ_DEBUG_BUFFER_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_BUFFER_BYTES);
+
+            let ring_max = std::env::var("UBQ_DEBUG_RING")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_else(|| if max_entries > 0 { max_entries } else { DEFAULT_RING_MAX });
+
+            let tick_ms = std::env::var("UBQ_DEBUG_TICK_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_TICK_MS);
+
+            let wheel_slots = std::env::var("UBQ_DEBUG_WHEEL_SLOTS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value >= 2)
+                .unwrap_or(DEFAULT_WHEEL_SLOTS);
 
             Config {
                 sample_rate,
@@ -111,41 +192,306 @@ mod imp {
                 tag_filters,
                 flush_ms,
                 log_dir,
+                log_path,
+                buffer_bytes,
+                ring_max,
+                tick_ms,
+                wheel_slots,
             }
         })
     }
 
-    fn should_log(tag: &'static str) -> bool {
-        let config = config();
+    fn logger() -> &'static Logger {
+        let logger = LOGGER.get_or_init(Logger::new);
+        install_panic_hook();
+        logger.ensure_thread();
+        logger
+    }
 
-        if let Some(filters) = &config.tag_filters {
+    impl Logger {
+        fn new() -> Self {
+            let cfg = config();
+            let wheel = TimerWheel::new(cfg.wheel_slots);
+            let capacity = cfg.ring_max.min(1024).max(16);
+            Logger {
+                queue: SegQueue::new(),
+                thread: OnceLock::new(),
+                thread_id: OnceLock::new(),
+                handle: OnceLock::new(),
+                recent: Mutex::new(VecDeque::with_capacity(capacity)),
+                flush_request: AtomicU64::new(0),
+                flush_done: AtomicU64::new(0),
+                shutdown_requested: AtomicBool::new(false),
+                shutdown_complete: AtomicBool::new(false),
+                wheel: Mutex::new(wheel),
+            }
+        }
+
+        fn ensure_thread(&'static self) {
+            self.handle.get_or_init(|| {
+                let cfg = config();
+                let logger = self;
+                thread::spawn(move || writer_loop(logger, cfg))
+            });
+        }
+
+        fn wake(&self) {
+            if let Some(thread) = self.thread.get() {
+                thread.unpark();
+            }
+        }
+
+        fn request_flush(&self) -> u64 {
+            let target = self.flush_request.fetch_add(1, Ordering::AcqRel) + 1;
+            self.wake();
+            target
+        }
+
+        fn flush_with_timeout(&self, timeout: Duration) {
+            if self.is_writer_thread() {
+                return;
+            }
+            let target = self.request_flush();
+            let start = Instant::now();
+            while self.flush_done.load(Ordering::Acquire) < target {
+                if start.elapsed() >= timeout {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn is_writer_thread(&self) -> bool {
+            self.thread_id
+                .get()
+                .map_or(false, |id| *id == thread::current().id())
+        }
+    }
+
+    impl TimerWheel {
+        fn new(slots: usize) -> Self {
+            let slots = slots.max(2);
+            let mut wheel_slots = Vec::with_capacity(slots);
+            for _ in 0..slots {
+                wheel_slots.push(Vec::new());
+            }
+            TimerWheel {
+                slots: wheel_slots,
+                cursor: 0,
+            }
+        }
+
+        fn insert(&mut self, mut task: PeriodicTask) {
+            let ticks = task.ticks.max(1);
+            let slots = self.slots.len();
+            let slot_offset = ticks % slots;
+            let rounds = (ticks - 1) / slots;
+            task.rounds = rounds;
+            let slot = (self.cursor + slot_offset) % slots;
+            self.slots[slot].push(task);
+        }
+
+        fn advance(&mut self) -> Vec<PeriodicTask> {
+            self.cursor = (self.cursor + 1) % self.slots.len();
+            let mut due = Vec::new();
+            let mut slot = Vec::new();
+            std::mem::swap(&mut slot, &mut self.slots[self.cursor]);
+            for mut task in slot {
+                if task.rounds == 0 {
+                    due.push(task);
+                } else {
+                    task.rounds -= 1;
+                    self.slots[self.cursor].push(task);
+                }
+            }
+            due
+        }
+    }
+
+    fn writer_loop(logger: &'static Logger, cfg: &'static Config) {
+        let _ = logger.thread.set(thread::current());
+        let _ = logger.thread_id.set(thread::current().id());
+
+        if let Err(err) = fs::create_dir_all(&cfg.log_dir) {
+            eprintln!("ubq debug: failed to create log dir {}: {err}", cfg.log_dir.display());
+        }
+
+        let mut file = match fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&cfg.log_path)
+        {
+            Ok(file) => Some(file),
+            Err(err) => {
+                eprintln!(
+                    "ubq debug: failed to open log file {}: {err}",
+                    cfg.log_path.display()
+                );
+                None
+            }
+        };
+
+        let mut buffer = String::with_capacity(cfg.buffer_bytes.max(1024));
+        let flush_interval = Duration::from_millis(cfg.flush_ms.max(1));
+        let tick = Duration::from_millis(cfg.tick_ms.max(1));
+        let mut last_flush = Instant::now();
+        let mut next_tick = Instant::now() + tick;
+
+        loop {
+            let shutdown_requested = logger.shutdown_requested.load(Ordering::Acquire);
+            let mut batch = Vec::new();
+            while let Some(entry) = logger.queue.pop() {
+                batch.push(entry);
+            }
+
+            if !batch.is_empty() {
+                if cfg.ring_max > 0 {
+                    let mut recent = match logger.recent.lock() {
+                        Ok(recent) => recent,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    for entry in batch.drain(..) {
+                        write_entry(&entry, &mut buffer);
+                        push_recent(&mut recent, entry, cfg.ring_max);
+                    }
+                } else {
+                    for entry in batch.drain(..) {
+                        write_entry(&entry, &mut buffer);
+                    }
+                }
+            }
+
+            let mut now = Instant::now();
+            if !shutdown_requested && now >= next_tick {
+                let mut due_tasks = Vec::new();
+                while now >= next_tick {
+                    let mut tasks = {
+                        let mut wheel = match logger.wheel.lock() {
+                            Ok(wheel) => wheel,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        wheel.advance()
+                    };
+                    due_tasks.append(&mut tasks);
+                    next_tick += tick;
+                }
+
+                if !due_tasks.is_empty() {
+                    let mut reschedule = Vec::new();
+                    for mut task in due_tasks {
+                        if !task.enabled.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        (task.callback)();
+                        if task.enabled.load(Ordering::Acquire) {
+                            reschedule.push(task);
+                        }
+                    }
+                    if !reschedule.is_empty() {
+                        let mut wheel = match logger.wheel.lock() {
+                            Ok(wheel) => wheel,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        for task in reschedule {
+                            wheel.insert(task);
+                        }
+                    }
+                }
+            }
+
+            now = Instant::now();
+            let requested = logger.flush_request.load(Ordering::Acquire);
+            let pending_flush = requested > logger.flush_done.load(Ordering::Acquire);
+
+            if !buffer.is_empty()
+                && (buffer.len() >= cfg.buffer_bytes
+                    || now.duration_since(last_flush) >= flush_interval
+                    || pending_flush)
+            {
+                if let Some(file) = file.as_mut() {
+                    let _ = file.write_all(buffer.as_bytes());
+                    if now.duration_since(last_flush) >= flush_interval || pending_flush {
+                        let _ = file.flush();
+                    }
+                }
+                buffer.clear();
+                last_flush = now;
+            }
+
+            if pending_flush {
+                if let Some(file) = file.as_mut() {
+                    let _ = file.flush();
+                }
+                logger.flush_done.store(requested, Ordering::Release);
+            }
+
+            if shutdown_requested && logger.queue.is_empty() && buffer.is_empty() {
+                if let Some(file) = file.as_mut() {
+                    let _ = file.flush();
+                }
+                logger.shutdown_complete.store(true, Ordering::Release);
+                break;
+            }
+
+            if !pending_flush && logger.queue.is_empty() {
+                let now = Instant::now();
+                let mut sleep_for = next_tick.saturating_duration_since(now);
+                if !buffer.is_empty() {
+                    let next_flush = last_flush + flush_interval;
+                    let to_flush = next_flush.saturating_duration_since(now);
+                    sleep_for = sleep_for.min(to_flush);
+                }
+                if sleep_for.is_zero() {
+                    thread::yield_now();
+                } else {
+                    thread::park_timeout(sleep_for);
+                }
+            }
+        }
+    }
+
+    fn write_entry(entry: &LogEntry, buffer: &mut String) {
+        let label = entry.thread_label.as_deref().unwrap_or("-");
+        let _ = write!(
+            buffer,
+            "[{}] tid={} {} {} {}\n",
+            entry.ts_ns, entry.thread_id, label, entry.tag, entry.message
+        );
+    }
+
+    fn push_recent(recent: &mut VecDeque<LogEntry>, entry: LogEntry, max: usize) {
+        if max == 0 {
+            return;
+        }
+        if recent.len() >= max {
+            recent.pop_front();
+        }
+        recent.push_back(entry);
+    }
+
+    fn should_log(tag: &'static str) -> bool {
+        let cfg = config();
+
+        if let Some(filters) = &cfg.tag_filters {
             if !filters.iter().any(|prefix| tag.starts_with(prefix)) {
                 return false;
             }
         }
 
-        if config.sample_rate > 1 {
+        if cfg.sample_rate > 1 {
             let keep = LOG_COUNT.with(|count| {
-                let mut value = count.borrow_mut();
-                *value += 1;
-                *value % config.sample_rate == 0
+                let next = count.get().saturating_add(1);
+                count.set(next);
+                next % cfg.sample_rate == 0
             });
             if !keep {
                 return false;
             }
         }
 
-        if config.max_entries != 0 {
-            let keep = LOG_TOTAL.with(|total| {
-                let mut total = total.borrow_mut();
-                if *total >= config.max_entries as u64 {
-                    false
-                } else {
-                    *total += 1;
-                    true
-                }
-            });
-            if !keep {
+        if cfg.max_entries != 0 {
+            let prev = LOG_TOTAL.fetch_add(1, Ordering::Relaxed);
+            if prev >= cfg.max_entries as u64 {
                 return false;
             }
         }
@@ -153,28 +499,97 @@ mod imp {
         true
     }
 
+    pub fn init() {
+        let _ = logger();
+    }
+
+    pub fn register(duration: Duration, task: impl FnMut() + Send + 'static) -> Registration {
+        let logger = logger();
+        let cfg = config();
+        let wheel_tick = Duration::from_millis(cfg.tick_ms.max(1));
+        let ticks = {
+            let tick_ns = wheel_tick.as_nanos();
+            let dur_ns = duration.as_nanos();
+            if tick_ns == 0 {
+                1
+            } else {
+                let ticks = (dur_ns + tick_ns - 1) / tick_ns;
+                (ticks.max(1)) as usize
+            }
+        };
+
+        let enabled = Arc::new(AtomicBool::new(true));
+        let task = PeriodicTask {
+            ticks,
+            rounds: 0,
+            enabled: Arc::clone(&enabled),
+            callback: Box::new(task),
+        };
+
+        let mut wheel = match logger.wheel.lock() {
+            Ok(wheel) => wheel,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        wheel.insert(task);
+        logger.wake();
+
+        Registration { enabled }
+    }
+
+    pub fn set_thread_label(label: impl Into<String>) {
+        let value = label.into();
+        THREAD_LABEL.with(|slot| {
+            *slot.borrow_mut() = Some(value);
+        });
+    }
+
+    pub fn clear_thread_label() {
+        THREAD_LABEL.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+
     pub fn log_tagged(tag: &'static str, args: fmt::Arguments<'_>) {
         if !should_log(tag) {
             return;
         }
 
-        let message = args.to_string();
         let entry = LogEntry {
             ts_ns: now_ns(),
             thread_id: THREAD_ID.with(|id| *id),
             thread_label: THREAD_LABEL.with(|slot| slot.borrow().clone()),
             tag,
-            message,
+            message: args.to_string(),
         };
-        LOGS.with(|logs| logs.borrow_mut().push(entry));
+
+        let logger = logger();
+        if logger.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
+        logger.queue.push(entry);
+        logger.wake();
     }
 
     pub fn take() -> Vec<LogEntry> {
-        LOGS.with(|logs| logs.borrow_mut().drain(..).collect())
+        let Some(logger) = LOGGER.get() else {
+            return Vec::new();
+        };
+        let mut recent = match logger.recent.lock() {
+            Ok(recent) => recent,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        recent.drain(..).collect()
     }
 
     pub fn snapshot() -> Vec<LogEntry> {
-        LOGS.with(|logs| logs.borrow().clone())
+        let Some(logger) = LOGGER.get() else {
+            return Vec::new();
+        };
+        let recent = match logger.recent.lock() {
+            Ok(recent) => recent,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        recent.iter().cloned().collect()
     }
 
     pub fn thread_id() -> u64 {
@@ -189,6 +604,33 @@ mod imp {
         now_ns()
     }
 
+    pub fn flush() {
+        let Some(logger) = LOGGER.get() else {
+            return;
+        };
+        logger.flush_with_timeout(Duration::from_millis(DEFAULT_FLUSH_WAIT_MS));
+    }
+
+    pub fn shutdown() {
+        let Some(logger) = LOGGER.get() else {
+            return;
+        };
+        if logger.is_writer_thread() {
+            logger.shutdown_requested.store(true, Ordering::Release);
+            return;
+        }
+        logger.shutdown_requested.store(true, Ordering::Release);
+        let _ = logger.request_flush();
+        let start = Instant::now();
+        let timeout = Duration::from_millis(DEFAULT_SHUTDOWN_WAIT_MS);
+        while !logger.shutdown_complete.load(Ordering::Acquire) {
+            if start.elapsed() >= timeout {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     pub fn write_to_dir(entries: &[LogEntry], dir: impl AsRef<Path>) -> io::Result<PathBuf> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
@@ -201,10 +643,7 @@ mod imp {
             format!("ubq-log-{thread_id}.log")
         };
         let path = dir.join(file_name);
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
         for entry in entries {
             let label = entry.thread_label.as_deref().unwrap_or("-");
             writeln!(
@@ -222,19 +661,15 @@ mod imp {
     }
 
     pub fn maybe_flush() {
-        let config = config();
-        let Some(dir) = config.log_dir.as_ref() else {
+        let Some(logger) = LOGGER.get() else {
             return;
         };
-        let Some(flush_ms) = config.flush_ms else {
-            return;
-        };
-        let flush_ns = flush_ms.saturating_mul(1_000_000);
+        let flush_ns = config().flush_ms.saturating_mul(1_000_000);
         if flush_ns == 0 {
             return;
         }
         let now = now_ns();
-        let should_flush = LAST_FLUSH_NS.with(|last| {
+        let should_flush = LAST_MAYBE_FLUSH_NS.with(|last| {
             let prev = last.get();
             if prev == 0 || now.saturating_sub(prev) >= flush_ns {
                 last.set(now);
@@ -244,7 +679,7 @@ mod imp {
             }
         });
         if should_flush {
-            let _ = flush_to_dir(dir);
+            logger.request_flush();
         }
     }
 
@@ -269,16 +704,20 @@ mod imp {
         STDOUT_LOG.get_or_init(|| Mutex::new(None))
     }
 
-    #[cfg(unix)]
-    pub fn install_stdout_panic_hook() {
+    fn install_panic_hook() {
         PANIC_HOOK.call_once(|| {
             let prev = panic::take_hook();
             panic::set_hook(Box::new(move |info| {
                 prev(info);
+                flush();
                 flush_stdout_log();
                 flush_stderr_log();
             }));
         });
+    }
+
+    pub fn install_stdout_panic_hook() {
+        install_panic_hook();
     }
 
     #[cfg(unix)]
@@ -333,22 +772,28 @@ mod imp {
     }
 
     #[cfg(not(unix))]
-    pub fn install_stdout_panic_hook() {}
+    pub fn flush_stdout_log() {
+        let _ = io::stdout().flush();
+    }
 
     #[cfg(not(unix))]
-    pub fn flush_stdout_log() {}
-
-    #[cfg(not(unix))]
-    pub fn flush_stderr_log() {}
+    pub fn flush_stderr_log() {
+        let _ = io::stderr().flush();
+    }
 
     pub fn prepare_log_dir(dir: impl AsRef<Path>) -> io::Result<()> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
+        let log_name = log_name_for_thread();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("ubq-log-") || name == "stdout.log" || name == "stderr.log" {
+            if name.starts_with("ubq-log-")
+                || name == "stdout.log"
+                || name == "stderr.log"
+                || name == log_name
+            {
                 let path = entry.path();
                 if path.is_dir() {
                     fs::remove_dir_all(path)?;
@@ -603,6 +1048,28 @@ mod imp {
             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
             .collect()
     }
+
+    fn log_name_for_thread() -> String {
+        let mut log_name = std::env::var("UBQ_DEBUG_FILE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                let base = std::env::var("UBQ_DEBUG_NAME")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| thread::current().name().map(|name| name.to_string()))
+                    .unwrap_or_else(|| "ubq".to_string());
+                let mut sanitized = sanitize_label(&base);
+                if sanitized.is_empty() {
+                    sanitized = "ubq".to_string();
+                }
+                sanitized
+            });
+        if !log_name.ends_with(".log") {
+            log_name.push_str(".log");
+        }
+        log_name
+    }
 }
 
 #[cfg(not(feature = "ubq_debug"))]
@@ -611,6 +1078,16 @@ mod imp {
     use std::fmt;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    #[derive(Clone, Debug)]
+    pub struct Registration;
+
+    pub fn init() {}
+
+    pub fn register(_duration: Duration, _task: impl FnMut() + Send + 'static) -> Registration {
+        Registration
+    }
 
     pub fn set_thread_label(_label: impl Into<String>) {}
 
@@ -637,6 +1114,10 @@ mod imp {
     pub fn elapsed_ns() -> u64 {
         0
     }
+
+    pub fn flush() {}
+
+    pub fn shutdown() {}
 
     pub fn write_to_dir(_entries: &[LogEntry], _dir: impl AsRef<Path>) -> io::Result<PathBuf> {
         Ok(PathBuf::new())
@@ -674,7 +1155,7 @@ pub use imp::*;
 
 #[cfg(feature = "ubq_debug")]
 #[macro_export]
-macro_rules! ubq_log {
+macro_rules! log {
     (tag: $tag:expr, $($arg:tt)+) => {
         $crate::debug::log_tagged($tag, format_args!($($arg)+));
     };
@@ -685,7 +1166,7 @@ macro_rules! ubq_log {
 
 #[cfg(not(feature = "ubq_debug"))]
 #[macro_export]
-macro_rules! ubq_log {
+macro_rules! log {
     (tag: $tag:expr, $($arg:tt)+) => {};
     ($($arg:tt)+) => {};
 }
