@@ -21,23 +21,22 @@ impl<T> Clone for Head<T> {
 
 impl<T> Head<T> {
     pub fn new(root: NonNull<Block<T>>) -> Self {
-        Self {
-            version: unsafe {
-                NonNull::new_unchecked(Box::into_raw(Box::new(CachePadded::new(AtomicUsize::new(
-                    0,
-                )))))
-            },
-            block: unsafe {
-                NonNull::new_unchecked(Box::into_raw(Box::new(CachePadded::new(AtomicPtr::new(
-                    root.as_ptr(),
-                )))))
-            },
+        // SAFETY: Box::into_raw produces proper, nonzero pointers.
+        unsafe {
+            Self {
+                version: NonNull::new_unchecked(Box::into_raw(Box::new(CachePadded::new(
+                    AtomicUsize::new(0),
+                )))),
+                block: NonNull::new_unchecked(Box::into_raw(Box::new(CachePadded::new(
+                    AtomicPtr::new(root.as_ptr()),
+                )))),
+            }
         }
     }
 
     pub fn load(&self) -> (usize, NonNull<Block<T>>) {
         let version = unsafe { self.version.as_ref() }.load(Ordering::Acquire);
-        let block = unsafe { self.block.as_ref() }.load(Ordering::Relaxed);
+        let block = unsafe { self.block.as_ref() }.load(Ordering::Acquire);
 
         (
             version,
@@ -46,11 +45,13 @@ impl<T> Head<T> {
         )
     }
 
-    pub fn store(&self, version: usize, next: NonNull<Block<T>>) {
+    pub fn store(&self, new_vsn: usize, old_vsn: usize, next: NonNull<Block<T>>) {
         // Publish block first, then publish version.
         // SAFETY: self.atomic is created by NonNull::from(Box::into_raw)
-        unsafe { self.block.as_ref() }.store(next.as_ptr(), Ordering::Relaxed);
-        unsafe { self.version.as_ref() }.fetch_max(version, Ordering::Release);
+        unsafe { self.block.as_ref() }.store(next.as_ptr(), Ordering::Release);
+        if new_vsn != old_vsn {
+            unsafe { self.version.as_ref() }.store(new_vsn, Ordering::Release);
+        }
     }
 
     /// Deallocate self.atomic

@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Barrier, OnceLock,
     atomic::{AtomicU64, Ordering},
+    Arc, Barrier, OnceLock,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -761,4 +761,511 @@ Options:
 "#;
     println!("{usage}");
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{resume_unwind, AssertUnwindSafe};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, RecvTimeoutError},
+        Arc, Barrier, Mutex,
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    const DEFAULT_TEST_ITEMS_PER_PRODUCER: u64 = 200;
+    const DEFAULT_TEST_TIMEOUT_SECS: u64 = 30;
+
+    fn test_timeout() -> Duration {
+        std::env::var("UBQ_TEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(DEFAULT_TEST_TIMEOUT_SECS))
+    }
+
+    fn run_with_timeout(name: &'static str, f: impl FnOnce() + Send + 'static) {
+        run_with_timeout_context(
+            name,
+            Arc::new(Mutex::new("context unavailable".to_string())),
+            f,
+        );
+    }
+
+    fn run_with_timeout_context(
+        name: &'static str,
+        timeout_context: Arc<Mutex<String>>,
+        f: impl FnOnce() + Send + 'static,
+    ) {
+        let timeout = test_timeout();
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(f));
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(())) => {}
+            Ok(Err(payload)) => resume_unwind(payload),
+            Err(RecvTimeoutError::Timeout) => {
+                let context = timeout_context
+                    .lock()
+                    .map(|value| value.clone())
+                    .unwrap_or_else(|_| "context unavailable (poisoned)".to_string());
+                panic!(
+                    "test `{name}` timed out after {}s (last context: {context})",
+                    timeout.as_secs()
+                )
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("test `{name}` ended unexpectedly before reporting")
+            }
+        }
+    }
+
+    fn set_timeout_context(timeout_context: &Arc<Mutex<String>>, value: impl Into<String>) {
+        if let Ok(mut slot) = timeout_context.lock() {
+            *slot = value.into();
+        }
+    }
+
+    fn test_items_per_producer() -> u64 {
+        std::env::var("UBQ_BENCH_TEST_ITEMS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TEST_ITEMS_PER_PRODUCER)
+    }
+
+    fn test_scenarios() -> Vec<ScenarioConfig> {
+        vec![
+            ScenarioConfig {
+                kind: ScenarioKind::SPSC,
+                producers: 1,
+                consumers: 1,
+            },
+            ScenarioConfig {
+                kind: ScenarioKind::MPSC,
+                producers: 3,
+                consumers: 1,
+            },
+            ScenarioConfig {
+                kind: ScenarioKind::SPMC,
+                producers: 1,
+                consumers: 3,
+            },
+            ScenarioConfig {
+                kind: ScenarioKind::MPMC,
+                producers: 3,
+                consumers: 3,
+            },
+        ]
+    }
+
+    fn test_queues() -> [QueueKind; 4] {
+        [
+            QueueKind::Ubq,
+            QueueKind::Crossbeam,
+            QueueKind::Flume,
+            QueueKind::Async,
+        ]
+    }
+
+    fn scenario_label(scenario: &ScenarioConfig) -> String {
+        format!(
+            "{}({}p/{}c)",
+            scenario.kind.name(),
+            scenario.producers,
+            scenario.consumers
+        )
+    }
+
+    fn record_error(
+        error_count: &AtomicUsize,
+        first_error: &Mutex<Option<String>>,
+        message: String,
+    ) {
+        error_count.fetch_add(1, Ordering::Relaxed);
+        let mut slot = first_error.lock().expect("first_error lock");
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+    }
+
+    fn assert_no_integrity_errors(
+        queue: QueueKind,
+        scenario: &ScenarioConfig,
+        mode: Mode,
+        seen: &[AtomicBool],
+        error_count: &AtomicUsize,
+        first_error: &Mutex<Option<String>>,
+        expected_total: u64,
+        consumed_total: u64,
+    ) {
+        let label = scenario_label(scenario);
+        assert_eq!(
+            consumed_total,
+            expected_total,
+            "{} {} consumed mismatch in {} mode",
+            queue.name(),
+            label,
+            mode.name()
+        );
+
+        let errors = error_count.load(Ordering::Relaxed);
+        if errors > 0 {
+            let first = first_error.lock().expect("first_error lock");
+            let message = first.as_deref().unwrap_or("unknown consumer error");
+            panic!(
+                "{} {} integrity errors in {} mode: {errors} (first: {message})",
+                queue.name(),
+                label,
+                mode.name()
+            );
+        }
+
+        let mut missing_count = 0usize;
+        let mut missing_samples = Vec::new();
+        for (idx, seen_flag) in seen.iter().enumerate() {
+            if !seen_flag.load(Ordering::Acquire) {
+                missing_count += 1;
+                if missing_samples.len() < 10 {
+                    missing_samples.push(idx);
+                }
+            }
+        }
+        assert_eq!(
+            missing_count,
+            0,
+            "{} {} missing values in {} mode: {} (samples: {:?})",
+            queue.name(),
+            label,
+            mode.name(),
+            missing_count,
+            missing_samples
+        );
+    }
+
+    fn run_throughput_integrity(
+        queue: QueueKind,
+        scenario: &ScenarioConfig,
+        items_per_producer: u64,
+    ) {
+        let total = total_items(items_per_producer, scenario.producers);
+        let seen = Arc::new(
+            (0..usize::try_from(total).expect("total items should fit usize"))
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        );
+        let consumed_total = Arc::new(AtomicUsize::new(0));
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let first_error = Arc::new(Mutex::new(None::<String>));
+
+        let (sender, receiver) = make_queue(queue);
+        let total_threads = scenario.producers + scenario.consumers;
+        let ready = Arc::new(Barrier::new(total_threads + 1));
+        let start_gate = Arc::new(Barrier::new(total_threads + 1));
+
+        let mut producer_handles = Vec::with_capacity(scenario.producers);
+        for producer_id in 0..scenario.producers {
+            let sender = sender_clone(&sender);
+            let ready = Arc::clone(&ready);
+            let start_gate = Arc::clone(&start_gate);
+            producer_handles.push(thread::spawn(move || {
+                ready.wait();
+                start_gate.wait();
+                let base = (producer_id as u64)
+                    .checked_mul(items_per_producer)
+                    .expect("item count overflow");
+                for offset in 0..items_per_producer {
+                    let value = base.checked_add(offset).expect("item count overflow");
+                    send(&sender, value);
+                }
+            }));
+        }
+
+        let mut consumer_handles = Vec::with_capacity(scenario.consumers);
+        for _ in 0..scenario.consumers {
+            let receiver = receiver_clone(&receiver);
+            let ready = Arc::clone(&ready);
+            let start_gate = Arc::clone(&start_gate);
+            let seen = Arc::clone(&seen);
+            let consumed_total = Arc::clone(&consumed_total);
+            let error_count = Arc::clone(&error_count);
+            let first_error = Arc::clone(&first_error);
+            consumer_handles.push(thread::spawn(move || {
+                ready.wait();
+                start_gate.wait();
+                loop {
+                    let value = recv(&receiver);
+                    if value == SENTINEL {
+                        break;
+                    }
+                    let idx = value as usize;
+                    if idx >= seen.len() {
+                        record_error(
+                            &error_count,
+                            &first_error,
+                            format!("out-of-range value {value}"),
+                        );
+                        continue;
+                    }
+                    let already_seen = seen[idx].swap(true, Ordering::AcqRel);
+                    if already_seen {
+                        record_error(
+                            &error_count,
+                            &first_error,
+                            format!("duplicate value {value}"),
+                        );
+                    }
+                    consumed_total.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        ready.wait();
+        start_gate.wait();
+
+        for handle in producer_handles {
+            handle.join().expect("producer join failed");
+        }
+
+        for _ in 0..scenario.consumers {
+            send(&sender, SENTINEL);
+        }
+
+        for handle in consumer_handles {
+            handle.join().expect("consumer join failed");
+        }
+
+        assert_no_integrity_errors(
+            queue,
+            scenario,
+            Mode::Throughput,
+            seen.as_slice(),
+            &error_count,
+            &first_error,
+            total,
+            consumed_total.load(Ordering::Relaxed) as u64,
+        );
+    }
+
+    fn run_fill_drain_integrity(
+        queue: QueueKind,
+        scenario: &ScenarioConfig,
+        items_per_producer: u64,
+    ) {
+        let total = total_items(items_per_producer, scenario.producers);
+        let seen = Arc::new(
+            (0..usize::try_from(total).expect("total items should fit usize"))
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        );
+        let consumed_total = Arc::new(AtomicUsize::new(0));
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let first_error = Arc::new(Mutex::new(None::<String>));
+
+        let (sender, receiver) = make_queue(queue);
+        run_producers_only(&sender, scenario.producers, items_per_producer);
+
+        for _ in 0..scenario.consumers {
+            send(&sender, SENTINEL);
+        }
+
+        let ready = Arc::new(Barrier::new(scenario.consumers + 1));
+        let start_gate = Arc::new(Barrier::new(scenario.consumers + 1));
+
+        let mut consumer_handles = Vec::with_capacity(scenario.consumers);
+        for _ in 0..scenario.consumers {
+            let receiver = receiver_clone(&receiver);
+            let ready = Arc::clone(&ready);
+            let start_gate = Arc::clone(&start_gate);
+            let seen = Arc::clone(&seen);
+            let consumed_total = Arc::clone(&consumed_total);
+            let error_count = Arc::clone(&error_count);
+            let first_error = Arc::clone(&first_error);
+            consumer_handles.push(thread::spawn(move || {
+                ready.wait();
+                start_gate.wait();
+                loop {
+                    let value = recv(&receiver);
+                    if value == SENTINEL {
+                        break;
+                    }
+                    let idx = value as usize;
+                    if idx >= seen.len() {
+                        record_error(
+                            &error_count,
+                            &first_error,
+                            format!("out-of-range value {value}"),
+                        );
+                        continue;
+                    }
+                    let already_seen = seen[idx].swap(true, Ordering::AcqRel);
+                    if already_seen {
+                        record_error(
+                            &error_count,
+                            &first_error,
+                            format!("duplicate value {value}"),
+                        );
+                    }
+                    consumed_total.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        ready.wait();
+        start_gate.wait();
+
+        for handle in consumer_handles {
+            handle.join().expect("consumer join failed");
+        }
+
+        assert_no_integrity_errors(
+            queue,
+            scenario,
+            Mode::FillDrain,
+            seen.as_slice(),
+            &error_count,
+            &first_error,
+            total,
+            consumed_total.load(Ordering::Relaxed) as u64,
+        );
+    }
+
+    #[test]
+    fn bench_throughput_records_match_expectations() {
+        let timeout_context = Arc::new(Mutex::new("starting benchmark matrix".to_string()));
+        run_with_timeout_context(
+            "bench_throughput_records_match_expectations",
+            Arc::clone(&timeout_context),
+            move || {
+                let items_per_producer = test_items_per_producer();
+                for queue in test_queues() {
+                    for scenario in test_scenarios() {
+                        set_timeout_context(
+                            &timeout_context,
+                            format!(
+                                "queue={} scenario={} mode={}",
+                                queue.name(),
+                                scenario_label(&scenario),
+                                Mode::Throughput.name()
+                            ),
+                        );
+                        let expected_total = total_items(items_per_producer, scenario.producers);
+                        let record = bench_throughput(queue, &scenario, items_per_producer);
+
+                        assert_eq!(record.queue, queue.name());
+                        assert_eq!(record.scenario, scenario.kind.name());
+                        assert_eq!(record.mode, Mode::Throughput.name());
+                        assert_eq!(record.producers, scenario.producers);
+                        assert_eq!(record.consumers, scenario.consumers);
+                        assert_eq!(record.total_items, expected_total);
+                        assert_eq!(record.consumed_items, expected_total);
+                        assert!(record.push_elapsed_ns.is_some());
+                        assert!(record.pop_elapsed_ns.is_some());
+                        assert!(record.fill_elapsed_ns.is_none());
+                        assert!(record.drain_elapsed_ns.is_none());
+                    }
+                }
+                set_timeout_context(&timeout_context, "completed benchmark matrix");
+            },
+        );
+    }
+
+    #[test]
+    fn bench_fill_drain_records_match_expectations() {
+        let timeout_context = Arc::new(Mutex::new("starting benchmark matrix".to_string()));
+        run_with_timeout_context(
+            "bench_fill_drain_records_match_expectations",
+            Arc::clone(&timeout_context),
+            move || {
+                let items_per_producer = test_items_per_producer();
+                for queue in test_queues() {
+                    for scenario in test_scenarios() {
+                        set_timeout_context(
+                            &timeout_context,
+                            format!(
+                                "queue={} scenario={} mode={}",
+                                queue.name(),
+                                scenario_label(&scenario),
+                                Mode::FillDrain.name()
+                            ),
+                        );
+                        let expected_total = total_items(items_per_producer, scenario.producers);
+                        let record = bench_fill_drain(queue, &scenario, items_per_producer);
+
+                        assert_eq!(record.queue, queue.name());
+                        assert_eq!(record.scenario, scenario.kind.name());
+                        assert_eq!(record.mode, Mode::FillDrain.name());
+                        assert_eq!(record.producers, scenario.producers);
+                        assert_eq!(record.consumers, scenario.consumers);
+                        assert_eq!(record.total_items, expected_total);
+                        assert_eq!(record.consumed_items, expected_total);
+                        assert!(record.push_elapsed_ns.is_none());
+                        assert!(record.pop_elapsed_ns.is_none());
+                        assert!(record.fill_elapsed_ns.is_some());
+                        assert!(record.drain_elapsed_ns.is_some());
+                    }
+                }
+                set_timeout_context(&timeout_context, "completed benchmark matrix");
+            },
+        );
+    }
+
+    #[test]
+    fn throughput_integrity_smoke_all_paths() {
+        let timeout_context = Arc::new(Mutex::new("starting integrity matrix".to_string()));
+        run_with_timeout_context(
+            "throughput_integrity_smoke_all_paths",
+            Arc::clone(&timeout_context),
+            move || {
+                let items_per_producer = test_items_per_producer();
+                for queue in test_queues() {
+                    for scenario in test_scenarios() {
+                        set_timeout_context(
+                            &timeout_context,
+                            format!(
+                                "queue={} scenario={} mode={}",
+                                queue.name(),
+                                scenario_label(&scenario),
+                                Mode::Throughput.name()
+                            ),
+                        );
+                        run_throughput_integrity(queue, &scenario, items_per_producer);
+                    }
+                }
+                set_timeout_context(&timeout_context, "completed integrity matrix");
+            },
+        );
+    }
+
+    #[test]
+    fn fill_drain_integrity_smoke_all_paths() {
+        let timeout_context = Arc::new(Mutex::new("starting integrity matrix".to_string()));
+        run_with_timeout_context(
+            "fill_drain_integrity_smoke_all_paths",
+            Arc::clone(&timeout_context),
+            move || {
+                let items_per_producer = test_items_per_producer();
+                for queue in test_queues() {
+                    for scenario in test_scenarios() {
+                        set_timeout_context(
+                            &timeout_context,
+                            format!(
+                                "queue={} scenario={} mode={}",
+                                queue.name(),
+                                scenario_label(&scenario),
+                                Mode::FillDrain.name()
+                            ),
+                        );
+                        run_fill_drain_integrity(queue, &scenario, items_per_producer);
+                    }
+                }
+                set_timeout_context(&timeout_context, "completed integrity matrix");
+            },
+        );
+    }
 }
