@@ -1,9 +1,13 @@
 [package]
 name = "ubq"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
-description = "Lock-free queue built from linked blocks for concurrent producers and consumers."
+description = "Lock-free unbounded MPMC queue backed by a linked ring of fixed-size blocks."
 license = "MIT"
+readme = "README.md"
+documentation = "https://docs.rs/ubq"
+keywords = ["queue", "mpmc", "lock-free", "concurrent", "channel"]
+categories = ["concurrency", "data-structures"]
 
 [dependencies]
 crossbeam-utils = "0.8.21"
