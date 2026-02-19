@@ -126,7 +126,7 @@ impl<T> I<T> {
 //
 // ─────────────────────────────────────────────────────────────────────────────
 impl<T> I<T> {
-    pub unsafe fn shrink(&self) -> Option<NonZeroUsize> {
+    pub fn shrink(&self) -> Option<NonZeroUsize> {
         // If no blocks have been allocated yet, nothing to do.
         let p_ = self.p.load(Ordering::Acquire);
 

@@ -65,9 +65,7 @@ impl<T> UBQ<T> {
     /// This value may change immediately due to concurrent clone/drop activity.
     #[inline]
     pub fn copies(&self) -> usize {
-        // SAFETY: `self.i` points to the shared inner allocation, which remains
-        // live while this handle exists.
-        unsafe { self.i.as_ref().copies() }
+        self.get_iref().copies()
     }
 
     /// Pushes `e` onto the back of the queue.
@@ -79,9 +77,7 @@ impl<T> UBQ<T> {
     #[doc(alias = "send")]
     #[inline]
     pub fn push(&self, e: T) {
-        // SAFETY: `self.i` points to the shared inner allocation, which remains
-        // live while this handle exists.
-        unsafe { self.i.as_ref().push(e) }
+        self.get_iref().push(e);
     }
 
     /// Removes and returns the front element, or [`None`] if no committed element
@@ -97,9 +93,7 @@ impl<T> UBQ<T> {
     #[doc(alias = "recv")]
     #[inline]
     pub fn pop(&self) -> Option<T> {
-        // SAFETY: `self.i` points to the shared inner allocation, which remains
-        // live while this handle exists.
-        unsafe { self.i.as_ref().pop() }
+        self.get_iref().pop()
     }
 
     /// Free (as opposed to recycle) all the empty blocks in this queue.
@@ -115,16 +109,20 @@ impl<T> UBQ<T> {
     /// progress, as it is technically UB for shrink to be called during other
     /// operations.
     pub unsafe fn shrink(&self) -> Option<NonZeroUsize> {
-        // SAFETY: `self.i` points to the shared inner allocation, which remains
-        // live while this handle exists.
-        unsafe { self.i.as_ref().shrink() }
+        self.get_iref().shrink()
     }
 
     /// Returns `true` if this UBQ contains no values.
     pub fn is_empty(&self) -> bool {
+        self.get_iref().is_empty()
+    }
+
+    /// Utility function to get the underlying `self.i` as a reference.
+    /// This function is safe, see the safety comment within for details.
+    fn get_iref(&self) -> &I<T> {
         // SAFETY: `self.i` points to the shared inner allocation, which remains
         // live while this handle exists.
-        unsafe { self.i.as_ref().is_empty() }
+        unsafe { self.i.as_ref() }
     }
 }
 
