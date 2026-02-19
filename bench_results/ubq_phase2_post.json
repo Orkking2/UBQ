@@ -1,0 +1,103 @@
+{
+  "meta": {
+    "timestamp_unix_ms": 1771205710017,
+    "block_cap": 32,
+    "items_per_producer": 1000000,
+    "queues": [
+      "ubq"
+    ],
+    "scenarios": [
+      {
+        "name": "spsc",
+        "producers": 1,
+        "consumers": 1
+      },
+      {
+        "name": "mpsc",
+        "producers": 4,
+        "consumers": 1
+      },
+      {
+        "name": "spmc",
+        "producers": 1,
+        "consumers": 4
+      },
+      {
+        "name": "mpmc",
+        "producers": 4,
+        "consumers": 4
+      }
+    ],
+    "available_parallelism": 16
+  },
+  "results": [
+    {
+      "queue": "ubq",
+      "scenario": "spsc",
+      "mode": "throughput",
+      "producers": 1,
+      "consumers": 1,
+      "items_per_producer": 1000000,
+      "total_items": 1000000,
+      "consumed_items": 1000000,
+      "elapsed_ns": 9321208,
+      "ops_per_sec": 107282232.08837311,
+      "push_elapsed_ns": 9271875,
+      "pop_elapsed_ns": 9300708,
+      "fill_elapsed_ns": null,
+      "drain_elapsed_ns": null,
+      "block_cap": 32
+    },
+    {
+      "queue": "ubq",
+      "scenario": "mpsc",
+      "mode": "throughput",
+      "producers": 4,
+      "consumers": 1,
+      "items_per_producer": 1000000,
+      "total_items": 4000000,
+      "consumed_items": 4000000,
+      "elapsed_ns": 355808667,
+      "ops_per_sec": 11241997.092780204,
+      "push_elapsed_ns": 355758458,
+      "pop_elapsed_ns": 355779917,
+      "fill_elapsed_ns": null,
+      "drain_elapsed_ns": null,
+      "block_cap": 32
+    },
+    {
+      "queue": "ubq",
+      "scenario": "spmc",
+      "mode": "throughput",
+      "producers": 1,
+      "consumers": 4,
+      "items_per_producer": 1000000,
+      "total_items": 1000000,
+      "consumed_items": 1000000,
+      "elapsed_ns": 90318333,
+      "ops_per_sec": 11071949.25752228,
+      "push_elapsed_ns": 10840666,
+      "pop_elapsed_ns": 90251916,
+      "fill_elapsed_ns": null,
+      "drain_elapsed_ns": null,
+      "block_cap": 32
+    },
+    {
+      "queue": "ubq",
+      "scenario": "mpmc",
+      "mode": "throughput",
+      "producers": 4,
+      "consumers": 4,
+      "items_per_producer": 1000000,
+      "total_items": 4000000,
+      "consumed_items": 4000000,
+      "elapsed_ns": 486719375,
+      "ops_per_sec": 8218288.002198392,
+      "push_elapsed_ns": 414120583,
+      "pop_elapsed_ns": 486655666,
+      "fill_elapsed_ns": null,
+      "drain_elapsed_ns": null,
+      "block_cap": 32
+    }
+  ]
+}

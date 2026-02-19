@@ -28022,3 +28022,603 @@
 [60500] tid=1 consumer-0 pop.empty block=0x708c08000 reserved=8:0 committed=8:0
 [62583] tid=1 consumer-0 pop.empty block=0x708c08000 reserved=8:0 committed=8:0
 [64625] tid=1 consumer-0 pop.empty block=0x708c08000 reserved=8:0 committed=8:0
+[16292] tid=1 producer-0 push.allocate block=0x8dc800380 slot=0:1 len=32
+[24125] tid=1 producer-0 push.write block=0x8dc800000 slot=2
+[24792] tid=2 consumer-0 pop.reserve block=0x8dc800380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[28792] tid=1 producer-0 test.pop value=99 block=0x8dc800380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x8dc800000 phead=0x8dc800380 vsn=1 chead=0x8dc800000 vsn=1
+[32250] tid=2 consumer-0 pop.reserve block=0x8dc800380 slot=1:2 committed=1:15, BLOCK_CAP=32
+[10750] tid=1 producer-0 push.allocate block=0xa0d004380 slot=0:1 len=32
+[16042] tid=1 producer-0 push.write block=0xa0d004000 slot=2
+[16292] tid=2 consumer-0 pop.reserve block=0xa0d004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[19042] tid=1 producer-0 test.pop value=99 block=0xa0d004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xa0d004000 phead=0xa0d004380 vsn=1 chead=0xa0d004000 vsn=1
+[21375] tid=2 consumer-0 pop.reserve block=0xa0d004380 slot=1:2 committed=1:14, BLOCK_CAP=32
+[13292] tid=1 producer-0 push.allocate block=0x764c04380 slot=0:1 len=32
+[18792] tid=1 producer-0 push.write block=0x764c04000 slot=2
+[24042] tid=1 producer-0 test.pop value=99 block=0x765008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x764c04380 phead=0x765008000 vsn=1 chead=0x764c04380 vsn=0
+[28459] tid=2 consumer-0 pop.reserve block=0x764c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[32625] tid=2 consumer-0 pop.reserve block=0x765008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[5375] tid=1 producer-0 push.allocate block=0xca5008380 slot=0:1 len=32
+[9625] tid=1 producer-0 push.write block=0xca5008000 slot=2
+[10000] tid=2 consumer-0 pop.reserve block=0xca5008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[12167] tid=1 producer-0 test.pop value=99 block=0xca5008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xca5008000 phead=0xca5008380 vsn=1 chead=0xca5008000 vsn=1
+[14000] tid=2 consumer-0 pop.reserve block=0xca5008380 slot=1:2 committed=1:10, BLOCK_CAP=32
+[10750] tid=1 producer-0 push.allocate block=0x856c04380 slot=0:1 len=32
+[19750] tid=1 producer-0 push.write block=0x856c04000 slot=2
+[24542] tid=1 producer-0 test.pop value=99 block=0x857008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x856c04380 phead=0x857008000 vsn=1 chead=0x856c04380 vsn=0
+[25709] tid=2 consumer-0 pop.reserve block=0x856c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[29125] tid=2 consumer-0 pop.reserve block=0x857008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[8334] tid=1 producer-0 push.allocate block=0xc13008380 slot=0:1 len=32
+[13292] tid=1 producer-0 push.write block=0xc13008000 slot=2
+[17917] tid=1 producer-0 test.pop value=99 block=0xc1300c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xc13008380 phead=0xc1300c000 vsn=1 chead=0xc13008380 vsn=0
+[19375] tid=2 consumer-0 pop.reserve block=0xc13008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[22792] tid=2 consumer-0 pop.reserve block=0xc1300c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[11458] tid=1 producer-0 push.allocate block=0x767008380 slot=0:1 len=32
+[17042] tid=1 producer-0 push.write block=0x767008000 slot=2
+[22417] tid=1 producer-0 test.pop value=99 block=0x767010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x767008380 phead=0x767010000 vsn=1 chead=0x767008380 vsn=0
+[23458] tid=2 consumer-0 pop.reserve block=0x767008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27125] tid=2 consumer-0 pop.reserve block=0x767010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[6500] tid=1 producer-0 push.allocate block=0xb7d008380 slot=0:1 len=32
+[10583] tid=2 consumer-0 pop.reserve block=0xb7d008380 slot=0:17 committed=0:25, BLOCK_CAP=32
+[11292] tid=1 producer-0 push.write block=0xb7d008000 slot=2
+[14542] tid=1 producer-0 test.pop value=99 block=0xb7d008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xb7d008000 phead=0xb7d008380 vsn=1 chead=0xb7d008000 vsn=1
+[15542] tid=2 consumer-0 pop.reserve block=0xb7d008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[51958] tid=1 producer-0 push.allocate block=0x925008380 slot=0:1 len=32
+[74791] tid=2 consumer-0 pop.reserve block=0x925008380 slot=0:17 committed=0:22, BLOCK_CAP=32
+[76458] tid=1 producer-0 push.write block=0x925008000 slot=2
+[90583] tid=2 consumer-0 pop.reserve block=0x925008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[90041] tid=1 producer-0 test.pop value=99 block=0x925008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x925008000 phead=0x925008380 vsn=1 chead=0x925008000 vsn=1
+[8916] tid=1 producer-0 push.allocate block=0xb7d004380 slot=0:1 len=32
+[13875] tid=1 producer-0 push.write block=0xb7d004000 slot=2
+[13416] tid=2 consumer-0 pop.reserve block=0xb7d004380 slot=0:17 committed=0:29, BLOCK_CAP=32
+[16916] tid=1 producer-0 test.pop value=99 block=0xb7d004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xb7d004000 phead=0xb7d004380 vsn=1 chead=0xb7d004000 vsn=1
+[18125] tid=2 consumer-0 pop.reserve block=0xb7d004380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[7750] tid=1 producer-0 push.allocate block=0x757008380 slot=0:1 len=32
+[11417] tid=2 consumer-0 pop.reserve block=0x757008380 slot=0:17 committed=0:24, BLOCK_CAP=32
+[12167] tid=1 producer-0 push.write block=0x757008000 slot=2
+[15583] tid=1 producer-0 test.pop value=99 block=0x757008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x757008000 phead=0x757008380 vsn=1 chead=0x757008000 vsn=1
+[16375] tid=2 consumer-0 pop.reserve block=0x757008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[10209] tid=1 producer-0 push.allocate block=0x93f008380 slot=0:1 len=32
+[19625] tid=1 producer-0 push.write block=0x93f008000 slot=2
+[24667] tid=1 producer-0 test.pop value=99 block=0x93f010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x93f008380 phead=0x93f010000 vsn=1 chead=0x93f008380 vsn=0
+[24625] tid=2 consumer-0 pop.reserve block=0x93f008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[29042] tid=2 consumer-0 pop.reserve block=0x93f010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[9833] tid=1 producer-0 push.allocate block=0xc98c04380 slot=0:1 len=32
+[14916] tid=1 producer-0 push.write block=0xc98c04000 slot=2
+[20208] tid=1 producer-0 test.pop value=99 block=0xc99008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xc98c04380 phead=0xc99008000 vsn=1 chead=0xc98c04380 vsn=0
+[21500] tid=2 consumer-0 pop.reserve block=0xc98c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[25625] tid=2 consumer-0 pop.reserve block=0xc99008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[14625] tid=1 producer-0 push.allocate block=0x95cc04380 slot=0:1 len=32
+[23083] tid=1 producer-0 push.write block=0x95cc04000 slot=2
+[28291] tid=1 producer-0 test.pop value=99 block=0x95d008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x95cc04380 phead=0x95d008000 vsn=1 chead=0x95cc04380 vsn=0
+[29666] tid=2 consumer-0 pop.reserve block=0x95cc04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[34041] tid=2 consumer-0 pop.reserve block=0x95d008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10625] tid=1 producer-0 push.allocate block=0x8d5004380 slot=0:1 len=32
+[15458] tid=1 producer-0 push.write block=0x8d5004000 slot=2
+[19625] tid=1 producer-0 test.pop value=99 block=0x8d4c08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x8d5004380 phead=0x8d4c08000 vsn=1 chead=0x8d5004380 vsn=0
+[21583] tid=2 consumer-0 pop.reserve block=0x8d5004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27417] tid=2 consumer-0 pop.reserve block=0x8d4c08000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[0] tid=1 producer-0 push.allocate block=0xb86c04380 slot=0:1 len=32
+[4625] tid=1 producer-0 push.write block=0xb86c04000 slot=2
+[5583] tid=2 consumer-0 pop.reserve block=0xb86c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[9958] tid=2 consumer-0 pop.reserve block=0xb87008000 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9750] tid=1 producer-0 test.pop value=99 block=0xb87008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xb86c04380 phead=0xb87008000 vsn=1 chead=0xb87008000 vsn=1
+[12833] tid=1 producer-0 push.allocate block=0x9cf004380 slot=0:1 len=32
+[20625] tid=1 producer-0 push.write block=0x9cf004000 slot=2
+[25458] tid=1 producer-0 test.pop value=99 block=0x9cec08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x9cf004380 phead=0x9cec08000 vsn=1 chead=0x9cf004380 vsn=0
+[26458] tid=2 consumer-0 pop.reserve block=0x9cf004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[30667] tid=2 consumer-0 pop.reserve block=0x9cec08000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[11125] tid=1 producer-0 push.allocate block=0xc49004380 slot=0:1 len=32
+[16417] tid=1 producer-0 push.write block=0xc49004000 slot=2
+[16208] tid=2 consumer-0 pop.reserve block=0xc49004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[19417] tid=1 producer-0 test.pop value=99 block=0xc49004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xc49004000 phead=0xc49004380 vsn=1 chead=0xc49004000 vsn=1
+[21292] tid=2 consumer-0 pop.reserve block=0xc49004380 slot=1:2 committed=1:9, BLOCK_CAP=32
+[11041] tid=1 producer-0 push.allocate block=0xc79008380 slot=0:1 len=32
+[15333] tid=1 producer-0 push.write block=0xc79008000 slot=2
+[15291] tid=2 consumer-0 pop.reserve block=0xc79008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[18208] tid=1 producer-0 test.pop value=99 block=0xc79008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xc79008000 phead=0xc79008380 vsn=1 chead=0xc79008000 vsn=1
+[19958] tid=2 consumer-0 pop.reserve block=0xc79008380 slot=1:2 committed=1:11, BLOCK_CAP=32
+[10583] tid=1 producer-0 push.allocate block=0x75f008380 slot=0:1 len=32
+[14750] tid=1 producer-0 push.write block=0x75f008000 slot=2
+[15208] tid=2 consumer-0 pop.reserve block=0x75f008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[19833] tid=1 producer-0 test.pop value=99 block=0x75f00c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x75f008380 phead=0x75f00c000 vsn=1 chead=0x75f008000 vsn=1
+[20792] tid=2 consumer-0 pop.reserve block=0x75f00c000 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9167] tid=1 producer-0 push.allocate block=0x83d008380 slot=0:1 len=32
+[13875] tid=1 producer-0 push.write block=0x83d008000 slot=2
+[13917] tid=2 consumer-0 pop.reserve block=0x83d008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[16625] tid=1 producer-0 test.pop value=99 block=0x83d008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x83d008000 phead=0x83d008380 vsn=1 chead=0x83d008000 vsn=1
+[18250] tid=2 consumer-0 pop.reserve block=0x83d008380 slot=1:2 committed=1:10, BLOCK_CAP=32
+[10041] tid=1 producer-0 push.allocate block=0xbf5004380 slot=0:1 len=32
+[18666] tid=1 producer-0 push.write block=0xbf5004000 slot=2
+[24000] tid=1 producer-0 test.pop value=99 block=0xbf4c08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xbf5004380 phead=0xbf4c08000 vsn=1 chead=0xbf5004380 vsn=0
+[24458] tid=2 consumer-0 pop.reserve block=0xbf5004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[28583] tid=2 consumer-0 pop.reserve block=0xbf4c08000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10250] tid=1 producer-0 push.allocate block=0xaa5008380 slot=0:1 len=32
+[15583] tid=1 producer-0 push.write block=0xaa5008000 slot=2
+[20167] tid=1 producer-0 test.pop value=99 block=0xaa500c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xaa5008380 phead=0xaa500c000 vsn=1 chead=0xaa5008380 vsn=0
+[21125] tid=2 consumer-0 pop.reserve block=0xaa5008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[24375] tid=2 consumer-0 pop.reserve block=0xaa500c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[7083] tid=1 producer-0 push.allocate block=0xbb0c04380 slot=0:1 len=32
+[11458] tid=1 producer-0 push.write block=0xbb0c04000 slot=2
+[11125] tid=2 consumer-0 pop.reserve block=0xbb0c04380 slot=0:17 committed=0:30, BLOCK_CAP=32
+[14500] tid=1 producer-0 test.pop value=99 block=0xbb0c04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xbb0c04000 phead=0xbb0c04380 vsn=1 chead=0xbb0c04000 vsn=1
+[15500] tid=2 consumer-0 pop.reserve block=0xbb0c04380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[11917] tid=1 producer-0 push.allocate block=0x78f008380 slot=0:1 len=32
+[17583] tid=1 producer-0 push.write block=0x78f008000 slot=2
+[22417] tid=1 producer-0 test.pop value=99 block=0x78f010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x78f008380 phead=0x78f010000 vsn=1 chead=0x78f008380 vsn=0
+[23875] tid=2 consumer-0 pop.reserve block=0x78f008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27333] tid=2 consumer-0 pop.reserve block=0x78f010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[9917] tid=1 producer-0 push.allocate block=0x831008380 slot=0:1 len=32
+[15208] tid=1 producer-0 push.write block=0x831008000 slot=2
+[19917] tid=1 producer-0 test.pop value=99 block=0x831010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x831008380 phead=0x831010000 vsn=1 chead=0x831008380 vsn=0
+[19958] tid=2 consumer-0 pop.reserve block=0x831008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[23292] tid=2 consumer-0 pop.reserve block=0x831010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[7708] tid=1 producer-0 push.allocate block=0x81f004380 slot=0:1 len=32
+[14833] tid=2 consumer-0 pop.reserve block=0x81f004380 slot=0:17 committed=0:24, BLOCK_CAP=32
+[15541] tid=1 producer-0 push.write block=0x81f004000 slot=2
+[19041] tid=1 producer-0 test.pop value=99 block=0x81f004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x81f004000 phead=0x81f004380 vsn=1 chead=0x81f004000 vsn=1
+[19708] tid=2 consumer-0 pop.reserve block=0x81f004380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[10167] tid=1 producer-0 push.allocate block=0xcb5008380 slot=0:1 len=32
+[14167] tid=2 consumer-0 pop.reserve block=0xcb5008380 slot=0:17 committed=0:26, BLOCK_CAP=32
+[14750] tid=1 producer-0 push.write block=0xcb5008000 slot=2
+[17959] tid=1 producer-0 test.pop value=99 block=0xcb5008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xcb5008000 phead=0xcb5008380 vsn=1 chead=0xcb5008000 vsn=1
+[18834] tid=2 consumer-0 pop.reserve block=0xcb5008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9584] tid=1 producer-0 push.allocate block=0x91b004380 slot=0:1 len=32
+[17125] tid=2 consumer-0 pop.reserve block=0x91b004380 slot=0:17 committed=0:25, BLOCK_CAP=32
+[17792] tid=1 producer-0 push.write block=0x91b004000 slot=2
+[21292] tid=1 producer-0 test.pop value=99 block=0x91b004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x91b004000 phead=0x91b004380 vsn=1 chead=0x91b004000 vsn=1
+[21917] tid=2 consumer-0 pop.reserve block=0x91b004380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[11042] tid=1 producer-0 push.allocate block=0x8e1008380 slot=0:1 len=32
+[15667] tid=1 producer-0 push.write block=0x8e1008000 slot=2
+[20375] tid=1 producer-0 test.pop value=99 block=0x8e1010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x8e1008380 phead=0x8e1010000 vsn=1 chead=0x8e1008380 vsn=0
+[21792] tid=2 consumer-0 pop.reserve block=0x8e1008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[25083] tid=2 consumer-0 pop.reserve block=0x8e1010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[13709] tid=1 producer-0 push.allocate block=0xb16c04380 slot=0:1 len=32
+[18250] tid=1 producer-0 push.write block=0xb16c04000 slot=2
+[22292] tid=1 producer-0 test.pop value=99 block=0xb17008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xb16c04380 phead=0xb17008000 vsn=1 chead=0xb16c04380 vsn=0
+[23584] tid=2 consumer-0 pop.reserve block=0xb16c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27375] tid=2 consumer-0 pop.reserve block=0xb17008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[11917] tid=1 producer-0 push.allocate block=0xbd1004380 slot=0:1 len=32
+[16917] tid=1 producer-0 push.write block=0xbd1004000 slot=2
+[17250] tid=2 consumer-0 pop.reserve block=0xbd1004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[20000] tid=1 producer-0 test.pop value=99 block=0xbd1004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xbd1004000 phead=0xbd1004380 vsn=1 chead=0xbd1004000 vsn=1
+[21792] tid=2 consumer-0 pop.reserve block=0xbd1004380 slot=1:2 committed=1:9, BLOCK_CAP=32
+[9958] tid=1 producer-0 push.allocate block=0xb0b004380 slot=0:1 len=32
+[14917] tid=2 consumer-0 pop.reserve block=0xb0b004380 slot=0:17 committed=0:22, BLOCK_CAP=32
+[15792] tid=1 producer-0 push.write block=0xb0b004000 slot=2
+[19208] tid=1 producer-0 test.pop value=99 block=0xb0b004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xb0b004000 phead=0xb0b004380 vsn=1 chead=0xb0b004000 vsn=1
+[19958] tid=2 consumer-0 pop.reserve block=0xb0b004380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[12958] tid=1 producer-0 push.allocate block=0x93b008380 slot=0:1 len=32
+[17958] tid=1 producer-0 push.write block=0x93b008000 slot=2
+[23917] tid=2 consumer-0 pop.reserve block=0x93b008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[26167] tid=1 producer-0 test.pop value=99 block=0x93b010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x93b008380 phead=0x93b010000 vsn=1 chead=0x93b008380 vsn=0
+[29083] tid=2 consumer-0 pop.reserve block=0x93b010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10000] tid=1 producer-0 push.allocate block=0xb11008380 slot=0:1 len=32
+[14375] tid=1 producer-0 push.write block=0xb11008000 slot=2
+[14333] tid=2 consumer-0 pop.reserve block=0xb11008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[17708] tid=1 producer-0 test.pop value=99 block=0xb11008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xb11008000 phead=0xb11008380 vsn=1 chead=0xb11008000 vsn=1
+[18750] tid=2 consumer-0 pop.reserve block=0xb11008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[13291] tid=1 producer-0 push.allocate block=0xb91004380 slot=0:1 len=32
+[23833] tid=1 producer-0 push.write block=0xb91004000 slot=2
+[23916] tid=2 consumer-0 pop.reserve block=0xb91004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27791] tid=1 producer-0 test.pop value=99 block=0xb91004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xb91004000 phead=0xb91004380 vsn=1 chead=0xb91004000 vsn=1
+[28750] tid=2 consumer-0 pop.reserve block=0xb91004380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[10541] tid=1 producer-0 push.allocate block=0x8c8c04380 slot=0:1 len=32
+[15916] tid=1 producer-0 push.write block=0x8c8c04000 slot=2
+[15583] tid=2 consumer-0 pop.reserve block=0x8c8c04380 slot=0:17 committed=0:31, BLOCK_CAP=32
+[19333] tid=1 producer-0 test.pop value=99 block=0x8c8c04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x8c8c04000 phead=0x8c8c04380 vsn=1 chead=0x8c8c04000 vsn=1
+[20916] tid=2 consumer-0 pop.reserve block=0x8c8c04380 slot=1:2 committed=1:7, BLOCK_CAP=32
+[9375] tid=1 producer-0 push.allocate block=0xa79008380 slot=0:1 len=32
+[14042] tid=1 producer-0 push.write block=0xa79008000 slot=2
+[13542] tid=2 consumer-0 pop.reserve block=0xa79008380 slot=0:17 committed=0:27, BLOCK_CAP=32
+[17042] tid=1 producer-0 test.pop value=99 block=0xa79008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xa79008000 phead=0xa79008380 vsn=1 chead=0xa79008000 vsn=1
+[18125] tid=2 consumer-0 pop.reserve block=0xa79008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[11292] tid=1 producer-0 push.allocate block=0xc74c04380 slot=0:1 len=32
+[15500] tid=2 consumer-0 pop.reserve block=0xc74c04380 slot=0:17 committed=0:23, BLOCK_CAP=32
+[16250] tid=1 producer-0 push.write block=0xc74c04000 slot=2
+[20334] tid=2 consumer-0 pop.reserve block=0xc74c04380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[19584] tid=1 producer-0 test.pop value=99 block=0xc74c04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xc74c04000 phead=0xc74c04380 vsn=1 chead=0xc74c04000 vsn=1
+[11917] tid=1 producer-0 push.allocate block=0x81d008380 slot=0:1 len=32
+[16959] tid=1 producer-0 push.write block=0x81d008000 slot=2
+[22584] tid=1 producer-0 test.pop value=99 block=0x81d00c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x81d008380 phead=0x81d00c000 vsn=1 chead=0x81d008380 vsn=0
+[24542] tid=2 consumer-0 pop.reserve block=0x81d008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[29375] tid=2 consumer-0 pop.reserve block=0x81d00c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10250] tid=1 producer-0 push.allocate block=0xc48c04380 slot=0:1 len=32
+[17917] tid=2 consumer-0 pop.reserve block=0xc48c04380 slot=0:17 committed=0:20, BLOCK_CAP=32
+[18958] tid=1 producer-0 push.write block=0xc48c04000 slot=2
+[22042] tid=1 producer-0 test.pop value=99 block=0xc48c04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xc48c04000 phead=0xc48c04380 vsn=1 chead=0xc48c04000 vsn=1
+[22833] tid=2 consumer-0 pop.reserve block=0xc48c04380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[10125] tid=1 producer-0 push.allocate block=0x870c04380 slot=0:1 len=32
+[14833] tid=1 producer-0 push.write block=0x870c04000 slot=2
+[19542] tid=1 producer-0 test.pop value=99 block=0x871008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x870c04380 phead=0x871008000 vsn=1 chead=0x870c04380 vsn=0
+[21708] tid=2 consumer-0 pop.reserve block=0x870c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[29458] tid=2 consumer-0 pop.reserve block=0x871008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10209] tid=1 producer-0 push.allocate block=0xc9b004380 slot=0:1 len=32
+[17959] tid=1 producer-0 push.write block=0xc9b004000 slot=2
+[17875] tid=2 consumer-0 pop.reserve block=0xc9b004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[21042] tid=1 producer-0 test.pop value=99 block=0xc9b004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xc9b004000 phead=0xc9b004380 vsn=1 chead=0xc9b004000 vsn=1
+[22167] tid=2 consumer-0 pop.reserve block=0xc9b004380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[10084] tid=1 producer-0 push.allocate block=0xc75004380 slot=0:1 len=32
+[15167] tid=1 producer-0 push.write block=0xc75004000 slot=2
+[20959] tid=1 producer-0 test.pop value=99 block=0xc74c08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xc75004380 phead=0xc74c08000 vsn=1 chead=0xc75004380 vsn=0
+[21667] tid=2 consumer-0 pop.reserve block=0xc75004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[26959] tid=2 consumer-0 pop.reserve block=0xc74c08000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[8000] tid=1 producer-0 push.allocate block=0xa0ec04380 slot=0:1 len=32
+[12625] tid=1 producer-0 push.write block=0xa0ec04000 slot=2
+[12791] tid=2 consumer-0 pop.reserve block=0xa0ec04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[17458] tid=2 consumer-0 pop.reserve block=0xa0f008000 slot=1:2 committed=1:4, BLOCK_CAP=32
+[17250] tid=1 producer-0 test.pop value=99 block=0xa0f008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xa0ec04380 phead=0xa0f008000 vsn=1 chead=0xa0f008000 vsn=1
+[12000] tid=1 producer-0 push.allocate block=0xbbd004380 slot=0:1 len=32
+[16625] tid=1 producer-0 push.write block=0xbbd004000 slot=2
+[21500] tid=1 producer-0 test.pop value=99 block=0xbbcc08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xbbd004380 phead=0xbbcc08000 vsn=1 chead=0xbbd004380 vsn=0
+[22000] tid=2 consumer-0 pop.reserve block=0xbbd004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[26000] tid=2 consumer-0 pop.reserve block=0xbbcc08000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10708] tid=1 producer-0 push.allocate block=0x7a3008380 slot=0:1 len=32
+[15208] tid=2 consumer-0 pop.reserve block=0x7a3008380 slot=0:17 committed=0:26, BLOCK_CAP=32
+[15833] tid=1 producer-0 push.write block=0x7a3008000 slot=2
+[19791] tid=1 producer-0 test.pop value=99 block=0x7a3008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x7a3008000 phead=0x7a3008380 vsn=1 chead=0x7a3008000 vsn=1
+[20875] tid=2 consumer-0 pop.reserve block=0x7a3008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9875] tid=1 producer-0 push.allocate block=0xaeb008380 slot=0:1 len=32
+[14292] tid=1 producer-0 push.write block=0xaeb008000 slot=2
+[14500] tid=2 consumer-0 pop.reserve block=0xaeb008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[17000] tid=1 producer-0 test.pop value=99 block=0xaeb008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xaeb008000 phead=0xaeb008380 vsn=1 chead=0xaeb008000 vsn=1
+[19000] tid=2 consumer-0 pop.reserve block=0xaeb008380 slot=1:2 committed=1:13, BLOCK_CAP=32
+[14833] tid=1 producer-0 push.allocate block=0xb45004380 slot=0:1 len=32
+[19750] tid=1 producer-0 push.write block=0xb45004000 slot=2
+[20375] tid=2 consumer-0 pop.reserve block=0xb45004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[24666] tid=2 consumer-0 pop.reserve block=0xb44c08000 slot=1:2 committed=1:4, BLOCK_CAP=32
+[24416] tid=1 producer-0 test.pop value=99 block=0xb44c08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xb45004380 phead=0xb44c08000 vsn=1 chead=0xb45004000 vsn=1
+[8916] tid=1 producer-0 push.allocate block=0xbc5008380 slot=0:1 len=32
+[16333] tid=2 consumer-0 pop.reserve block=0xbc5008380 slot=0:17 committed=0:26, BLOCK_CAP=32
+[16916] tid=1 producer-0 push.write block=0xbc5008000 slot=2
+[20250] tid=1 producer-0 test.pop value=99 block=0xbc5008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xbc5008000 phead=0xbc5008380 vsn=1 chead=0xbc5008000 vsn=1
+[21000] tid=2 consumer-0 pop.reserve block=0xbc5008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[11209] tid=1 producer-0 push.allocate block=0x9b9004380 slot=0:1 len=32
+[17042] tid=1 producer-0 push.write block=0x9b9004000 slot=2
+[21834] tid=1 producer-0 test.pop value=99 block=0x9b8c08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x9b9004380 phead=0x9b8c08000 vsn=1 chead=0x9b9004380 vsn=0
+[24042] tid=2 consumer-0 pop.reserve block=0x9b9004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27500] tid=2 consumer-0 pop.reserve block=0x9b8c08000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[7458] tid=1 producer-0 push.allocate block=0x86f008380 slot=0:1 len=32
+[11208] tid=2 consumer-0 pop.reserve block=0x86f008380 slot=0:17 committed=0:24, BLOCK_CAP=32
+[11916] tid=1 producer-0 push.write block=0x86f008000 slot=2
+[15291] tid=1 producer-0 test.pop value=99 block=0x86f008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x86f008000 phead=0x86f008380 vsn=1 chead=0x86f008000 vsn=1
+[15916] tid=2 consumer-0 pop.reserve block=0x86f008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9542] tid=1 producer-0 push.allocate block=0x9e3008380 slot=0:1 len=32
+[19375] tid=1 producer-0 push.write block=0x9e3008000 slot=2
+[24875] tid=1 producer-0 test.pop value=99 block=0x9e3010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x9e3008380 phead=0x9e3010000 vsn=1 chead=0x9e3008380 vsn=0
+[25625] tid=2 consumer-0 pop.reserve block=0x9e3008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[30042] tid=2 consumer-0 pop.reserve block=0x9e3010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10958] tid=1 producer-0 push.allocate block=0xa23008380 slot=0:1 len=32
+[16083] tid=2 consumer-0 pop.reserve block=0xa23008380 slot=0:17 committed=0:28, BLOCK_CAP=32
+[16500] tid=1 producer-0 push.write block=0xa23008000 slot=2
+[20125] tid=1 producer-0 test.pop value=99 block=0xa23008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xa23008000 phead=0xa23008380 vsn=1 chead=0xa23008000 vsn=1
+[20917] tid=2 consumer-0 pop.reserve block=0xa23008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[7541] tid=1 producer-0 push.allocate block=0xa55008380 slot=0:1 len=32
+[11916] tid=1 producer-0 push.write block=0xa55008000 slot=2
+[12125] tid=2 consumer-0 pop.reserve block=0xa55008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[14416] tid=1 producer-0 test.pop value=99 block=0xa55008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xa55008000 phead=0xa55008380 vsn=1 chead=0xa55008000 vsn=1
+[16666] tid=2 consumer-0 pop.reserve block=0xa55008380 slot=1:2 committed=1:24, BLOCK_CAP=32
+[12583] tid=1 producer-0 push.allocate block=0xc31008380 slot=0:1 len=32
+[20500] tid=1 producer-0 push.write block=0xc31008000 slot=2
+[25333] tid=1 producer-0 test.pop value=99 block=0xc3100c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xc31008380 phead=0xc3100c000 vsn=1 chead=0xc31008380 vsn=0
+[27166] tid=2 consumer-0 pop.reserve block=0xc31008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[30541] tid=2 consumer-0 pop.reserve block=0xc3100c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[8167] tid=1 producer-0 push.allocate block=0x83ec04380 slot=0:1 len=32
+[12209] tid=1 producer-0 push.write block=0x83ec04000 slot=2
+[12042] tid=2 consumer-0 pop.reserve block=0x83ec04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[15292] tid=1 producer-0 test.pop value=99 block=0x83ec04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x83ec04000 phead=0x83ec04380 vsn=1 chead=0x83ec04000 vsn=1
+[17084] tid=2 consumer-0 pop.reserve block=0x83ec04380 slot=1:2 committed=1:7, BLOCK_CAP=32
+[10000] tid=1 producer-0 push.allocate block=0xbe7008380 slot=0:1 len=32
+[17334] tid=2 consumer-0 pop.reserve block=0xbe7008380 slot=0:17 committed=0:24, BLOCK_CAP=32
+[18042] tid=1 producer-0 push.write block=0xbe7008000 slot=2
+[21167] tid=1 producer-0 test.pop value=99 block=0xbe7008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xbe7008000 phead=0xbe7008380 vsn=1 chead=0xbe7008000 vsn=1
+[22125] tid=2 consumer-0 pop.reserve block=0xbe7008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[6625] tid=1 producer-0 push.allocate block=0x98d008380 slot=0:1 len=32
+[11334] tid=1 producer-0 push.write block=0x98d008000 slot=2
+[11625] tid=2 consumer-0 pop.reserve block=0x98d008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[14209] tid=1 producer-0 test.pop value=99 block=0x98d008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x98d008000 phead=0x98d008380 vsn=1 chead=0x98d008000 vsn=1
+[15542] tid=2 consumer-0 pop.reserve block=0x98d008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9334] tid=1 producer-0 push.allocate block=0x782c04380 slot=0:1 len=32
+[13959] tid=1 producer-0 push.write block=0x782c04000 slot=2
+[14084] tid=2 consumer-0 pop.reserve block=0x782c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[16375] tid=1 producer-0 test.pop value=99 block=0x782c04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x782c04000 phead=0x782c04380 vsn=1 chead=0x782c04000 vsn=1
+[17709] tid=2 consumer-0 pop.reserve block=0x782c04380 slot=1:2 committed=1:9, BLOCK_CAP=32
+[12959] tid=1 producer-0 push.allocate block=0xb7f008380 slot=0:1 len=32
+[17792] tid=1 producer-0 push.write block=0xb7f008000 slot=2
+[21792] tid=1 producer-0 test.pop value=99 block=0xb7f00c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xb7f008380 phead=0xb7f00c000 vsn=1 chead=0xb7f008380 vsn=0
+[23167] tid=2 consumer-0 pop.reserve block=0xb7f008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[26667] tid=2 consumer-0 pop.reserve block=0xb7f00c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10416] tid=1 producer-0 push.allocate block=0xbc3008380 slot=0:1 len=32
+[15541] tid=2 consumer-0 pop.reserve block=0xbc3008380 slot=0:17 committed=0:26, BLOCK_CAP=32
+[16000] tid=1 producer-0 push.write block=0xbc3008000 slot=2
+[19250] tid=1 producer-0 test.pop value=99 block=0xbc3008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xbc3008000 phead=0xbc3008380 vsn=1 chead=0xbc3008000 vsn=1
+[20166] tid=2 consumer-0 pop.reserve block=0xbc3008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[6625] tid=1 producer-0 push.allocate block=0x8a7008380 slot=0:1 len=32
+[10584] tid=2 consumer-0 pop.reserve block=0x8a7008380 slot=0:17 committed=0:25, BLOCK_CAP=32
+[11209] tid=1 producer-0 push.write block=0x8a7008000 slot=2
+[14667] tid=1 producer-0 test.pop value=99 block=0x8a7008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x8a7008000 phead=0x8a7008380 vsn=1 chead=0x8a7008000 vsn=1
+[15292] tid=2 consumer-0 pop.reserve block=0x8a7008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[10083] tid=1 producer-0 push.allocate block=0x92f008380 slot=0:1 len=32
+[15083] tid=1 producer-0 push.write block=0x92f008000 slot=2
+[15208] tid=2 consumer-0 pop.reserve block=0x92f008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[18667] tid=1 producer-0 test.pop value=99 block=0x92f008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x92f008000 phead=0x92f008380 vsn=1 chead=0x92f008000 vsn=1
+[20792] tid=2 consumer-0 pop.reserve block=0x92f008380 slot=1:2 committed=1:13, BLOCK_CAP=32
+[10083] tid=1 producer-0 push.allocate block=0xa4ac04380 slot=0:1 len=32
+[17875] tid=1 producer-0 push.write block=0xa4ac04000 slot=2
+[22917] tid=1 producer-0 test.pop value=99 block=0xa4b008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xa4ac04380 phead=0xa4b008000 vsn=1 chead=0xa4ac04380 vsn=0
+[24125] tid=2 consumer-0 pop.reserve block=0xa4ac04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27917] tid=2 consumer-0 pop.reserve block=0xa4b008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[9375] tid=1 producer-0 push.allocate block=0xbf2c04380 slot=0:1 len=32
+[13916] tid=1 producer-0 push.write block=0xbf2c04000 slot=2
+[17666] tid=1 producer-0 test.pop value=99 block=0xbf3008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xbf2c04380 phead=0xbf3008000 vsn=1 chead=0xbf2c04380 vsn=0
+[19250] tid=2 consumer-0 pop.reserve block=0xbf2c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[22666] tid=2 consumer-0 pop.reserve block=0xbf3008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[7375] tid=1 producer-0 push.allocate block=0x87d008380 slot=0:1 len=32
+[11625] tid=1 producer-0 push.write block=0x87d008000 slot=2
+[11791] tid=2 consumer-0 pop.reserve block=0x87d008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[14250] tid=1 producer-0 test.pop value=99 block=0x87d008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x87d008000 phead=0x87d008380 vsn=1 chead=0x87d008000 vsn=1
+[16166] tid=2 consumer-0 pop.reserve block=0x87d008380 slot=1:2 committed=1:15, BLOCK_CAP=32
+[10708] tid=1 producer-0 push.allocate block=0xc79008380 slot=0:1 len=32
+[15750] tid=1 producer-0 push.write block=0xc79008000 slot=2
+[20792] tid=1 producer-0 test.pop value=99 block=0xc7900c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xc79008380 phead=0xc7900c000 vsn=1 chead=0xc79008380 vsn=0
+[21792] tid=2 consumer-0 pop.reserve block=0xc79008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[25167] tid=2 consumer-0 pop.reserve block=0xc7900c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10250] tid=1 producer-0 push.allocate block=0xc45004380 slot=0:1 len=32
+[14792] tid=1 producer-0 push.write block=0xc45004000 slot=2
+[15584] tid=2 consumer-0 pop.reserve block=0xc45004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[19625] tid=1 producer-0 test.pop value=99 block=0xc44c08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xc45004380 phead=0xc44c08000 vsn=1 chead=0xc45004000 vsn=1
+[20042] tid=2 consumer-0 pop.reserve block=0xc44c08000 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9625] tid=1 producer-0 push.allocate block=0x79b008380 slot=0:1 len=32
+[14709] tid=1 producer-0 push.write block=0x79b008000 slot=2
+[19375] tid=1 producer-0 test.pop value=99 block=0x79b010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x79b008380 phead=0x79b010000 vsn=1 chead=0x79b008380 vsn=0
+[20750] tid=2 consumer-0 pop.reserve block=0x79b008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[24917] tid=2 consumer-0 pop.reserve block=0x79b010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[11000] tid=1 producer-0 push.allocate block=0xa90c04380 slot=0:1 len=32
+[15708] tid=1 producer-0 push.write block=0xa90c04000 slot=2
+[16083] tid=2 consumer-0 pop.reserve block=0xa90c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[20791] tid=2 consumer-0 pop.reserve block=0xa91008000 slot=1:2 committed=1:4, BLOCK_CAP=32
+[20666] tid=1 producer-0 test.pop value=99 block=0xa91008000 slot=3 alloc=1:4 committed=1:4 reserved=1:1 consumed=1:1 next=0xa90c04380 phead=0xa91008000 vsn=1 chead=0xa91008000 vsn=1
+[12167] tid=1 producer-0 push.allocate block=0x754c04380 slot=0:1 len=32
+[17334] tid=1 producer-0 push.write block=0x754c04000 slot=2
+[21917] tid=1 producer-0 test.pop value=99 block=0x755008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x754c04380 phead=0x755008000 vsn=1 chead=0x754c04380 vsn=0
+[23625] tid=2 consumer-0 pop.reserve block=0x754c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[26834] tid=2 consumer-0 pop.reserve block=0x755008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[20583] tid=1 producer-0 push.allocate block=0xac1400380 slot=0:1 len=32
+[27083] tid=1 producer-0 push.write block=0xac1400000 slot=2
+[32750] tid=1 producer-0 test.pop value=99 block=0xac1008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xac1400380 phead=0xac1008000 vsn=1 chead=0xac1400380 vsn=0
+[34791] tid=2 consumer-0 pop.reserve block=0xac1400380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[40875] tid=2 consumer-0 pop.reserve block=0xac1008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[11916] tid=1 producer-0 push.allocate block=0x90f008380 slot=0:1 len=32
+[16583] tid=1 producer-0 push.write block=0x90f008000 slot=2
+[20875] tid=1 producer-0 test.pop value=99 block=0x90f010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x90f008380 phead=0x90f010000 vsn=1 chead=0x90f008380 vsn=0
+[23250] tid=2 consumer-0 pop.reserve block=0x90f008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27625] tid=2 consumer-0 pop.reserve block=0x90f010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[7250] tid=1 producer-0 push.allocate block=0xa71004380 slot=0:1 len=32
+[11291] tid=2 consumer-0 pop.reserve block=0xa71004380 slot=0:17 committed=0:26, BLOCK_CAP=32
+[11916] tid=1 producer-0 push.write block=0xa71004000 slot=2
+[15041] tid=1 producer-0 test.pop value=99 block=0xa71004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xa71004000 phead=0xa71004380 vsn=1 chead=0xa71004000 vsn=1
+[16166] tid=2 consumer-0 pop.reserve block=0xa71004380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9625] tid=1 producer-0 push.allocate block=0x8b9008380 slot=0:1 len=32
+[15000] tid=1 producer-0 push.write block=0x8b9008000 slot=2
+[19375] tid=1 producer-0 test.pop value=99 block=0x8b900c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x8b9008380 phead=0x8b900c000 vsn=1 chead=0x8b9008380 vsn=0
+[19541] tid=2 consumer-0 pop.reserve block=0x8b9008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[23666] tid=2 consumer-0 pop.reserve block=0x8b900c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10750] tid=1 producer-0 push.allocate block=0x8cd008380 slot=0:1 len=32
+[17000] tid=1 producer-0 push.write block=0x8cd008000 slot=2
+[17166] tid=2 consumer-0 pop.reserve block=0x8cd008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[19750] tid=1 producer-0 test.pop value=99 block=0x8cd008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x8cd008000 phead=0x8cd008380 vsn=1 chead=0x8cd008000 vsn=1
+[21500] tid=2 consumer-0 pop.reserve block=0x8cd008380 slot=1:2 committed=1:12, BLOCK_CAP=32
+[10166] tid=1 producer-0 push.allocate block=0x855008380 slot=0:1 len=32
+[14208] tid=2 consumer-0 pop.reserve block=0x855008380 slot=0:17 committed=0:25, BLOCK_CAP=32
+[14791] tid=1 producer-0 push.write block=0x855008000 slot=2
+[18083] tid=1 producer-0 test.pop value=99 block=0x855008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x855008000 phead=0x855008380 vsn=1 chead=0x855008000 vsn=1
+[18958] tid=2 consumer-0 pop.reserve block=0x855008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[11750] tid=1 producer-0 push.allocate block=0x866c04380 slot=0:1 len=32
+[16542] tid=1 producer-0 push.write block=0x866c04000 slot=2
+[21125] tid=1 producer-0 test.pop value=99 block=0x867008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x866c04380 phead=0x867008000 vsn=1 chead=0x866c04380 vsn=0
+[22375] tid=2 consumer-0 pop.reserve block=0x866c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[25750] tid=2 consumer-0 pop.reserve block=0x867008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10458] tid=1 producer-0 push.allocate block=0xb8b008380 slot=0:1 len=32
+[18625] tid=1 producer-0 push.write block=0xb8b008000 slot=2
+[23292] tid=1 producer-0 test.pop value=99 block=0xb8b010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xb8b008380 phead=0xb8b010000 vsn=1 chead=0xb8b008380 vsn=0
+[24542] tid=2 consumer-0 pop.reserve block=0xb8b008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[28750] tid=2 consumer-0 pop.reserve block=0xb8b010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10792] tid=1 producer-0 push.allocate block=0xa4cc04380 slot=0:1 len=32
+[19125] tid=1 producer-0 push.write block=0xa4cc04000 slot=2
+[23833] tid=2 consumer-0 pop.reserve block=0xa4cc04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[24083] tid=1 producer-0 test.pop value=99 block=0xa4d008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xa4cc04380 phead=0xa4d008000 vsn=1 chead=0xa4cc04380 vsn=0
+[28333] tid=2 consumer-0 pop.reserve block=0xa4d008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10000] tid=1 producer-0 push.allocate block=0xc69008380 slot=0:1 len=32
+[17625] tid=1 producer-0 push.write block=0xc69008000 slot=2
+[22500] tid=1 producer-0 test.pop value=99 block=0xc6900c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xc69008380 phead=0xc6900c000 vsn=1 chead=0xc69008380 vsn=0
+[23791] tid=2 consumer-0 pop.reserve block=0xc69008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[26833] tid=2 consumer-0 pop.reserve block=0xc6900c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10917] tid=1 producer-0 push.allocate block=0xb73008380 slot=0:1 len=32
+[15875] tid=1 producer-0 push.write block=0xb73008000 slot=2
+[20834] tid=1 producer-0 test.pop value=99 block=0xb7300c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xb73008380 phead=0xb7300c000 vsn=1 chead=0xb73008380 vsn=0
+[22125] tid=2 consumer-0 pop.reserve block=0xb73008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[25834] tid=2 consumer-0 pop.reserve block=0xb7300c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[11917] tid=1 producer-0 push.allocate block=0xb35008380 slot=0:1 len=32
+[16542] tid=1 producer-0 push.write block=0xb35008000 slot=2
+[20833] tid=1 producer-0 test.pop value=99 block=0xb3500c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xb35008380 phead=0xb3500c000 vsn=1 chead=0xb35008380 vsn=0
+[21500] tid=2 consumer-0 pop.reserve block=0xb35008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[24833] tid=2 consumer-0 pop.reserve block=0xb3500c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[41] tid=1 producer-0 push.allocate block=0xc39008380 slot=0:1 len=32
+[5250] tid=1 producer-0 push.write block=0xc39010000 slot=2
+[6458] tid=2 consumer-0 pop.reserve block=0xc39008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[7916] tid=1 producer-0 test.pop value=99 block=0xc39008000 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xc39008380 phead=0xc39008000 vsn=1 chead=0xc39008380 vsn=0
+[10916] tid=2 consumer-0 pop.reserve block=0xc39008000 slot=1:2 committed=1:28, BLOCK_CAP=32
+[9875] tid=1 producer-0 push.allocate block=0xb51008380 slot=0:1 len=32
+[23000] tid=2 consumer-0 pop.reserve block=0xb51008380 slot=0:17 committed=0:24, BLOCK_CAP=32
+[23666] tid=1 producer-0 push.write block=0xb51008000 slot=2
+[26375] tid=1 producer-0 test.pop value=99 block=0xb51008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xb51008000 phead=0xb51008380 vsn=1 chead=0xb51008000 vsn=1
+[27000] tid=2 consumer-0 pop.reserve block=0xb51008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9916] tid=1 producer-0 push.allocate block=0x7cec04380 slot=0:1 len=32
+[14291] tid=1 producer-0 push.write block=0x7cec04000 slot=2
+[14666] tid=2 consumer-0 pop.reserve block=0x7cec04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[16916] tid=1 producer-0 test.pop value=99 block=0x7cec04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x7cec04000 phead=0x7cec04380 vsn=1 chead=0x7cec04000 vsn=1
+[18625] tid=2 consumer-0 pop.reserve block=0x7cec04380 slot=1:2 committed=1:10, BLOCK_CAP=32
+[10792] tid=1 producer-0 push.allocate block=0x86cc04380 slot=0:1 len=32
+[16333] tid=1 producer-0 push.write block=0x86cc04000 slot=2
+[16125] tid=2 consumer-0 pop.reserve block=0x86cc04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[20167] tid=1 producer-0 test.pop value=99 block=0x86cc04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x86cc04000 phead=0x86cc04380 vsn=1 chead=0x86cc04000 vsn=1
+[21125] tid=2 consumer-0 pop.reserve block=0x86cc04380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[6083] tid=1 producer-0 push.allocate block=0xa26c04380 slot=0:1 len=32
+[10458] tid=2 consumer-0 pop.reserve block=0xa26c04380 slot=0:17 committed=0:27, BLOCK_CAP=32
+[10958] tid=1 producer-0 push.write block=0xa26c04000 slot=2
+[14375] tid=1 producer-0 test.pop value=99 block=0xa26c04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xa26c04000 phead=0xa26c04380 vsn=1 chead=0xa26c04000 vsn=1
+[15250] tid=2 consumer-0 pop.reserve block=0xa26c04380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9875] tid=1 producer-0 push.allocate block=0x809008380 slot=0:1 len=32
+[14667] tid=1 producer-0 push.write block=0x809008000 slot=2
+[14167] tid=2 consumer-0 pop.reserve block=0x809008380 slot=0:17 committed=0:28, BLOCK_CAP=32
+[17834] tid=1 producer-0 test.pop value=99 block=0x809008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x809008000 phead=0x809008380 vsn=1 chead=0x809008000 vsn=1
+[18750] tid=2 consumer-0 pop.reserve block=0x809008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[6041] tid=1 producer-0 push.allocate block=0x707008380 slot=0:1 len=32
+[9541] tid=2 consumer-0 pop.reserve block=0x707008380 slot=0:17 committed=0:24, BLOCK_CAP=32
+[10291] tid=1 producer-0 push.write block=0x707008000 slot=2
+[14333] tid=2 consumer-0 pop.reserve block=0x707008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[13750] tid=1 producer-0 test.pop value=99 block=0x707008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x707008000 phead=0x707008380 vsn=1 chead=0x707008000 vsn=1
+[9416] tid=1 producer-0 push.allocate block=0xb35004380 slot=0:1 len=32
+[17625] tid=1 producer-0 push.write block=0xb35004000 slot=2
+[22541] tid=1 producer-0 test.pop value=99 block=0xb34c08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xb35004380 phead=0xb34c08000 vsn=1 chead=0xb35004380 vsn=0
+[24291] tid=2 consumer-0 pop.reserve block=0xb35004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27500] tid=2 consumer-0 pop.reserve block=0xb34c08000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[9458] tid=1 producer-0 push.allocate block=0xa29008380 slot=0:1 len=32
+[17625] tid=1 producer-0 push.write block=0xa29008000 slot=2
+[21875] tid=2 consumer-0 pop.reserve block=0xa29008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[22625] tid=1 producer-0 test.pop value=99 block=0xa29010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xa29008380 phead=0xa29010000 vsn=1 chead=0xa29008380 vsn=0
+[25916] tid=2 consumer-0 pop.reserve block=0xa29010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10333] tid=1 producer-0 push.allocate block=0x7a8c04380 slot=0:1 len=32
+[14916] tid=1 producer-0 push.write block=0x7a8c04000 slot=2
+[20625] tid=1 producer-0 test.pop value=99 block=0x7a9008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x7a8c04380 phead=0x7a9008000 vsn=1 chead=0x7a8c04380 vsn=0
+[20750] tid=2 consumer-0 pop.reserve block=0x7a8c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[25250] tid=2 consumer-0 pop.reserve block=0x7a9008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[7000] tid=1 producer-0 push.allocate block=0x963008380 slot=0:1 len=32
+[11041] tid=1 producer-0 push.write block=0x963008000 slot=2
+[11333] tid=2 consumer-0 pop.reserve block=0x963008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[13625] tid=1 producer-0 test.pop value=99 block=0x963008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x963008000 phead=0x963008380 vsn=1 chead=0x963008000 vsn=1
+[15416] tid=2 consumer-0 pop.reserve block=0x963008380 slot=1:2 committed=1:13, BLOCK_CAP=32
+[9667] tid=1 producer-0 push.allocate block=0xcb3008380 slot=0:1 len=32
+[17625] tid=1 producer-0 push.write block=0xcb3008000 slot=2
+[22250] tid=2 consumer-0 pop.reserve block=0xcb3008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[22917] tid=1 producer-0 test.pop value=99 block=0xcb300c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xcb3008380 phead=0xcb300c000 vsn=1 chead=0xcb3008380 vsn=0
+[26792] tid=2 consumer-0 pop.reserve block=0xcb300c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10500] tid=1 producer-0 push.allocate block=0x7c9008380 slot=0:1 len=32
+[16041] tid=1 producer-0 push.write block=0x7c9008000 slot=2
+[20916] tid=1 producer-0 test.pop value=99 block=0x7c900c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x7c9008380 phead=0x7c900c000 vsn=1 chead=0x7c9008380 vsn=0
+[23166] tid=2 consumer-0 pop.reserve block=0x7c9008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27208] tid=2 consumer-0 pop.reserve block=0x7c900c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10959] tid=1 producer-0 push.allocate block=0xc1f008380 slot=0:1 len=32
+[15042] tid=2 consumer-0 pop.reserve block=0xc1f008380 slot=0:17 committed=0:24, BLOCK_CAP=32
+[15709] tid=1 producer-0 push.write block=0xc1f008000 slot=2
+[19000] tid=1 producer-0 test.pop value=99 block=0xc1f008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xc1f008000 phead=0xc1f008380 vsn=1 chead=0xc1f008000 vsn=1
+[19792] tid=2 consumer-0 pop.reserve block=0xc1f008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[34209] tid=1 producer-0 push.allocate block=0xc4b008380 slot=0:1 len=32
+[37334] tid=2 consumer-0 pop.reserve block=0xc4b008380 slot=0:17 committed=0:24, BLOCK_CAP=32
+[37917] tid=1 producer-0 push.write block=0xc4b008000 slot=2
+[40584] tid=1 producer-0 test.pop value=99 block=0xc4b008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xc4b008000 phead=0xc4b008380 vsn=1 chead=0xc4b008000 vsn=1
+[41167] tid=2 consumer-0 pop.reserve block=0xc4b008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[10042] tid=1 producer-0 push.allocate block=0xc7d008380 slot=0:1 len=32
+[15000] tid=1 producer-0 push.write block=0xc7d008000 slot=2
+[20459] tid=1 producer-0 test.pop value=99 block=0xc7d010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xc7d008380 phead=0xc7d010000 vsn=1 chead=0xc7d008380 vsn=0
+[21167] tid=2 consumer-0 pop.reserve block=0xc7d008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[24792] tid=2 consumer-0 pop.reserve block=0xc7d010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[11333] tid=1 producer-0 push.allocate block=0x7da800380 slot=0:1 len=32
+[15875] tid=2 consumer-0 pop.reserve block=0x7da800380 slot=0:17 committed=0:18, BLOCK_CAP=32
+[17083] tid=1 producer-0 push.write block=0x7da800000 slot=2
+[21250] tid=1 producer-0 test.pop value=99 block=0x7da800380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x7da800000 phead=0x7da800380 vsn=1 chead=0x7da800000 vsn=1
+[21958] tid=2 consumer-0 pop.reserve block=0x7da800380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[8542] tid=1 producer-0 push.allocate block=0x900c04380 slot=0:1 len=32
+[13083] tid=1 producer-0 push.write block=0x900c04000 slot=2
+[13167] tid=2 consumer-0 pop.reserve block=0x900c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[16958] tid=1 producer-0 test.pop value=99 block=0x900c04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x900c04000 phead=0x900c04380 vsn=1 chead=0x900c04000 vsn=1
+[18917] tid=2 consumer-0 pop.reserve block=0x900c04380 slot=1:2 committed=1:12, BLOCK_CAP=32
+[8500] tid=1 producer-0 push.allocate block=0xc44c04380 slot=0:1 len=32
+[13417] tid=1 producer-0 push.write block=0xc44c04000 slot=2
+[13208] tid=2 consumer-0 pop.reserve block=0xc44c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[17000] tid=1 producer-0 test.pop value=99 block=0xc44c04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xc44c04000 phead=0xc44c04380 vsn=1 chead=0xc44c04000 vsn=1
+[18750] tid=2 consumer-0 pop.reserve block=0xc44c04380 slot=1:2 committed=1:7, BLOCK_CAP=32
+[10208] tid=1 producer-0 push.allocate block=0x78f008380 slot=0:1 len=32
+[14125] tid=2 consumer-0 pop.reserve block=0x78f008380 slot=0:17 committed=0:21, BLOCK_CAP=32
+[15083] tid=1 producer-0 push.write block=0x78f008000 slot=2
+[19375] tid=2 consumer-0 pop.reserve block=0x78f008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[18750] tid=1 producer-0 test.pop value=99 block=0x78f008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x78f008000 phead=0x78f008380 vsn=1 chead=0x78f008000 vsn=1
+[7958] tid=1 producer-0 push.allocate block=0x72b008380 slot=0:1 len=32
+[13458] tid=1 producer-0 push.write block=0x72b008000 slot=2
+[13000] tid=2 consumer-0 pop.reserve block=0x72b008380 slot=0:17 committed=0:27, BLOCK_CAP=32
+[16292] tid=1 producer-0 test.pop value=99 block=0x72b008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x72b008000 phead=0x72b008380 vsn=1 chead=0x72b008000 vsn=1
+[17708] tid=2 consumer-0 pop.reserve block=0x72b008380 slot=1:2 committed=1:7, BLOCK_CAP=32
+[7833] tid=1 producer-0 push.allocate block=0x7ccc04380 slot=0:1 len=32
+[15500] tid=1 producer-0 push.write block=0x7ccc04000 slot=2
+[15750] tid=2 consumer-0 pop.reserve block=0x7ccc04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[18083] tid=1 producer-0 test.pop value=99 block=0x7ccc04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x7ccc04000 phead=0x7ccc04380 vsn=1 chead=0x7ccc04000 vsn=1
+[19916] tid=2 consumer-0 pop.reserve block=0x7ccc04380 slot=1:2 committed=1:11, BLOCK_CAP=32
+[9542] tid=1 producer-0 push.allocate block=0xc85008380 slot=0:1 len=32
+[14875] tid=1 producer-0 push.write block=0xc85008000 slot=2
+[19917] tid=1 producer-0 test.pop value=99 block=0xc8500c000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xc85008380 phead=0xc8500c000 vsn=1 chead=0xc85008380 vsn=0
+[25834] tid=2 consumer-0 pop.reserve block=0xc85008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[31084] tid=2 consumer-0 pop.reserve block=0xc8500c000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[8583] tid=1 producer-0 push.allocate block=0x803004380 slot=0:1 len=32
+[13500] tid=1 producer-0 push.write block=0x803004000 slot=2
+[13750] tid=2 consumer-0 pop.reserve block=0x803004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[16583] tid=1 producer-0 test.pop value=99 block=0x803004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x803004000 phead=0x803004380 vsn=1 chead=0x803004000 vsn=1
+[18125] tid=2 consumer-0 pop.reserve block=0x803004380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[8417] tid=1 producer-0 push.allocate block=0x82d008380 slot=0:1 len=32
+[14167] tid=1 producer-0 push.write block=0x82d008000 slot=2
+[18375] tid=1 producer-0 test.pop value=99 block=0x82d010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x82d008380 phead=0x82d010000 vsn=1 chead=0x82d008380 vsn=0
+[23208] tid=2 consumer-0 pop.reserve block=0x82d008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[29292] tid=2 consumer-0 pop.reserve block=0x82d010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[9917] tid=1 producer-0 push.allocate block=0xb0f008380 slot=0:1 len=32
+[14584] tid=1 producer-0 push.write block=0xb0f008000 slot=2
+[14250] tid=2 consumer-0 pop.reserve block=0xb0f008380 slot=0:17 committed=0:30, BLOCK_CAP=32
+[17709] tid=1 producer-0 test.pop value=99 block=0xb0f008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xb0f008000 phead=0xb0f008380 vsn=1 chead=0xb0f008000 vsn=1
+[18625] tid=2 consumer-0 pop.reserve block=0xb0f008380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[10917] tid=1 producer-0 push.allocate block=0xbb9004380 slot=0:1 len=32
+[15834] tid=1 producer-0 push.write block=0xbb9004000 slot=2
+[20542] tid=1 producer-0 test.pop value=99 block=0xbb8c08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xbb9004380 phead=0xbb8c08000 vsn=1 chead=0xbb9004380 vsn=0
+[22250] tid=2 consumer-0 pop.reserve block=0xbb9004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[26000] tid=2 consumer-0 pop.reserve block=0xbb8c08000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10041] tid=1 producer-0 push.allocate block=0xcbcc04380 slot=0:1 len=32
+[14583] tid=1 producer-0 push.write block=0xcbcc04000 slot=2
+[14208] tid=2 consumer-0 pop.reserve block=0xcbcc04380 slot=0:17 committed=0:29, BLOCK_CAP=32
+[17500] tid=1 producer-0 test.pop value=99 block=0xcbcc04380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xcbcc04000 phead=0xcbcc04380 vsn=1 chead=0xcbcc04000 vsn=1
+[19125] tid=2 consumer-0 pop.reserve block=0xcbcc04380 slot=1:2 committed=1:6, BLOCK_CAP=32
+[12792] tid=1 producer-0 push.allocate block=0xcbd008380 slot=0:1 len=32
+[21292] tid=1 producer-0 push.write block=0xcbd008000 slot=2
+[23000] tid=2 consumer-0 pop.reserve block=0xcbd008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27084] tid=2 consumer-0 pop.reserve block=0xcbd010000 slot=1:2 committed=1:4, BLOCK_CAP=32
+[26792] tid=1 producer-0 test.pop value=99 block=0xcbd010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xcbd008380 phead=0xcbd010000 vsn=1 chead=0xcbd008000 vsn=1
+[9250] tid=1 producer-0 push.allocate block=0x9b4c04380 slot=0:1 len=32
+[14375] tid=1 producer-0 push.write block=0x9b4c04000 slot=2
+[19416] tid=1 producer-0 test.pop value=99 block=0x9b5008000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x9b4c04380 phead=0x9b5008000 vsn=1 chead=0x9b4c04380 vsn=0
+[20500] tid=2 consumer-0 pop.reserve block=0x9b4c04380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[24833] tid=2 consumer-0 pop.reserve block=0x9b5008000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10416] tid=1 producer-0 push.allocate block=0xc99004380 slot=0:1 len=32
+[14375] tid=2 consumer-0 pop.reserve block=0xc99004380 slot=0:17 committed=0:24, BLOCK_CAP=32
+[15083] tid=1 producer-0 push.write block=0xc99004000 slot=2
+[18375] tid=1 producer-0 test.pop value=99 block=0xc99004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xc99004000 phead=0xc99004380 vsn=1 chead=0xc99004000 vsn=1
+[19208] tid=2 consumer-0 pop.reserve block=0xc99004380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9459] tid=1 producer-0 push.allocate block=0xa6d004380 slot=0:1 len=32
+[13292] tid=2 consumer-0 pop.reserve block=0xa6d004380 slot=0:17 committed=0:25, BLOCK_CAP=32
+[13917] tid=1 producer-0 push.write block=0xa6d004000 slot=2
+[17042] tid=1 producer-0 test.pop value=99 block=0xa6d004380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xa6d004000 phead=0xa6d004380 vsn=1 chead=0xa6d004000 vsn=1
+[18000] tid=2 consumer-0 pop.reserve block=0xa6d004380 slot=1:2 committed=1:4, BLOCK_CAP=32
+[9958] tid=1 producer-0 push.allocate block=0xb1b004380 slot=0:1 len=32
+[17833] tid=1 producer-0 push.write block=0xb1b004000 slot=2
+[22708] tid=1 producer-0 test.pop value=99 block=0xb1ac08000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0xb1b004380 phead=0xb1ac08000 vsn=1 chead=0xb1b004380 vsn=0
+[24125] tid=2 consumer-0 pop.reserve block=0xb1b004380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[27583] tid=2 consumer-0 pop.reserve block=0xb1ac08000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[14708] tid=1 producer-0 push.allocate block=0x855008380 slot=0:1 len=32
+[19291] tid=1 producer-0 push.write block=0x855008000 slot=2
+[24083] tid=1 producer-0 test.pop value=99 block=0x855010000 slot=3 alloc=1:4 committed=1:4 reserved=1:0 consumed=1:0 next=0x855008380 phead=0x855010000 vsn=1 chead=0x855008380 vsn=0
+[25083] tid=2 consumer-0 pop.reserve block=0x855008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[29166] tid=2 consumer-0 pop.reserve block=0x855010000 slot=1:2 committed=1:32, BLOCK_CAP=32
+[10167] tid=1 producer-0 push.allocate block=0xb7f008380 slot=0:1 len=32
+[14834] tid=1 producer-0 push.write block=0xb7f008000 slot=2
+[14959] tid=2 consumer-0 pop.reserve block=0xb7f008380 slot=0:17 committed=0:32, BLOCK_CAP=32
+[17584] tid=1 producer-0 test.pop value=99 block=0xb7f008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0xb7f008000 phead=0xb7f008380 vsn=1 chead=0xb7f008000 vsn=1
+[19375] tid=2 consumer-0 pop.reserve block=0xb7f008380 slot=1:2 committed=1:12, BLOCK_CAP=32
+[9458] tid=1 producer-0 push.allocate block=0x7ad008380 slot=0:1 len=32
+[14292] tid=2 consumer-0 pop.reserve block=0x7ad008380 slot=0:17 committed=0:25, BLOCK_CAP=32
+[14917] tid=1 producer-0 push.write block=0x7ad008000 slot=2
+[18125] tid=1 producer-0 test.pop value=99 block=0x7ad008380 slot=3 alloc=1:4 committed=1:4 reserved=0:32 consumed=0:32 next=0x7ad008000 phead=0x7ad008380 vsn=1 chead=0x7ad008000 vsn=1
+[18958] tid=2 consumer-0 pop.reserve block=0x7ad008380 slot=1:2 committed=1:4, BLOCK_CAP=32

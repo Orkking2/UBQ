@@ -1,6 +1,6 @@
 [package]
 name = "ubq"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 description = "Lock-free queue built from linked blocks for concurrent producers and consumers."
 license = "MIT"
@@ -9,6 +9,7 @@ license = "MIT"
 crossbeam-utils = "0.8.21"
 crossbeam-queue = "0.3"
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
+loom = { version = "0.7", optional = true }
 
 [features]
 default = []
@@ -16,6 +17,7 @@ ubq_debug = []
 bench_small = []
 bench_medium = []
 bench_large = []
+loom = ["dep:loom"]
 
 [dev-dependencies]
 criterion = { version = "0.8.1", features = ["html_reports"] }

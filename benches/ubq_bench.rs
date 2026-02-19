@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc, Barrier, OnceLock,
+    atomic::{AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -766,11 +766,11 @@ Options:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{resume_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, resume_unwind};
     use std::sync::{
+        Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError},
-        Arc, Barrier, Mutex,
     };
     use std::thread;
     use std::time::Duration;

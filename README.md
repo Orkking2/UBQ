@@ -107,3 +107,15 @@ You can also limit log volume:
 - `UBQ_DEBUG_SAMPLE=1000` to log every 1000th event per thread.
 - `UBQ_DEBUG_MAX=50000` to cap entries per thread.
 - Reset logging uses tags `reset.attempt`, `reset.success`, and `reset.skip`.
+
+## Loom model checking
+
+UBQ includes opt-in loom tests for deterministic interleaving exploration of
+high-contention block-boundary scenarios:
+
+```bash
+LOOM_MAX_PREEMPTIONS=3 cargo test --features loom --test loom_ubq
+```
+
+By default, the scenario runner caps model exploration at 200 permutations for
+practical runtime; override with `LOOM_MAX_PERMUTATIONS`.
