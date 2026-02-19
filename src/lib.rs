@@ -109,6 +109,15 @@ pub struct UBQ<T> {
     n: NonNull<CachePadded<AtomicUsize>>,
 }
 
+/// Creates a new queue and returns two handles to the same underlying ring.
+///
+/// This is equivalent to `let q = UBQ::new(); (q.clone(), q)`.
+#[inline]
+pub fn channel<T>() -> (UBQ<T>, UBQ<T>) {
+	let q = UBQ::new();
+	(q.clone(), q)
+}
+
 // SAFETY: All shared mutable state is accessed through `AtomicPtr` and [`A`]
 // operations, or through the `UnsafeCell` slots in `B::a`, which are protected by
 // the exclusive-index guarantee [C6] and the Release–Acquire pairing on `B::p` and
@@ -236,6 +245,7 @@ impl<T> UBQ<T> {
     /// Creates a new, empty queue.
     ///
     /// No blocks are allocated until the first call to [`push`](Self::push).
+	#[inline]
     pub fn new() -> Self {
         // SAFETY:
         //   · `Box::new_zeroed().assume_init()` is used for the `p` and `c`
