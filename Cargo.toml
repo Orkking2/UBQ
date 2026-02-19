@@ -1,6 +1,6 @@
 [package]
 name = "ubq"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2024"
 description = "Lock-free unbounded MPMC queue backed by a linked ring of fixed-size blocks."
 license = "MIT"

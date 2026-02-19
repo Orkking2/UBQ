@@ -58,7 +58,7 @@ use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     num::NonZeroUsize,
-    ptr::{self, NonNull},
+    ptr::NonNull,
     sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
 
@@ -135,6 +135,18 @@ const fn high(r: F) -> H {
 #[inline(always)]
 const fn merge(h: H, l: H) -> F {
     (h as F) << H::BITS | l as F
+}
+
+/// # [C1] STABILITY PREDICATE:
+/// `stab(u) := high(u) == low(u) || low(u) == L`
+/// Until stab(u) holds there are in-flight producers (resp. consumers):
+/// slots in the range [low(u), high(u)) are allocated (resp. reserved)
+/// but not yet written (resp. read). We must not claim any slot until the
+/// block reaches a stable state. `backoff.snooze()` yields the thread to
+/// give those producers (resp. consumers) time to commit (resp. consume).
+#[inline(always)]
+const fn stab(u: F) -> bool {
+    high(u) == low(u) || low(u) == L
 }
 
 /// Shared UBQ state pointed to by every [`UBQ<T>`] handle.
@@ -431,17 +443,6 @@ impl<T> I<T> {
 //
 // ─────────────────────────────────────────────────────────────────────────────
 impl<T> I<T> {
-    /// # [C1] STABILITY PREDICATE:
-    /// `stab(u) := high(u) == low(u) || low(u) == L`
-    /// Until stab(u) holds there are in-flight producers (resp. consumers):
-    /// slots in the range [low(u), high(u)) are allocated (resp. reserved)
-    /// but not yet written (resp. read). We must not claim any slot until the
-    /// block reaches a stable state. `backoff.snooze()` yields the thread to
-    /// give those producers (resp. consumers) time to commit (resp. consume).
-    fn stab(u: F) -> bool {
-        high(u) == low(u) || low(u) == L
-    }
-
     /// All blocks between phead and chead MUST be empty, let's remove them.
     unsafe fn shrink(&self) -> Option<NonZeroUsize> {
         // If no blocks have been allocated yet, nothing to do.
@@ -459,7 +460,7 @@ impl<T> I<T> {
             let (p, c) = (b.p.load(Ordering::Relaxed), b.c.load(Ordering::Relaxed));
 
             // Abort if any in-flight operations are detected.
-            if !Self::stab(p) || !Self::stab(c) {
+            if !stab(p) || !stab(c) {
                 return None;
             }
 
@@ -517,11 +518,11 @@ impl<T> I<T> {
             let p = unsafe { (*p_).p.load(Ordering::Relaxed) };
             let c = unsafe { (*p_).c.load(Ordering::Relaxed) };
 
-            if !Self::stab(p) || !Self::stab(c) {
+            if !stab(p) || !stab(c) {
                 return None;
             }
 
-			let e = low(p) == if c == F::MAX { 0 } else { low(c) };
+            let e = low(p) == if c == F::MAX { 0 } else { low(c) };
 
             // A block is empty when everything pushed to it has been consumed,
             // or when nothing was ever pushed (pre-allocated, c still sentinel).
@@ -846,13 +847,13 @@ impl<T> I<T> {
                     continue '_0;
                 }
 
-                if !Self::stab(p) {
+                if !stab(p) {
                     // Spin until stable. Each Acquire reload re-establishes the
                     // happens-before relationship required for [C2].
                     '_2: loop {
                         p = c.p.load(Ordering::Acquire);
 
-                        if Self::stab(p) {
+                        if stab(p) {
                             break;
                         }
 
