@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crossbeam_utils::Backoff;
 use serde::Serialize;
 
-use ubq::{BLOCK_CAP, UBQ};
+use ubq::{L, UBQ};
 
 const SENTINEL: u64 = u64::MAX;
 
@@ -200,7 +200,7 @@ struct ScenarioMeta {
 #[derive(Serialize)]
 struct Meta {
     timestamp_unix_ms: u128,
-    block_cap: usize,
+    L: usize,
     items_per_producer: u64,
     queues: Vec<String>,
     scenarios: Vec<ScenarioMeta>,
@@ -223,7 +223,7 @@ struct Record {
     pop_elapsed_ns: Option<u64>,
     fill_elapsed_ns: Option<u64>,
     drain_elapsed_ns: Option<u64>,
-    block_cap: usize,
+    L: usize,
 }
 
 #[derive(Serialize)]
@@ -413,7 +413,7 @@ fn run_benches(config: &BenchConfig) -> Output {
 
     let meta = Meta {
         timestamp_unix_ms,
-        block_cap: BLOCK_CAP,
+        L: L as usize,
         items_per_producer: config.items_per_producer,
         queues: config.queues.iter().map(|q| q.name().to_string()).collect(),
         scenarios: config
@@ -563,7 +563,7 @@ fn bench_throughput(
         pop_elapsed_ns: Some(consumer_max.load(Ordering::Relaxed)),
         fill_elapsed_ns: None,
         drain_elapsed_ns: None,
-        block_cap: BLOCK_CAP,
+        L: L as usize,
     }
 }
 
@@ -605,7 +605,7 @@ fn bench_fill_drain(
         pop_elapsed_ns: None,
         fill_elapsed_ns: Some(fill_elapsed.as_nanos() as u64),
         drain_elapsed_ns: Some(drain_elapsed.as_nanos() as u64),
-        block_cap: BLOCK_CAP,
+        L: L as usize,
     }
 }
 

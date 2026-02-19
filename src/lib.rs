@@ -57,18 +57,19 @@ use crossbeam_utils::{Backoff, CachePadded};
 use std::{
     cell::UnsafeCell,
     mem::MaybeUninit,
-    ptr::NonNull,
-    sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+    num::NonZeroUsize,
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
 
 /// Atomic storage for a packed pair of counters (`high` = claimed, `low` = committed).
-type A = AtomicU64;
+type A = AtomicU32;
 
 /// Packed `F::BITS`-bit counter representation manipulated through [`A`].
 /// Layout: upper `H::BITS` bits = claimed count, lower `H::BITS` bits = committed count.
-type F = u64;
+type F = u32;
 /// Single `H::BITS`-bit half of a packed [`F`] counter.
-type H = u32;
+type H = u16;
 
 /// A lock-free, unbounded multi-producer/multi-consumer (MPMC) queue.
 ///
@@ -99,30 +100,55 @@ type H = u32;
 ///    `B::c` starts at `F::MAX` ("closed to consumers") and is set to `0` by the
 ///    consumer that advances `chead`.
 pub struct UBQ<T> {
-    /// Atomic pointer to phead: the block currently accepting producer pushes.
-    p: NonNull<CachePadded<AtomicPtr<B<T>>>>,
-    /// Atomic pointer to chead: the block currently being drained by consumers.
-    c: NonNull<CachePadded<AtomicPtr<B<T>>>>,
-    /// Shared reference count. Incremented by [`Clone`] and decremented by [`Drop`];
-    /// when it reaches zero the last clone frees the block ring and drops any
-    /// unconsumed elements.
-    n: NonNull<CachePadded<AtomicUsize>>,
+    /// Shared inner state allocation.
+    i: NonNull<I<T>>,
 }
 
 // SAFETY: All shared mutable state is accessed through `AtomicPtr` and [`A`]
 // operations, or through the `UnsafeCell` slots in `B::a`, which are protected by
 // the exclusive-index guarantee [C6] and the Release–Acquire pairing on `B::p` and
 // `B::c`. Given `T: Sync` (resp. `T: Send`), concurrent shared access (resp.
-// cross-thread transfer) of `T` values through `Q` is therefore sound.
+// cross-thread transfer) of `T` values through `UBQ` is therefore sound.
 unsafe impl<T: Sync> Sync for UBQ<T> {}
 unsafe impl<T: Send> Send for UBQ<T> {}
 
 /// Number of element slots per block.
-const L: H = 32;
+pub const L: H = 32;
 const _: () = assert!(
     L != H::MAX,
     "L cannot be H::MAX, as this value is used as a sentinel."
 );
+
+/// Returns the lower `H::BITS` bits of a packed counter (committed count).
+#[inline(always)]
+const fn low(r: F) -> H {
+    r as H
+}
+
+/// Returns the upper `H::BITS` bits of a packed counter (claimed count).
+#[inline(always)]
+const fn high(r: F) -> H {
+    (r >> H::BITS) as H
+}
+
+/// Packs two [`H`] values into a [`F`]: `h` in the upper `H::BITS` bits, `l` in the lower.
+#[inline(always)]
+const fn merge(h: H, l: H) -> F {
+    (h as F) << H::BITS | l as F
+}
+
+/// Shared UBQ state pointed to by every [`UBQ<T>`] handle.
+struct I<T> {
+    /// Atomic pointer to phead: the block currently accepting producer pushes.
+    p: CachePadded<AtomicPtr<B<T>>>,
+    /// Atomic pointer to chead: the block currently being drained by consumers.
+    c: CachePadded<AtomicPtr<B<T>>>,
+    /// Shared reference count stored as `copies - 1`.
+    ///
+    /// * `0` means exactly one handle exists.
+    /// * `k` means `k + 1` handles exist.
+    n: CachePadded<AtomicUsize>,
+}
 
 /// A fixed-size ring-buffer segment.
 ///
@@ -141,21 +167,194 @@ struct B<T> {
     a: [UnsafeCell<MaybeUninit<T>>; L as usize],
 }
 
-/// Returns the lower `H::BITS` bits of a packed counter (committed count).
-fn low(r: F) -> H {
-    r as H
+impl<T> Drop for B<T> {
+    fn drop(&mut self) {
+        let (p, c) = unsafe { (*self.p.as_ptr(), *self.c.as_ptr()) };
+
+        debug_assert!(
+            high(p) == low(p) || low(p) == L,
+            "all producers should be finished before dropping B (p = {}:{})",
+            high(p),
+            low(p)
+        );
+        debug_assert!(
+            high(c) == low(c) || low(c) == L,
+            "all consumers should be finished before dropping B (c = {}:{})",
+            high(c),
+            low(c),
+        );
+
+        // Drop unconsumed elements in this block. The live range of
+        // initialized, unconsumed slots is:
+        //	 · [0, 0) 			  when p == F::MAX: block is marked
+        //	   for destruction during queue operation; it is guaranteed
+        //     to be empty.
+        //
+        //   · [0, low(p))        when c == F::MAX: block was never
+        //     opened to consumers; every produced value is unconsumed.
+        //
+        //   · [low(c), low(p))   else: low(c) committed consumer
+        //     reads have already moved [0, low(c)) out; the remaining
+        //     range [low(c), low(p)) holds initialized unconsumed Ts.
+        let z = |u: F| if u == F::MAX { 0 } else { low(u) };
+
+        for i in z(c)..z(p) {
+            unsafe {
+                self.a
+                    .get_unchecked_mut(i as usize)
+                    .get_mut()
+                    .as_mut_ptr()
+                    .drop_in_place();
+            }
+        }
+    }
 }
 
-/// Returns the upper `H::BITS` bits of a packed counter (claimed count).
-fn high(r: F) -> H {
-    (r >> H::BITS) as H
+impl<T> UBQ<T> {
+    /// Creates a new, empty queue.
+    ///
+    /// No blocks are allocated until the first call to [`push`](Self::push).
+    #[inline]
+    pub fn new() -> Self {
+        // SAFETY:
+        //   · `I<T>` is valid when zero-initialized: `p` and `c` are
+        //     `AtomicPtr<B<T>>` (null is a valid initial value) and `n` is an
+        //     `AtomicUsize` (0, representing one live copy, is valid).
+        //   · `Box::into_raw` on a non-empty `Box` is always non-null.
+        unsafe {
+            Self {
+                i: NonNull::new_unchecked(Box::into_raw(Box::new_zeroed().assume_init())),
+            }
+        }
+    }
+
+    /// Returns a best-effort snapshot of how many [`UBQ`] handles currently exist.
+    ///
+    /// This value may change immediately due to concurrent clone/drop activity.
+    #[inline]
+    pub fn copies(&self) -> usize {
+        // SAFETY: `self.i` points to the shared inner allocation, which remains
+        // live while this handle exists.
+        unsafe { self.i.as_ref().copies() }
+    }
+
+    /// Pushes `e` onto the back of the queue.
+    ///
+    /// This operation is lock-free and never parks the calling thread.  It may
+    /// spin briefly at block boundaries while in-flight producers commit their
+    /// writes.
+    #[doc(alias = "enqueue")]
+    #[doc(alias = "send")]
+    #[inline]
+    pub fn push(&self, e: T) {
+        // SAFETY: `self.i` points to the shared inner allocation, which remains
+        // live while this handle exists.
+        unsafe { self.i.as_ref().push(e) }
+    }
+
+    /// Removes and returns the front element, or [`None`] if no committed element
+    /// is currently available.
+    ///
+    /// Returns [`None`] when the queue is empty **or** when the current block has
+    /// no further committed slots at this instant (in-flight producers may still
+    /// be writing). After all producers have finished, `None` reliably indicates
+    /// an empty queue.
+    ///
+    /// This operation is lock-free and never parks the calling thread.
+    #[doc(alias = "dequeue")]
+    #[doc(alias = "recv")]
+    #[inline]
+    pub fn pop(&self) -> Option<T> {
+        // SAFETY: `self.i` points to the shared inner allocation, which remains
+        // live while this handle exists.
+        unsafe { self.i.as_ref().pop() }
+    }
+
+    /// Free (as opposed to recycle) all the empty blocks in this queue.
+    /// This function returns Some(n) where n is the number of blocks freed
+    /// or None (0) if no blocks are freed.
+    ///
+    /// # SAFETY:
+    ///
+    /// The caller must ensure that there are no in-flight push's or pop's
+    /// during the execution of this function, as it is theoretically possible,
+    /// although rare, for a producer or consumer to have a stale pointer to
+    /// a block that is being freed (causing a Seg. Fault). With slow producers
+    /// and consumers, it's probably safe to call this method, but at your own risk!
+    pub unsafe fn shrink(&self) -> Option<NonZeroUsize> {
+        // SAFETY: `self.i` points to the shared inner allocation, which remains
+        // live while this handle exists.
+        unsafe { self.i.as_ref().shrink() }
+    }
+
+    /// Returns `true` if this UBQ contains no values.
+    pub fn is_empty(&self) -> bool {
+        // SAFETY: `self.i` points to the shared inner allocation, which remains
+        // live while this handle exists.
+        unsafe { self.i.as_ref().is_empty() }
+    }
 }
 
-/// Packs two [`H`] values into a [`F`]: `h` in the upper `H::BITS` bits, `l` in the lower.
-fn merge(h: H, l: H) -> F {
-    (h as F) << H::BITS | l as F
+impl<T> Clone for UBQ<T> {
+    fn clone(&self) -> Self {
+        // `n` stores copies - 1. `fetch_add(1)` therefore increments the number
+        // of live handles by one.
+        unsafe { self.i.as_ref().n.fetch_add(1, Ordering::Relaxed) };
+
+        // `NonNull<_>` is `Copy`; clones share the same `I<T>` allocation.
+        Self { i: self.i }
+    }
 }
 
+impl<T> Drop for UBQ<T> {
+    fn drop(&mut self) {
+        // `n` stores copies - 1. `fetch_sub(1)` returns the previous n.
+        //
+        // Last-owner case:
+        //   previous n == 0  <=>  previous copies == 1.
+        // We intentionally allow the atomic to wrap to `usize::MAX` here; the
+        // inner allocation is reclaimed immediately after and cannot be observed.
+        let n = unsafe { self.i.as_ref().n.fetch_sub(1, Ordering::Relaxed) };
+
+        if n == 0 {
+            // Reclaim the shared inner state and drop any queued elements.
+            //
+            // SAFETY:
+            //   · `n == 0` implies this was the final handle.
+            //   · `self.i` came from `Box::into_raw` in `new()` and has not yet
+            //     been reclaimed.
+            unsafe { drop(Box::from_raw(self.i.as_ptr())) }
+        }
+    }
+}
+
+impl<T> I<T> {
+    #[inline]
+    fn copies(&self) -> usize {
+        self.n.load(Ordering::Relaxed).wrapping_add(1)
+    }
+
+    fn is_empty(&self) -> bool {
+        let p = self.p.load(Ordering::Relaxed);
+
+        if p.is_null() {
+            return true;
+        }
+
+        let c = self.c.load(Ordering::Relaxed);
+
+        if p != c {
+            return false;
+        }
+
+        let b = unsafe { &*p };
+
+        let p = b.p.load(Ordering::Relaxed);
+        let c = b.c.load(Ordering::Relaxed);
+
+        low(p) == low(c)
+    }
+}
 // ─── Correctness arguments ────────────────────────────────────────────────────
 //
 // The labels [C1]–[C6] below are cited in SAFETY comments and inline remarks
@@ -231,42 +430,161 @@ fn merge(h: H, l: H) -> F {
 //   access the same slot concurrently.
 //
 // ─────────────────────────────────────────────────────────────────────────────
-
-impl<T> UBQ<T> {
-    /// Creates a new, empty queue.
-    ///
-    /// No blocks are allocated until the first call to [`push`](Self::push).
-	#[inline]
-    pub fn new() -> Self {
-        // SAFETY:
-        //   · `Box::new_zeroed().assume_init()` is used for the `p` and `c`
-        //     allocations. The zero-initialized type is
-        //     `CachePadded<AtomicPtr<B<T>>>`, which contains only an `AtomicPtr`.
-        //     The zero bit-pattern for `AtomicPtr` is a null pointer — a valid
-        //     and expected initial value meaning "no block allocated yet."
-        //   · `Box::into_raw` on a non-empty `Box` is always non-null, so
-        //     `NonNull::new_unchecked` is sound in all three cases.
-        //   · The refcount `n` is initialised to `1` via `Box::new(...)`, which
-        //     is unconditionally valid.
-        unsafe {
-            Self {
-                p: NonNull::new_unchecked(Box::into_raw(Box::new_zeroed().assume_init())),
-                c: NonNull::new_unchecked(Box::into_raw(Box::new_zeroed().assume_init())),
-                n: NonNull::new_unchecked(Box::into_raw(Box::new(CachePadded::new(
-                    AtomicUsize::new(1),
-                )))),
-            }
-        }
+impl<T> I<T> {
+    /// # [C1] STABILITY PREDICATE:
+    /// `stab(u) := high(u) == low(u) || low(u) == L`
+    /// Until stab(u) holds there are in-flight producers (resp. consumers):
+    /// slots in the range [low(u), high(u)) are allocated (resp. reserved)
+    /// but not yet written (resp. read). We must not claim any slot until the
+    /// block reaches a stable state. `backoff.snooze()` yields the thread to
+    /// give those producers (resp. consumers) time to commit (resp. consume).
+    fn stab(u: F) -> bool {
+        high(u) == low(u) || low(u) == L
     }
 
-    /// Pushes `e` onto the back of the queue.
-    ///
-    /// This operation is lock-free and never parks the calling thread.  It may
-    /// spin briefly at block boundaries while in-flight producers commit their
-    /// writes.
-    #[doc(alias = "enqueue")]
-    #[doc(alias = "send")]
-    pub fn push(&self, e: T) {
+    /// All blocks between phead and chead MUST be empty, let's remove them.
+    unsafe fn shrink(&self) -> Option<NonZeroUsize> {
+        // If no blocks have been allocated yet, nothing to do.
+        let p_ = self.p.load(Ordering::Acquire);
+
+        if p_.is_null() {
+            return None;
+        }
+
+        let f_ = unsafe { (*p_).n.load(Ordering::Relaxed) };
+
+        // ── Single-block case: n is null, block is not part of a ring ────────
+        if f_.is_null() {
+            let b = unsafe { &*p_ };
+            let (p, c) = (b.p.load(Ordering::Relaxed), b.c.load(Ordering::Relaxed));
+
+            // Abort if any in-flight operations are detected.
+            if !Self::stab(p) || !Self::stab(c) {
+                return None;
+            }
+
+            // A block is empty when everything pushed to it has been consumed,
+            // or when nothing was ever pushed (pre-allocated, c still sentinel).
+            if low(p) != if c == F::MAX { 0 } else { low(c) } {
+                return None;
+            }
+
+            // Mark for destruction so any stray accessor can detect invalidity,
+            // then clear both head pointers and free the block.
+            // If our CAS fails, a producer has changed p, so we should exit.
+            if b.p
+                .compare_exchange(p, F::MAX, Ordering::Release, Ordering::Relaxed)
+                .is_err()
+            {
+                return None;
+            }
+            // Block has been successfully marked for destruction.
+            self.p.store(std::ptr::null_mut(), Ordering::Release);
+            self.c.store(std::ptr::null_mut(), Ordering::Release);
+            unsafe { drop(Box::from_raw(p_)) };
+
+            return NonZeroUsize::new(1);
+        }
+
+        // ── Multi-block ring ─────────────────────────────────────────────────
+        // Snapshot chead before any modifications.
+        let c_ = self.c.load(Ordering::Relaxed);
+        let mut f = 0usize;
+
+        // Key invariant: push advances phead into a block only when that block
+        // has been fully consumed (low(n.c) >= L).  Therefore every block in
+        // the segment  phead.n → … → chead  is guaranteed to be empty — no
+        // per-block emptiness checks are needed inside the free loop.
+        //
+        // We exploit this to determine the final queue state up-front and
+        // update q.p / q.c / phead.n *before* freeing anything, so that any
+        // stray concurrent accessor (despite the safety contract) always sees
+        // a coherent queue after the head-pointer stores complete.
+        //
+        // Three cases, resolved before the loop:
+        //
+        //   1. phead == chead, phead empty  →  q.p = q.c = null;
+        //      free every block in the ring (recycled segment + phead).
+        //
+        //   2. phead == chead, phead not empty  →  phead.n = null;
+        //      free only the recycled segment (first_n … back to phead).
+        //
+        //   3. phead != chead  →  phead.n = chead (shortcut over the segment);
+        //      free only the recycled segment (first_n … up to chead).
+
+        if p_ == c_ {
+            // phead is the only block that may still carry live elements.
+            let p = unsafe { (*p_).p.load(Ordering::Relaxed) };
+            let c = unsafe { (*p_).c.load(Ordering::Relaxed) };
+
+            if !Self::stab(p) || !Self::stab(c) {
+                return None;
+            }
+
+			let e = low(p) == if c == F::MAX { 0 } else { low(c) };
+
+            // A block is empty when everything pushed to it has been consumed,
+            // or when nothing was ever pushed (pre-allocated, c still sentinel).
+            if !e {
+                // Case 1: mark phead and null both heads before freeing.
+                // Mark for destruction so any stray accessor can detect invalidity,
+                // then clear both head pointers and free the block.
+                // If our CAS fails, a producer has changed p, so we should exit.
+                if unsafe {
+                    (*p_)
+                        .p
+                        .compare_exchange(p, F::MAX, Ordering::Release, Ordering::Relaxed)
+                        .is_err()
+                } {
+                    return None;
+                }
+                self.p.store(std::ptr::null_mut(), Ordering::Release);
+                self.c.store(std::ptr::null_mut(), Ordering::Release);
+            } else {
+                // Case 2: detach the recycled segment from phead.
+                unsafe { (*p_).n.store(std::ptr::null_mut(), Ordering::Release) };
+            }
+
+            // Free the recycled segment: first_n → … → (block whose .n == phead).
+            // Termination: we stop as soon as after == phead, then (in case 1
+            // only) free phead itself.
+            let mut cur = f_;
+            loop {
+                let after = unsafe { (*cur).n.load(Ordering::Relaxed) };
+                unsafe { (*cur).p.store(F::MAX, Ordering::Release) };
+                unsafe { drop(Box::from_raw(cur)) };
+                f += 1;
+                if after == p_ {
+                    break;
+                }
+                cur = after;
+            }
+
+            if e {
+                unsafe { drop(Box::from_raw(p_)) };
+                f += 1;
+            }
+        } else {
+            // Case 3: shortcut phead directly to chead, then free the segment.
+            unsafe { (*p_).n.store(c_, Ordering::Release) };
+
+            let mut cur = f_;
+            loop {
+                if cur == c_ {
+                    break;
+                }
+                let after = unsafe { (*cur).n.load(Ordering::Relaxed) };
+                unsafe { (*cur).p.store(F::MAX, Ordering::Release) };
+                unsafe { drop(Box::from_raw(cur)) };
+                f += 1;
+                cur = after;
+            }
+        }
+
+        NonZeroUsize::new(f)
+    }
+
+    fn push(&self, e: T) {
         let backoff = Backoff::new();
         // Spare block carried across loop iterations. Avoids a redundant allocation
         // when we lose a CAS race during first-block initialization.
@@ -276,11 +594,7 @@ impl<T> UBQ<T> {
             // Load phead with Acquire, pairing with the Release stores that publish
             // or advance phead (the CAS below on first push, or the block-transition
             // stores on subsequent iterations).
-            //
-            // SAFETY: `self.p` is a `NonNull<AtomicPtr<B<T>>>` backed by a heap
-            // allocation created before `Q` is shared and never freed while any clone
-            // of `Q` is alive. `as_ref()` borrows it for the lifetime of `self`.
-            let mut p = unsafe { self.p.as_ref() }.load(Ordering::Acquire);
+            let mut p = self.p.load(Ordering::Acquire);
 
             if p.is_null() {
                 // No block exists yet. Allocate one and race to install it as phead.
@@ -294,23 +608,15 @@ impl<T> UBQ<T> {
                 //     ([C2], [C6]).
                 let n = Box::into_raw(unsafe { Box::new_zeroed().assume_init() });
 
-                // SAFETY: `self.p` is valid as above.
-                match unsafe { self.p.as_ref() }.compare_exchange_weak(
-                    p,
-                    n,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
+                match self
+                    .p
+                    .compare_exchange_weak(p, n, Ordering::AcqRel, Ordering::Acquire)
+                {
                     Ok(_) => {
                         // We won the race. By invariant 1, the first block is
                         // immediately open to both producers and consumers, so we
                         // publish it as chead too.
-                        //
-                        // SAFETY: `self.c` is a valid `NonNull<AtomicPtr<B<T>>>` for
-                        // the same reasons as `self.p`. `n` is a live allocation that
-                        // we own exclusively — the CAS succeeded and no other thread
-                        // has observed this pointer yet.
-                        unsafe { self.c.as_ref().store(n, Ordering::Release) };
+                        self.c.store(n, Ordering::Release);
 
                         p = n;
                     }
@@ -386,8 +692,25 @@ impl<T> UBQ<T> {
                         // SAFETY: `n` is non-null — the `||` short-circuits when n is
                         // null, so we only reach this sub-expression when n != null. As a
                         // block in the ring loaded from p.n with Acquire, `n` is a valid
-                        // live allocation for the lifetime of `Q`.
+                        // live allocation for the lifetime of `I`.
                         low((*n).c.load(Ordering::Acquire)) < L
+                    }
+                    || unsafe {
+                        // SAFETY: See above.
+                        let p = (*n).p.load(Ordering::Relaxed);
+
+                        if p == F::MAX {
+                            // This block is being freed by Self::shrink
+                            false
+                        } else {
+                            // We must ensure that we are not overriding
+                            // Self::shrink's setting p to the sentinel F::MAX
+                            //
+                            // Read more in the `else` block below.
+                            (*n).p
+                                .compare_exchange(p, 0, Ordering::Release, Ordering::Relaxed)
+                                .is_ok()
+                        }
                     }
                 {
                     // `n` is either absent or not yet fully consumed. Allocate a new
@@ -417,20 +740,23 @@ impl<T> UBQ<T> {
                     // p.n == b_ and b_.c == F::MAX are visible.
                     //
                     // SAFETY: `b_` is a freshly allocated, exclusively owned block.
-                    // `self.p` and `p` are valid as established above. By [C3] we are
-                    // the sole thread modifying phead and p.n at this moment.
+                    // `p` is valid as established above. By [C3] we are the sole
+                    // thread modifying phead and p.n at this moment.
                     unsafe {
-                        self.p.as_ref().store(b_, Ordering::Release);
+                        self.p.store(b_, Ordering::Release);
                         (*p).n.store(b_, Ordering::Release);
                     }
                 } else {
                     // `n` is fully consumed (low(n.c) >= L). Recycle it in place.
                     //
-                    // The order of the three stores below is significant:
+                    // The order of the stores below is significant:
                     //   1. n.p = 0 (Release): reset the producer counter so that new
                     //      producers observing phead == n start claiming from slot 0.
                     //      This must precede the phead advance so producers see a
-                    //      clean counter.
+                    //      clean counter. This is now handled in the conditional,
+                    //		instead of a raw `store`, we must CAS to not step on the
+                    // 		toes of Self::shrink, it still happens previously in time
+                    // 		to (2) and (3).
                     //   2. phead = n (Release): new producers may now begin pushing
                     //      to n.
                     //   3. n.c = F::MAX (Release): signal to the consumer (the one
@@ -444,11 +770,10 @@ impl<T> UBQ<T> {
                     // making n.p == 0 and n.c == F::MAX visible on arrival.
                     //
                     // SAFETY: `n` is a valid live block confirmed fully consumed.
-                    // `self.p` is valid as above. By [C3] we are the sole modifier of
-                    // n.p, phead, and n.c at this moment.
+                    // By [C3] we are the sole modifier of n.p, phead, and n.c at
+                    // this moment.
                     unsafe {
-                        (*n).p.store(0, Ordering::Release);
-                        self.p.as_ref().store(n, Ordering::Release);
+                        self.p.store(n, Ordering::Release);
 
                         // `n` ready for consumer reset
                         (*n).c.store(F::MAX, Ordering::Release);
@@ -482,18 +807,7 @@ impl<T> UBQ<T> {
         }
     }
 
-    /// Removes and returns the front element, or [`None`] if no committed element
-    /// is currently available.
-    ///
-    /// Returns [`None`] when the queue is empty **or** when the current block has
-    /// no further committed slots at this instant (in-flight producers may still
-    /// be writing). After all producers have finished, `None` reliably indicates
-    /// an empty queue.
-    ///
-    /// This operation is lock-free and never parks the calling thread.
-    #[doc(alias = "dequeue")]
-    #[doc(alias = "recv")]
-    pub fn pop(&self) -> Option<T> {
+    fn pop(&self) -> Option<T> {
         let backoff = Backoff::new();
 
         '_0: loop {
@@ -501,10 +815,8 @@ impl<T> UBQ<T> {
             // or advance chead (the initial store in `push` for the first block, or
             // the chead-advance store in `pop` for subsequent blocks).
             //
-            // SAFETY: `self.c` is a `NonNull<AtomicPtr<B<T>>>` backed by a heap
-            // allocation that lives for the duration of `Q`, for the same reasons as
-            // `self.p` in `push`.
-            let c = unsafe { self.c.as_ref().load(Ordering::Acquire).as_ref()? };
+            // SAFETY: `chead` points at a live block while `I<T>` is alive.
+            let c = unsafe { self.c.load(Ordering::Acquire).as_ref()? };
 
             // Load B::c (the consumer counter) for the current block. Acquire pairs
             // with the Release store that last modified B::c: either the chead-advance
@@ -529,20 +841,18 @@ impl<T> UBQ<T> {
                 // in `push`, satisfying [C2] once v(p) holds.
                 let mut p = c.p.load(Ordering::Acquire);
 
-                // [C1] STABILITY PREDICATE: v(p) := high(p) == low(p) || low(p) == L.
-                // Until v(p) holds there are in-flight producers: slots in the range
-                // [low(p), high(p)) are reserved but not yet written. We must not claim
-                // any slot until the block reaches a stable state. `backoff.snooze()`
-                // yields the thread to give those producers time to commit.
-                let v = |p: F| high(p) == low(p) || low(p) == L;
+                // Somehow we've ended up in a block that is marked to be freed, retry.
+                if p == F::MAX {
+                    continue '_0;
+                }
 
-                if !v(p) {
+                if !Self::stab(p) {
                     // Spin until stable. Each Acquire reload re-establishes the
                     // happens-before relationship required for [C2].
                     '_2: loop {
                         p = c.p.load(Ordering::Acquire);
 
-                        if v(p) {
+                        if Self::stab(p) {
                             break;
                         }
 
@@ -632,7 +942,7 @@ impl<T> UBQ<T> {
                     //     observe n.c == 0.
                     unsafe {
                         (*n).c.store(0, Ordering::Relaxed);
-                        self.c.as_ref().store(n, Ordering::Release);
+                        self.c.store(n, Ordering::Release);
                     }
                 }
 
@@ -660,147 +970,33 @@ impl<T> UBQ<T> {
     }
 }
 
-impl<T> Clone for UBQ<T> {
-    fn clone(&self) -> Self {
-        // Increment the shared reference count before constructing the new handle.
-        // Relaxed ordering is sufficient: the increment transfers no data —
-        // producers and consumers synchronize memory through B::p and B::c in
-        // `push`/`pop`. We only need to atomically prevent the count from
-        // underflowing while this clone is alive.
-        //
-        // SAFETY: `self.n` is a `NonNull<CachePadded<AtomicUsize>>` backed by
-        // the heap allocation created in `new()`. Because `self` is a live clone
-        // the reference count is ≥ 1, so the allocation has not been freed.
-        // `as_ref()` borrows it for the lifetime of `self`, which is valid.
-        unsafe { self.n.as_ref().fetch_add(1, Ordering::Relaxed) };
-
-        // `NonNull<_>` is `Copy`, so each field clone is a bitwise copy of the
-        // raw pointer. All clones share the same phead, chead, and refcount
-        // allocations; no data is deep-copied.
-        Self {
-            p: self.p.clone(),
-            c: self.c.clone(),
-            n: self.n.clone(),
-        }
-    }
-}
-
-impl<T> Drop for UBQ<T> {
+impl<T> Drop for I<T> {
     fn drop(&mut self) {
-        // Atomically decrement the reference count. Relaxed ordering is
-        // sufficient: the caller is responsible for ensuring all push/pop
-        // operations are complete before the last clone is destroyed (typically
-        // by joining producer/consumer threads). Under that contract, ownership
-        // of any remaining elements is transferred via thread-join
-        // synchronization rather than through this atomic.
-        //
-        // SAFETY: `self.n` is a valid `NonNull<CachePadded<AtomicUsize>>` for
-        // the same reasons as in `Clone::clone`.
-        let n = unsafe { self.n.as_ref().fetch_sub(1, Ordering::Relaxed) };
+        // Capture chead. `get_mut()` bypasses atomics and is valid under
+        // last-owner exclusivity.
+        let mut b = *self.c.get_mut();
 
-        if n == 1 {
-            // We were the last clone (count dropped from 1 to 0). No other
-            // thread holds a `UBQ` handle, so we have exclusive access to all
-            // three shared allocations and to every block in the ring.
-            //
-            // Capture chead before freeing self.c's allocation. `get_mut()`
-            // bypasses atomic operations; sound here because exclusive access
-            // is guaranteed (no other clone exists, no concurrent push/pop).
-            //
-            // SAFETY: `self.c` is a valid `NonNull<CachePadded<AtomicPtr<B<T>>>>`.
-            // `as_mut()` requires exclusive access, which holds because `n == 1`
-            // before the fetch_sub guarantees we are the sole owner.
-            let mut b = unsafe { *self.c.as_mut().get_mut() };
+        // If no block was ever allocated, there is nothing to reclaim.
+        if b.is_null() {
+            return;
+        }
 
-            // Reclaim the three meta-allocations (refcount, phead, chead boxes).
-            // Each pointer was produced by `Box::into_raw` in `new()` and has
-            // not been freed — the previous reference count of 1 ensures this
-            // is the first and only reclamation.
-            //
-            // SAFETY: All three raw pointers are valid, non-null, and
-            // exclusively owned at this point.
-            unsafe {
-                drop(Box::from_raw(self.n.as_ptr()));
-                drop(Box::from_raw(self.p.as_ptr()));
-                drop(Box::from_raw(self.c.as_ptr()));
-            }
+        // Traverse the circular block ring starting from chead and drop every
+        // unconsumed element. Stop when we return to the start (b == b_) or hit
+        // a null next pointer (partially formed ring on teardown).
+        let b_ = b;
 
-            // If no block was ever allocated (queue was created but never
-            // pushed to), chead is null and there is nothing to traverse.
-            if b.is_null() {
-                return;
-            }
+        loop {
+            // Read metadata directly, bypassing atomics under exclusive access.
+            let n = unsafe { *(*b).n.get_mut() };
 
-            // Traverse the circular block ring starting from chead and drop
-            // every unconsumed element. We stop when we return to the starting
-            // block (b == b_) or hit a null next pointer (ring partially
-            // formed on early teardown).
-            let b_ = b;
+            // Free this block
+            drop(unsafe { Box::from_raw(b) });
 
-            loop {
-                // Read the next pointer and both counters directly, bypassing
-                // atomic operations — valid because we have exclusive access.
-                //
-                // SAFETY: `b` is non-null (checked above; each subsequent
-                // value is a valid ring block's `n` pointer) and points to a
-                // live `B<T>` allocation.
-                let n = unsafe { *(*b).n.get_mut() };
+            b = n;
 
-                let p = unsafe { *(*b).p.get_mut() };
-                let c = unsafe { *(*b).c.get_mut() };
-
-                debug_assert!(
-                    high(p) == low(p) || low(p) == L,
-                    "all producers should be finished before dropping UBQ (p = {}:{})",
-                    high(p),
-                    low(p)
-                );
-                debug_assert!(
-                    high(c) == low(c) || low(c) == L,
-                    "all consumers should be finished before dropping UBQ (c = {}:{})",
-                    high(c),
-                    low(c),
-                );
-
-                // Drop unconsumed elements in this block. The live range of
-                // initialized, unconsumed slots is:
-                //   · [0, low(p))        when c == F::MAX — block was never
-                //     opened to consumers; every produced value is unconsumed.
-                //   · [low(c), low(p))   otherwise — low(c) committed consumer
-                //     reads have already moved [0, low(c)) out; the remaining
-                //     range [low(c), low(p)) holds initialized unconsumed Ts.
-                //
-                // By [C2], every slot in [0, low(p)) contains a fully
-                // initialized T. The debug_asserts above confirm no in-flight
-                // producers remain, so low(p) accurately reflects all slots
-                // written in this block.
-                for i in if c == F::MAX { 0 } else { low(c) }..low(p) {
-                    // SAFETY:
-                    //   · `b` is a valid `*mut B<T>` as established above.
-                    //   · `i` is in [0, low(p)) ⊆ [0, L); the offset is in
-                    //     bounds of the `a` array.
-                    //   · Slot `i` holds an initialized T (by [C2] and the
-                    //     range argument above).
-                    //   · Exclusive access is guaranteed (last-clone
-                    //     exclusivity); no concurrent reads or writes occur.
-                    //   · `cast::<T>()` is valid: `UnsafeCell<MaybeUninit<T>>`
-                    //     is `repr(transparent)` over `MaybeUninit<T>`, which
-                    //     is `repr(transparent)` over `T`; layout matches.
-                    unsafe {
-                        (*b).a
-                            .as_mut_ptr_range()
-                            .start
-                            .add(i as usize)
-                            .cast::<T>()
-                            .drop_in_place()
-                    }
-                }
-
-                b = n;
-
-                if b.is_null() || b == b_ {
-                    break;
-                }
+            if b.is_null() || b == b_ {
+                break;
             }
         }
     }
@@ -810,6 +1006,7 @@ impl<T> Drop for UBQ<T> {
 mod tests {
     use std::{
         fmt::{Debug, Write},
+        ptr,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -822,7 +1019,7 @@ mod tests {
 
     impl<T> Debug for UBQ<T> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let p = unsafe { *self.p.as_ref().as_ptr() };
+            let p = unsafe { self.i.as_ref().p.load(Ordering::Acquire) };
 
             if p.is_null() {
                 return writeln!(f, "UBQ {{}}");
@@ -1001,5 +1198,43 @@ mod tests {
         for c in v {
             c.join().unwrap()
         }
+    }
+
+    #[test]
+    fn is_empty_returns_correctly() {
+        assert!(UBQ::<()>::new().is_empty());
+
+        for m in 1_000..1_005 {
+            let q = UBQ::new();
+
+            for i in 0..m {
+                q.push(i);
+            }
+
+            for _ in 0..m {
+                q.pop().unwrap();
+            }
+
+            assert!(q.is_empty())
+        }
+    }
+
+    #[test]
+    fn shrink_removes_all_in_empty_queue() {
+        let q = UBQ::new();
+
+        let m = 1_000;
+        for i in 0..m {
+            q.push(i);
+        }
+
+        for _ in 0..m {
+            q.pop().unwrap();
+        }
+
+        // No in-flight push's or pop's
+        unsafe { q.shrink() };
+
+        assert!(unsafe { *q.i.as_ref().p.as_ptr() } == ptr::null_mut())
     }
 }
