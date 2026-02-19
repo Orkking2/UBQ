@@ -1,6 +1,6 @@
 [package]
 name = "ubq"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 description = "Lock-free unbounded MPMC queue backed by a linked ring of fixed-size blocks."
 license = "MIT"
@@ -11,9 +11,6 @@ categories = ["concurrency", "data-structures"]
 
 [dependencies]
 crossbeam-utils = "0.8.21"
-crossbeam-queue = "0.3"
-log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
-loom = { version = "0.7", optional = true }
 
 [features]
 default = []
@@ -21,7 +18,6 @@ ubq_debug = []
 bench_small = []
 bench_medium = []
 bench_large = []
-loom = ["dep:loom"]
 
 [dev-dependencies]
 criterion = { version = "0.8.1", features = ["html_reports"] }
