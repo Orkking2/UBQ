@@ -7,118 +7,88 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use concurrent_queue::PopError;
 use crossbeam_utils::Backoff;
 use serde::Serialize;
 
-use ubq::{L, UBQ};
+use ubq::{BLOCK_LENGTH, UBQ};
 
 const SENTINEL: u64 = u64::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueueKind {
     Ubq,
-    Crossbeam,
-    Flume,
-    Async,
+    SegQueue,
+    ConcurrentQueue,
 }
 
 impl QueueKind {
     fn name(self) -> &'static str {
         match self {
             QueueKind::Ubq => "ubq",
-            QueueKind::Crossbeam => "crossbeam",
-            QueueKind::Flume => "flume",
-            QueueKind::Async => "async-channel",
+            QueueKind::SegQueue => "segqueue",
+            QueueKind::ConcurrentQueue => "concurrent-queue",
         }
     }
 
     fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
             "ubq" => Some(QueueKind::Ubq),
-            "crossbeam" | "crossbeam-channel" => Some(QueueKind::Crossbeam),
-            "flume" => Some(QueueKind::Flume),
-            "async" | "async-channel" => Some(QueueKind::Async),
+            "segqueue" | "crossbeam" | "crossbeam-segqueue" | "crossbeam-channel" => {
+                Some(QueueKind::SegQueue)
+            }
+            "concurrent-queue" | "concurrent" => Some(QueueKind::ConcurrentQueue),
             _ => None,
         }
     }
 }
 
-enum Sender {
-    Ubq(UBQ<u64>),
-    Crossbeam(crossbeam_channel::Sender<u64>),
-    Flume(flume::Sender<u64>),
-    Async(async_channel::Sender<u64>),
+#[derive(Clone)]
+enum Queue {
+    Ubq(Arc<UBQ<u64>>),
+    SegQueue(Arc<crossbeam_queue::SegQueue<u64>>),
+    ConcurrentQueue(Arc<concurrent_queue::ConcurrentQueue<u64>>),
 }
 
-enum Receiver {
-    Ubq(UBQ<u64>),
-    Crossbeam(crossbeam_channel::Receiver<u64>),
-    Flume(flume::Receiver<u64>),
-    Async(async_channel::Receiver<u64>),
-}
-
-fn make_queue(kind: QueueKind) -> (Sender, Receiver) {
+fn make_queue(kind: QueueKind) -> Queue {
     match kind {
-        QueueKind::Ubq => {
-            let q = UBQ::new();
-            (Sender::Ubq(q.clone()), Receiver::Ubq(q))
-        }
-        QueueKind::Crossbeam => {
-            let (s, r) = crossbeam_channel::unbounded();
-            (Sender::Crossbeam(s), Receiver::Crossbeam(r))
-        }
-        QueueKind::Flume => {
-            let (s, r) = flume::unbounded();
-            (Sender::Flume(s), Receiver::Flume(r))
-        }
-        QueueKind::Async => {
-            let (s, r) = async_channel::unbounded();
-            (Sender::Async(s), Receiver::Async(r))
+        QueueKind::Ubq => Queue::Ubq(Arc::new(UBQ::new())),
+        QueueKind::SegQueue => Queue::SegQueue(Arc::new(crossbeam_queue::SegQueue::new())),
+        QueueKind::ConcurrentQueue => {
+            Queue::ConcurrentQueue(Arc::new(concurrent_queue::ConcurrentQueue::unbounded()))
         }
     }
 }
 
-fn sender_clone(sender: &Sender) -> Sender {
-    match sender {
-        Sender::Ubq(q) => Sender::Ubq(q.clone()),
-        Sender::Crossbeam(s) => Sender::Crossbeam(s.clone()),
-        Sender::Flume(s) => Sender::Flume(s.clone()),
-        Sender::Async(s) => Sender::Async(s.clone()),
+fn send(queue: &Queue, value: u64) {
+    match queue {
+        Queue::Ubq(q) => q.push(value),
+        Queue::SegQueue(q) => q.push(value),
+        Queue::ConcurrentQueue(q) => q.push(value).expect("send failed"),
     }
 }
 
-fn receiver_clone(receiver: &Receiver) -> Receiver {
-    match receiver {
-        Receiver::Ubq(q) => Receiver::Ubq(q.clone()),
-        Receiver::Crossbeam(r) => Receiver::Crossbeam(r.clone()),
-        Receiver::Flume(r) => Receiver::Flume(r.clone()),
-        Receiver::Async(r) => Receiver::Async(r.clone()),
-    }
-}
-
-fn send(sender: &Sender, value: u64) {
-    match sender {
-        Sender::Ubq(q) => q.push(value),
-        Sender::Crossbeam(s) => s.send(value).expect("send failed"),
-        Sender::Flume(s) => s.send(value).expect("send failed"),
-        Sender::Async(s) => s.send_blocking(value).expect("send failed"),
-    }
-}
-
-fn recv(receiver: &Receiver) -> u64 {
-    match receiver {
-        Receiver::Ubq(q) => {
-            let backoff = Backoff::new();
-            loop {
+fn recv(queue: &Queue) -> u64 {
+    let backoff = Backoff::new();
+    loop {
+        match queue {
+            Queue::Ubq(q) => {
                 if let Some(value) = q.pop() {
                     return value;
                 }
-                backoff.snooze();
             }
+            Queue::SegQueue(q) => {
+                if let Some(value) = q.pop() {
+                    return value;
+                }
+            }
+            Queue::ConcurrentQueue(q) => match q.pop() {
+                Ok(value) => return value,
+                Err(PopError::Empty) => {}
+                Err(PopError::Closed) => panic!("recv failed: queue closed"),
+            },
         }
-        Receiver::Crossbeam(r) => r.recv().expect("recv failed"),
-        Receiver::Flume(r) => r.recv().expect("recv failed"),
-        Receiver::Async(r) => r.recv_blocking().expect("recv failed"),
+        backoff.snooze();
     }
 }
 
@@ -200,7 +170,7 @@ struct ScenarioMeta {
 #[derive(Serialize)]
 struct Meta {
     timestamp_unix_ms: u128,
-    L: usize,
+    block_cap: usize,
     items_per_producer: u64,
     queues: Vec<String>,
     scenarios: Vec<ScenarioMeta>,
@@ -223,7 +193,7 @@ struct Record {
     pop_elapsed_ns: Option<u64>,
     fill_elapsed_ns: Option<u64>,
     drain_elapsed_ns: Option<u64>,
-    L: usize,
+    block_cap: usize,
 }
 
 #[derive(Serialize)]
@@ -257,9 +227,8 @@ fn parse_args() -> BenchConfig {
     let mut items_per_producer: u64 = 1_000_000;
     let mut queues = vec![
         QueueKind::Ubq,
-        QueueKind::Crossbeam,
-        QueueKind::Flume,
-        QueueKind::Async,
+        QueueKind::SegQueue,
+        QueueKind::ConcurrentQueue,
     ];
     let mut modes = vec![Mode::Throughput, Mode::FillDrain];
 
@@ -413,7 +382,7 @@ fn run_benches(config: &BenchConfig) -> Output {
 
     let meta = Meta {
         timestamp_unix_ms,
-        L: L as usize,
+        block_cap: BLOCK_LENGTH as usize,
         items_per_producer: config.items_per_producer,
         queues: config.queues.iter().map(|q| q.name().to_string()).collect(),
         scenarios: config
@@ -461,7 +430,7 @@ fn bench_throughput(
 ) -> Record {
     let total_items = total_items(items_per_producer, scenario.producers);
 
-    let (sender, receiver) = make_queue(queue);
+    let queue_handle = make_queue(queue);
 
     let total_threads = scenario.producers + scenario.consumers;
     let ready = Arc::new(Barrier::new(total_threads + 1));
@@ -474,7 +443,7 @@ fn bench_throughput(
 
     let mut producer_handles = Vec::with_capacity(scenario.producers);
     for producer_id in 0..scenario.producers {
-        let sender = sender_clone(&sender);
+        let queue_handle = queue_handle.clone();
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
@@ -488,7 +457,7 @@ fn bench_throughput(
                 .expect("item count overflow");
             for offset in 0..items_per_producer {
                 let value = base.checked_add(offset).expect("item count overflow");
-                send(&sender, value);
+                send(&queue_handle, value);
             }
             let end_ns = start.elapsed().as_nanos() as u64;
             producer_max.fetch_max(end_ns, Ordering::Relaxed);
@@ -497,7 +466,7 @@ fn bench_throughput(
 
     let mut consumer_handles = Vec::with_capacity(scenario.consumers);
     for _ in 0..scenario.consumers {
-        let receiver = receiver_clone(&receiver);
+        let queue_handle = queue_handle.clone();
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
@@ -508,7 +477,7 @@ fn bench_throughput(
             start_gate.wait();
             let start = *start.get().expect("start set");
             loop {
-                let value = recv(&receiver);
+                let value = recv(&queue_handle);
                 if value == SENTINEL {
                     break;
                 }
@@ -528,7 +497,7 @@ fn bench_throughput(
     }
 
     for _ in 0..scenario.consumers {
-        send(&sender, SENTINEL);
+        send(&queue_handle, SENTINEL);
     }
 
     for handle in consumer_handles {
@@ -563,7 +532,7 @@ fn bench_throughput(
         pop_elapsed_ns: Some(consumer_max.load(Ordering::Relaxed)),
         fill_elapsed_ns: None,
         drain_elapsed_ns: None,
-        L: L as usize,
+        block_cap: BLOCK_LENGTH as usize,
     }
 }
 
@@ -574,15 +543,15 @@ fn bench_fill_drain(
 ) -> Record {
     let total_items = total_items(items_per_producer, scenario.producers);
 
-    let (sender, receiver) = make_queue(queue);
+    let queue_handle = make_queue(queue);
 
-    let fill_elapsed = run_producers_only(&sender, scenario.producers, items_per_producer);
+    let fill_elapsed = run_producers_only(&queue_handle, scenario.producers, items_per_producer);
 
     for _ in 0..scenario.consumers {
-        send(&sender, SENTINEL);
+        send(&queue_handle, SENTINEL);
     }
 
-    let (drain_elapsed, consumed) = run_consumers_only(&receiver, scenario.consumers);
+    let (drain_elapsed, consumed) = run_consumers_only(&queue_handle, scenario.consumers);
 
     if consumed != total_items {
         warn_mismatch(queue, scenario, total_items, consumed);
@@ -605,11 +574,11 @@ fn bench_fill_drain(
         pop_elapsed_ns: None,
         fill_elapsed_ns: Some(fill_elapsed.as_nanos() as u64),
         drain_elapsed_ns: Some(drain_elapsed.as_nanos() as u64),
-        L: L as usize,
+        block_cap: BLOCK_LENGTH as usize,
     }
 }
 
-fn run_producers_only(sender: &Sender, producers: usize, items_per_producer: u64) -> Duration {
+fn run_producers_only(queue_handle: &Queue, producers: usize, items_per_producer: u64) -> Duration {
     let ready = Arc::new(Barrier::new(producers + 1));
     let start_gate = Arc::new(Barrier::new(producers + 1));
     let start = Arc::new(OnceLock::new());
@@ -617,7 +586,7 @@ fn run_producers_only(sender: &Sender, producers: usize, items_per_producer: u64
 
     let mut handles = Vec::with_capacity(producers);
     for producer_id in 0..producers {
-        let sender = sender_clone(sender);
+        let queue_handle = queue_handle.clone();
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
@@ -631,7 +600,7 @@ fn run_producers_only(sender: &Sender, producers: usize, items_per_producer: u64
                 .expect("item count overflow");
             for offset in 0..items_per_producer {
                 let value = base.checked_add(offset).expect("item count overflow");
-                send(&sender, value);
+                send(&queue_handle, value);
             }
             let end_ns = start.elapsed().as_nanos() as u64;
             max_end.fetch_max(end_ns, Ordering::Relaxed);
@@ -649,7 +618,7 @@ fn run_producers_only(sender: &Sender, producers: usize, items_per_producer: u64
     Duration::from_nanos(max_end.load(Ordering::Relaxed))
 }
 
-fn run_consumers_only(receiver: &Receiver, consumers: usize) -> (Duration, u64) {
+fn run_consumers_only(queue_handle: &Queue, consumers: usize) -> (Duration, u64) {
     let ready = Arc::new(Barrier::new(consumers + 1));
     let start_gate = Arc::new(Barrier::new(consumers + 1));
     let start = Arc::new(OnceLock::new());
@@ -658,7 +627,7 @@ fn run_consumers_only(receiver: &Receiver, consumers: usize) -> (Duration, u64) 
 
     let mut handles = Vec::with_capacity(consumers);
     for _ in 0..consumers {
-        let receiver = receiver_clone(receiver);
+        let queue_handle = queue_handle.clone();
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
@@ -669,7 +638,7 @@ fn run_consumers_only(receiver: &Receiver, consumers: usize) -> (Duration, u64) 
             start_gate.wait();
             let start: Instant = *start.get().expect("start set");
             loop {
-                let value = recv(&receiver);
+                let value = recv(&queue_handle);
                 if value == SENTINEL {
                     break;
                 }
@@ -748,7 +717,7 @@ Usage:
 
 Options:
   --items-per-producer N    Items each producer enqueues (default: 1_000_000)
-  --queues LIST             Comma list: ubq,crossbeam,flume,async-channel
+  --queues LIST             Comma list: ubq,segqueue,concurrent-queue
   --modes LIST              Comma list: throughput,fill_drain
   --scenarios LIST          Comma list: spsc,mpsc,spmc,mpmc
   --mpsc-producers N        Producers for MPSC (default: 4)
@@ -864,12 +833,11 @@ mod tests {
         ]
     }
 
-    fn test_queues() -> [QueueKind; 4] {
+    fn test_queues() -> [QueueKind; 3] {
         [
             QueueKind::Ubq,
-            QueueKind::Crossbeam,
-            QueueKind::Flume,
-            QueueKind::Async,
+            QueueKind::SegQueue,
+            QueueKind::ConcurrentQueue,
         ]
     }
 
@@ -963,14 +931,14 @@ mod tests {
         let error_count = Arc::new(AtomicUsize::new(0));
         let first_error = Arc::new(Mutex::new(None::<String>));
 
-        let (sender, receiver) = make_queue(queue);
+        let queue_handle = make_queue(queue);
         let total_threads = scenario.producers + scenario.consumers;
         let ready = Arc::new(Barrier::new(total_threads + 1));
         let start_gate = Arc::new(Barrier::new(total_threads + 1));
 
         let mut producer_handles = Vec::with_capacity(scenario.producers);
         for producer_id in 0..scenario.producers {
-            let sender = sender_clone(&sender);
+            let queue_handle = queue_handle.clone();
             let ready = Arc::clone(&ready);
             let start_gate = Arc::clone(&start_gate);
             producer_handles.push(thread::spawn(move || {
@@ -981,14 +949,14 @@ mod tests {
                     .expect("item count overflow");
                 for offset in 0..items_per_producer {
                     let value = base.checked_add(offset).expect("item count overflow");
-                    send(&sender, value);
+                    send(&queue_handle, value);
                 }
             }));
         }
 
         let mut consumer_handles = Vec::with_capacity(scenario.consumers);
         for _ in 0..scenario.consumers {
-            let receiver = receiver_clone(&receiver);
+            let queue_handle = queue_handle.clone();
             let ready = Arc::clone(&ready);
             let start_gate = Arc::clone(&start_gate);
             let seen = Arc::clone(&seen);
@@ -999,7 +967,7 @@ mod tests {
                 ready.wait();
                 start_gate.wait();
                 loop {
-                    let value = recv(&receiver);
+                    let value = recv(&queue_handle);
                     if value == SENTINEL {
                         break;
                     }
@@ -1033,7 +1001,7 @@ mod tests {
         }
 
         for _ in 0..scenario.consumers {
-            send(&sender, SENTINEL);
+            send(&queue_handle, SENTINEL);
         }
 
         for handle in consumer_handles {
@@ -1067,11 +1035,11 @@ mod tests {
         let error_count = Arc::new(AtomicUsize::new(0));
         let first_error = Arc::new(Mutex::new(None::<String>));
 
-        let (sender, receiver) = make_queue(queue);
-        run_producers_only(&sender, scenario.producers, items_per_producer);
+        let queue_handle = make_queue(queue);
+        run_producers_only(&queue_handle, scenario.producers, items_per_producer);
 
         for _ in 0..scenario.consumers {
-            send(&sender, SENTINEL);
+            send(&queue_handle, SENTINEL);
         }
 
         let ready = Arc::new(Barrier::new(scenario.consumers + 1));
@@ -1079,7 +1047,7 @@ mod tests {
 
         let mut consumer_handles = Vec::with_capacity(scenario.consumers);
         for _ in 0..scenario.consumers {
-            let receiver = receiver_clone(&receiver);
+            let queue_handle = queue_handle.clone();
             let ready = Arc::clone(&ready);
             let start_gate = Arc::clone(&start_gate);
             let seen = Arc::clone(&seen);
@@ -1090,7 +1058,7 @@ mod tests {
                 ready.wait();
                 start_gate.wait();
                 loop {
-                    let value = recv(&receiver);
+                    let value = recv(&queue_handle);
                     if value == SENTINEL {
                         break;
                     }

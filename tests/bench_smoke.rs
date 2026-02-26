@@ -34,12 +34,14 @@ fn pop_blocking(q: &UBQ<u64>) -> u64 {
 fn run_throughput_integrity(producers: usize, consumers: usize) {
     let total = ITEMS_PER_PRODUCER * producers as u64;
     let seen: Arc<Vec<AtomicBool>> = Arc::new(
-        (0..total as usize).map(|_| AtomicBool::new(false)).collect(),
+        (0..total as usize)
+            .map(|_| AtomicBool::new(false))
+            .collect(),
     );
     let consumed = Arc::new(AtomicUsize::new(0));
     let duplicates = Arc::new(AtomicUsize::new(0));
 
-    let q: UBQ<u64> = UBQ::new();
+    let q: Arc<UBQ<u64>> = Arc::new(UBQ::new());
     let total_threads = producers + consumers;
     let ready = Arc::new(Barrier::new(total_threads + 1));
     let start = Arc::new(Barrier::new(total_threads + 1));
@@ -47,7 +49,7 @@ fn run_throughput_integrity(producers: usize, consumers: usize) {
     let mut handles = Vec::with_capacity(total_threads);
 
     for pid in 0..producers {
-        let q = q.clone();
+        let q = Arc::clone(&q);
         let ready = ready.clone();
         let start = start.clone();
         handles.push(thread::spawn(move || {
@@ -61,7 +63,7 @@ fn run_throughput_integrity(producers: usize, consumers: usize) {
     }
 
     for _ in 0..consumers {
-        let q = q.clone();
+        let q = Arc::clone(&q);
         let ready = ready.clone();
         let start = start.clone();
         let seen = seen.clone();
@@ -126,19 +128,21 @@ fn run_throughput_integrity(producers: usize, consumers: usize) {
 fn run_fill_drain_integrity(producers: usize, consumers: usize) {
     let total = ITEMS_PER_PRODUCER * producers as u64;
     let seen: Arc<Vec<AtomicBool>> = Arc::new(
-        (0..total as usize).map(|_| AtomicBool::new(false)).collect(),
+        (0..total as usize)
+            .map(|_| AtomicBool::new(false))
+            .collect(),
     );
     let consumed = Arc::new(AtomicUsize::new(0));
     let duplicates = Arc::new(AtomicUsize::new(0));
 
-    let q: UBQ<u64> = UBQ::new();
+    let q: Arc<UBQ<u64>> = Arc::new(UBQ::new());
 
     // Fill phase.
     {
         let barrier = Arc::new(Barrier::new(producers + 1));
         let mut handles = Vec::with_capacity(producers);
         for pid in 0..producers {
-            let q = q.clone();
+            let q = Arc::clone(&q);
             let barrier = barrier.clone();
             handles.push(thread::spawn(move || {
                 barrier.wait();
@@ -164,7 +168,7 @@ fn run_fill_drain_integrity(producers: usize, consumers: usize) {
         let barrier = Arc::new(Barrier::new(consumers + 1));
         let mut handles = Vec::with_capacity(consumers);
         for _ in 0..consumers {
-            let q = q.clone();
+            let q = Arc::clone(&q);
             let barrier = barrier.clone();
             let seen = seen.clone();
             let consumed = consumed.clone();

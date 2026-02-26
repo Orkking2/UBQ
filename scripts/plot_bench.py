@@ -2,6 +2,7 @@
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 
 SCENARIOS = ["spsc", "mpsc", "spmc", "mpmc"]
@@ -19,7 +20,7 @@ def load_records(path: Path):
             continue
         scenario = rec.get("scenario")
         queue = rec.get("queue")
-        block_cap = rec.get("block_cap")
+        block_cap = rec.get("block_cap", rec.get("L"))
         if queue == "ubq" and block_cap is not None:
             label = f"ubq({block_cap})"
         else:
@@ -38,7 +39,7 @@ def sort_labels(labels):
             return (0, size_val)
         if label == "ubq":
             return (0, 0)
-        order = {"crossbeam": 1, "flume": 2, "async-channel": 3}
+        order = {"segqueue": 1, "concurrent-queue": 2}
         return (1, order.get(label, 99), label)
 
     return sorted(labels, key=key)
@@ -51,6 +52,20 @@ def write_csv(out_dir: Path, scenario: str, values):
     for label, ops in values:
         lines.append(f"{label},{ops:.6f}")
     csv_path.write_text("\n".join(lines), encoding="utf-8")
+    return csv_path
+
+
+def ensure_mplconfigdir(out_dir: Path):
+    if os.environ.get("MPLCONFIGDIR"):
+        return
+
+    default_mpl_dir = Path.home() / ".matplotlib"
+    if default_mpl_dir.exists() and os.access(default_mpl_dir, os.W_OK):
+        return
+
+    fallback_mpl_dir = out_dir / ".mplconfig"
+    fallback_mpl_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = str(fallback_mpl_dir)
 
 
 def main():
@@ -66,6 +81,7 @@ def main():
     out_dir = Path(args.out_dir)
 
     data = {scenario: {} for scenario in SCENARIOS}
+    throughput_points = 0
 
     for file in args.files:
         path = Path(file)
@@ -73,14 +89,21 @@ def main():
             if scenario not in data:
                 continue
             data[scenario].setdefault(label, []).append(ops)
+            throughput_points += 1
+
+    if throughput_points == 0:
+        print("No throughput records found in input files.")
+        return
 
     # Always write CSVs
     for scenario in SCENARIOS:
         entries = data.get(scenario, {})
         labels = sort_labels(entries.keys())
         values = [(label, sum(entries[label]) / len(entries[label])) for label in labels]
-        write_csv(out_dir, scenario, values)
+        csv_path = write_csv(out_dir, scenario, values)
+        print(f"Wrote CSV: {csv_path}")
 
+    ensure_mplconfigdir(out_dir)
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -103,7 +126,9 @@ def main():
 
         out_dir.mkdir(parents=True, exist_ok=True)
         fig.tight_layout()
-        fig.savefig(out_dir / f"{scenario}_throughput.png", dpi=200)
+        png_path = out_dir / f"{scenario}_throughput.png"
+        fig.savefig(png_path, dpi=200)
+        print(f"Wrote PNG: {png_path}")
         plt.close(fig)
 
 

@@ -4,13 +4,9 @@
 //! # Overview
 //!
 //! [`UBQ<T>`] is a **lock-free MPMC queue** with no upper bound on capacity.
-//! Elements are stored in fixed-size *blocks* that form a circular ring; blocks
-//! are allocated on demand and recycled once fully consumed.
 //!
-//! Every [`UBQ<T>`] handle is cheaply clonable — all clones share the same
-//! underlying ring and may call [`UBQ::push`] and [`UBQ::pop`] concurrently from
-//! any thread.  Reference counting ensures that the ring (and any unconsumed
-//! elements) is freed when the last clone is dropped.
+//! [`UBQ<T>`] itself is not clonable. To share it across threads, wrap it in
+//! [`Arc<UBQ<T>>`](std::sync::Arc), then clone the `Arc`.
 //!
 //! Neither [`UBQ::push`] nor [`UBQ::pop`] ever parks the calling thread.  Both
 //! operations are *lock-free*: producers and consumers make progress independently.
@@ -21,10 +17,11 @@
 //!
 //! ```rust
 //! use ubq::UBQ;
+//! use std::sync::Arc;
 //! use std::thread;
 //!
-//! let q: UBQ<u64> = UBQ::new();
-//! let q2 = q.clone();
+//! let q: Arc<UBQ<u64>> = UBQ::new_arc();
+//! let q2 = Arc::clone(&q);
 //!
 //! let producer = thread::spawn(move || {
 //!     for i in 0..1_000_u64 {
@@ -48,18 +45,31 @@
 //! slots.  A consumer spins briefly on the *stability predicate* before claiming a
 //! slot to guarantee it reads only fully-committed writes.
 //!
-//! Detailed correctness arguments for each invariant are annotated inline in the
-//! source as `[C1]`–`[C6]`.
+//! Ordering and invariants are documented inline near the transitions they govern.
 
+#![feature(integer_atomics)]
 #![warn(missing_docs)]
 
 pub(crate) mod block;
-pub(crate) mod inner;
-pub(crate) mod packed;
+pub(crate) mod util;
 pub(crate) mod queue;
 
 #[cfg(test)]
 mod tests;
 
-pub use packed::L;
+pub use block::BLOCK_LENGTH;
 pub use queue::UBQ;
+
+/*
+rsync -avz --delete --delete-excluded --prune-empty-dirs \
+  --include='/Cargo.toml' \
+  --include='/Cargo.lock' \
+  --include='/README.md' \
+  --include='/LICENSE' \
+  --include='/src/' --include='/src/**' \
+  --include='/benches/' --include='/benches/**' \
+  --include='/tests/' --include='/tests/**' \
+  --include='/scripts/' --include='/scripts/**' \
+  --exclude='*' \
+  ./ lab:~/UBQ/
+*/*/*/*/*/

@@ -12,8 +12,8 @@ and consumers.
 - **Lock-free** — `push` and `pop` never park the calling thread.
 - **Unbounded** — capacity grows automatically as new blocks are allocated.
 - **MPMC** — any number of producers and consumers may operate concurrently.
-- **Clonable handles** — every `UBQ<T>` clone shares the same underlying ring;
-  reference counting frees the ring when the last clone is dropped.
+- **Arc-friendly sharing** — `UBQ<T>` is meant to be wrapped in `Arc` for shared,
+  concurrent ownership across threads.
 - **FIFO ordering** — elements are returned in the order they were pushed, within
   each block.
 
@@ -45,16 +45,17 @@ fn main() {
 
 ```rust
 use ubq::UBQ;
+use std::sync::Arc;
 use std::thread;
 
-let q: UBQ<u64> = UBQ::new();
+let q: Arc<UBQ<u64>> = Arc::new(UBQ::new());
 
 // Spawn 4 producers and 4 consumers.
 let m = 100_000;
 let handles: Vec<_> = (0..4)
     .flat_map(|_| {
-        let pq = q.clone();
-        let cq = q.clone();
+        let pq = Arc::clone(&q);
+        let cq = Arc::clone(&q);
         [
             thread::spawn(move || { for i in 0..m { pq.push(i); } }),
             thread::spawn(move || { for _ in 0..m { while cq.pop().is_none() {} } }),
@@ -69,24 +70,14 @@ See the full API reference on [docs.rs](https://docs.rs/ubq).
 
 ## How it works
 
-UBQ organises elements into fixed-size *blocks* linked in a circular ring.
-Two atomic head pointers — **phead** and **chead** — track which block is
-currently accepting pushes and which is being drained by consumers.
-
-Within each block, a pair of packed counters distinguishes *claimed* from
-*committed* slots. A consumer spin-waits briefly on a *stability predicate*
-before claiming a slot, ensuring it reads only fully-committed writes. When a
-block is exhausted the last claimer atomically advances the head pointer to the
-next block, recycling the old one once it has been fully consumed.
-
-The correctness of the protocol rests on six invariants (`[C1]`–`[C6]`)
-documented inline in the source.
+TODO
 
 ## Benchmarks
 
-This repo includes a benchmark harness that compares UBQ against other unbounded
-queues in SPSC, MPSC, SPMC, and MPMC scenarios. Results are emitted as JSON; an
-optional helper script generates throughput bar plots.
+This repo includes a benchmark harness that compares UBQ against established
+unbounded MPMC queue implementations (`segqueue` and `concurrent-queue`) in
+SPSC, MPSC, SPMC, and MPMC scenarios. Results are emitted as JSON; an optional
+helper script generates throughput bar plots.
 
 Run the default benchmark suite (release mode):
 
@@ -97,7 +88,7 @@ cargo bench --bench ubq_bench -- --out bench_results/ubq_default.json
 Limit to specific queues or scenarios:
 
 ```bash
-cargo bench --bench ubq_bench -- --queues=ubq,crossbeam --scenarios=spsc,mpmc
+cargo bench --bench ubq_bench -- --queues=ubq,segqueue,concurrent-queue --scenarios=spsc,mpmc
 ```
 
 Generate plots (PNG) and CSVs:

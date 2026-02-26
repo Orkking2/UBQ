@@ -1,63 +1,56 @@
-use crate::packed::{A, F, L, high, low};
-use crossbeam_utils::CachePadded;
-use std::{cell::UnsafeCell, mem::MaybeUninit, sync::atomic::AtomicPtr};
+use crossbeam_utils::Backoff;
+use std::{
+    cell::UnsafeCell,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+};
+
+/// Number of element slots per block.
+pub const BLOCK_LENGTH: usize = 32;
 
 /// A fixed-size ring-buffer segment.
-///
-/// `p` and `c` each pack two [`H`] counters into a [`A`] using the upper and lower
-/// `H::BITS` bits respectively; see `high()`, `low()`, and `merge()`.
-pub struct B<T> {
-    /// Pointer to the next block in the ring.
-    pub n: CachePadded<AtomicPtr<Self>>,
-    /// Producer counter. `high(p)` = slots claimed; `low(p)` = slots committed.
-    pub p: CachePadded<A>,
-    /// Consumer counter. `high(c)` = slots claimed; `low(c)` = slots committed.
-    /// The sentinel value `F::MAX` means the block is not yet open to consumers.
-    pub c: CachePadded<A>,
-    /// Element storage. Slot `i` is written by the unique producer that claims index
-    /// `i` and read by the unique consumer that claims index `i`. See [C6].
-    pub a: [UnsafeCell<MaybeUninit<T>>; L as usize],
+#[repr(align(256))]
+pub struct Block<T> {
+    /// Link to the successor block used by producer-head advancement/recycling.
+    pub next: AtomicPtr<Self>,
+    /// Per-slot storage for values in this block.
+    pub array: [Slot<T>; BLOCK_LENGTH],
 }
 
-impl<T> Drop for B<T> {
-    fn drop(&mut self) {
-        let (p, c) = unsafe { (*self.p.as_ptr(), *self.c.as_ptr()) };
+// Bits indicating the state of a slot:
+// * If a value has been written into the slot, `WRITE` is set.
+pub const WRITE: usize = 1;
+pub const READ: usize = WRITE << 1;
+pub const DESTROY: usize = READ << 1;
 
-        debug_assert!(
-            high(p) == low(p) || low(p) == L,
-            "all producers should be finished before dropping B (p = {}:{})",
-            high(p),
-            low(p)
-        );
-        debug_assert!(
-            high(c) == low(c) || low(c) == L,
-            "all consumers should be finished before dropping B (c = {}:{})",
-            high(c),
-            low(c),
-        );
+pub struct Slot<T> {
+    pub value: UnsafeCell<MaybeUninit<T>>,
+    pub state: AtomicUsize,
+}
 
-        // Drop unconsumed elements in this block. The live range of
-        // initialized, unconsumed slots is:
-        //	 · [0, 0) 			  when p == F::MAX: block is marked
-        //	   for destruction during queue operation; it is guaranteed
-        //     to be empty.
-        //
-        //   · [0, low(p))        when c == F::MAX: block was never
-        //     opened to consumers; every produced value is unconsumed.
-        //
-        //   · [low(c), low(p))   else: low(c) committed consumer
-        //     reads have already moved [0, low(c)) out; the remaining
-        //     range [low(c), low(p)) holds initialized unconsumed Ts.
-        let z = |u: F| if u == F::MAX { 0 } else { low(u) };
+impl<T> Slot<T> {
+    pub fn await_write(&self) {
+        let backoff = Backoff::new();
 
-        for i in z(c)..z(p) {
-            unsafe {
-                self.a
-                    .get_unchecked_mut(i as usize)
-                    .get_mut()
-                    .as_mut_ptr()
-                    .drop_in_place();
-            }
+        while self.state.load(Ordering::Acquire) & WRITE == 0 {
+            backoff.snooze();
         }
+    }
+}
+
+impl<T> Block<T> {
+    pub fn new_zeroed() -> Box<Self> {
+        unsafe { Box::new_zeroed().assume_init() }
+    }
+}
+
+impl<T> Drop for Block<T> {
+    fn drop(&mut self) {
+        self.array
+            .iter_mut()
+            .filter_map(|Slot { value, state }| {
+                (*state.get_mut() & (WRITE | READ) == WRITE).then_some(value)
+            })
+            .for_each(|value| unsafe { value.get_mut().assume_init_drop() });
     }
 }

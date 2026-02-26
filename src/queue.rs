@@ -1,44 +1,67 @@
-use crate::inner::I;
-use std::{num::NonZeroUsize, ptr::NonNull, sync::atomic::Ordering};
+use crate::{
+    BLOCK_LENGTH,
+    block::{Block, DESTROY, READ, WRITE},
+    util::{HIGHEST_BIT, INCR, acquire_nonnull},
+};
+use crossbeam_utils::{Backoff, CachePadded};
+use std::{
+    marker::PhantomData,
+    mem::{ManuallyDrop, MaybeUninit},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 /// A lock-free, unbounded multi-producer/multi-consumer (MPMC) queue.
 ///
-/// See the [crate-level documentation](crate) for an overview and quick-start example.
-///
-/// # Cloning and ownership
-///
-/// `UBQ<T>` is cheaply clonable: every clone shares the same underlying block ring
-/// via reference counting.  All clones may call [`push`](Self::push) and
-/// [`pop`](Self::pop) concurrently without additional coordination.  The block ring
-/// (including any unconsumed elements) is freed when the **last** clone is dropped.
-///
-/// # Implementation invariants
-///
-/// 1. **Block availability:** the first published block is immediately open to both
-///    producers and consumers; each later block is initially open only to producers.
-///
-/// 2. **Stale head pointers fail fast:** a producer (resp. consumer) operating on a
-///    block that is no longer `phead` (resp. `chead`) abandons that attempt, reloads
-///    the head pointer, and retries.
-///
-/// 3. **Producer/consumer coordination per block:** `B::p` packs two counters —
-///    `high(p)` = claimed slots (incremented before writing) and
-///    `low(p)` = committed slots (incremented with `Release` after writing).
-///    Before claiming a slot a consumer spin-waits until `high(p) == low(p)`
-///    (all claims committed) or `low(p) == L` (block full).  Full blocks use an
-///    unconditional `fetch_add` on `B::c`; partial blocks use a `CAS` loop.
-///    `B::c` starts at `F::MAX` ("closed to consumers") and is set to `0` by the
-///    consumer that advances `chead`.
+/// See the [crate-level documentation](crate) for an overview and quick-start
+/// example. `UBQ<T>` itself is not clonable; share it with
+/// [`Arc<UBQ<T>>`](std::sync::Arc).
 pub struct UBQ<T> {
-    /// Shared inner state allocation.
-    pub(crate) i: NonNull<I<T>>,
+    /// Atomic pointer to phead: the block currently accepting producer pushes.
+    pub(crate) phead: CachePadded<AtomicUsize>,
+    /// Atomic pointer to chead: the block currently being drained by consumers.
+    pub(crate) chead: CachePadded<AtomicUsize>,
+    _marker: PhantomData<T>,
 }
 
-// SAFETY: All shared mutable state is accessed through `AtomicPtr` and [`A`]
-// operations, or through the `UnsafeCell` slots in `B::a`, which are protected by
-// the exclusive-index guarantee [C6] and the Release–Acquire pairing on `B::p` and
-// `B::c`. Given `T: Sync` (resp. `T: Send`), concurrent shared access (resp.
-// cross-thread transfer) of `T` values through `UBQ` is therefore sound.
+const MASK: usize = 255;
+
+struct Head<T> {
+    block: *mut Block<T>,
+    index: usize,
+}
+
+impl<T> Copy for Head<T> {}
+impl<T> Clone for Head<T> {
+    fn clone(&self) -> Self {
+        Self {
+            block: self.block.clone(),
+            index: self.index.clone(),
+        }
+    }
+}
+
+impl<T> Head<T> {
+    fn new(u: usize) -> Self {
+        Self {
+            block: (u & !MASK) as *mut Block<T>,
+            index: u & MASK,
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.index == 0 && self.block.is_null()
+    }
+
+    fn pack(self) -> usize {
+        self.block.addr() | self.index
+    }
+}
+
+// SAFETY: Slot ownership is assigned with atomic counters, and producer/consumer
+// commits are synchronized with Release/Acquire ordering before cross-thread reads.
 unsafe impl<T: Sync> Sync for UBQ<T> {}
 unsafe impl<T: Send> Send for UBQ<T> {}
 
@@ -48,113 +71,183 @@ impl<T> UBQ<T> {
     /// No blocks are allocated until the first call to [`push`](Self::push).
     #[inline]
     pub fn new() -> Self {
-        // SAFETY:
-        //   · `I<T>` is valid when zero-initialized: `p` and `c` are
-        //     `AtomicPtr<B<T>>` (null is a valid initial value) and `n` is an
-        //     `AtomicUsize` (0, representing one live copy, is valid).
-        //   · `Box::into_raw` on a non-empty `Box` is always non-null.
-        unsafe {
-            Self {
-                i: NonNull::new_unchecked(Box::into_raw(Box::new_zeroed().assume_init())),
-            }
+        Self {
+            phead: CachePadded::new(AtomicUsize::new(0)),
+            chead: CachePadded::new(AtomicUsize::new(0)),
+            _marker: PhantomData,
         }
     }
 
-    /// Returns a best-effort snapshot of how many [`UBQ`] handles currently exist.
-    ///
-    /// This value may change immediately due to concurrent clone/drop activity.
-    #[inline]
-    pub fn copies(&self) -> usize {
-        self.get_iref().copies()
+    /// Creates a new queue, like [`new`](Self::new), but using [`Arc::new_zeroed`].
+    pub fn new_arc() -> Arc<Self> {
+        unsafe { Arc::new_zeroed().assume_init() }
     }
+
+    // /// Returns `true` if this UBQ contains no values.
+    // pub fn is_empty(&self) -> bool {
+    //     todo!()
+    // }
 
     /// Pushes `e` onto the back of the queue.
-    ///
-    /// This operation is lock-free and never parks the calling thread.  It may
-    /// spin briefly at block boundaries while in-flight producers commit their
-    /// writes.
     #[doc(alias = "enqueue")]
     #[doc(alias = "send")]
-    #[inline]
     pub fn push(&self, e: T) {
-        self.get_iref().push(e);
+        let backoff = Backoff::new();
+        let mut phead = Head::new(0);
+        let mut block = None;
+
+        // This is the only time the ptr part of phead is invalid.
+        if self.phead.load(Ordering::Acquire) == 0 {
+            let ptr = Box::into_raw(Block::new_zeroed());
+
+            match self.phead.compare_exchange(
+                0,
+                ptr.addr() + 1,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.chead.store(ptr.addr(), Ordering::Release);
+                    phead = Head {
+                        index: 0,
+                        block: ptr,
+                    };
+                }
+                Err(_) => block = Some(unsafe { Box::from_raw(ptr) }),
+            }
+        }
+
+        if phead.is_zero() {
+            loop {
+                if Head::<T>::new(self.phead.load(Ordering::Acquire)).index >= BLOCK_LENGTH {
+                    backoff.snooze();
+                    continue;
+                }
+
+                phead = Head::new(self.phead.fetch_add(1, Ordering::Acquire));
+
+                if phead.index >= BLOCK_LENGTH {
+                    backoff.snooze();
+                    continue;
+                }
+
+                break;
+            }
+        }
+
+        if phead.index + 1 == BLOCK_LENGTH {
+            let new = Box::into_raw(block.take().unwrap_or_else(Block::new_zeroed));
+
+            unsafe { (*phead.block).next.store(new, Ordering::Release) };
+            self.phead.store(new.addr(), Ordering::Release);
+        }
+
+        let slot = unsafe { (*phead.block).array.get_unchecked(phead.index) };
+        unsafe { slot.value.get().write(MaybeUninit::new(e)) };
+
+        slot.state.store(WRITE, Ordering::Release);
     }
 
-    /// Removes and returns the front element, or [`None`] if no committed element
-    /// is currently available.
-    ///
-    /// Returns [`None`] when the queue is empty **or** when the current block has
-    /// no further committed slots at this instant (in-flight producers may still
-    /// be writing). After all producers have finished, `None` reliably indicates
-    /// an empty queue.
-    ///
-    /// This operation is lock-free and never parks the calling thread.
+    /// Removes and returns the front element, or [`None`] if the queue is empty.
     #[doc(alias = "dequeue")]
     #[doc(alias = "recv")]
-    #[inline]
     pub fn pop(&self) -> Option<T> {
-        self.get_iref().pop()
-    }
+        let backoff = Backoff::new();
 
-    /// Free (as opposed to recycle) all the empty blocks in this queue.
-    /// This function returns Some(n) where n is the number of blocks freed
-    /// or None (0) if no blocks are freed.
-    ///
-    /// # SAFETY:
-    ///
-    /// The caller must ensure that there are no in-flight push's or pop's
-    /// during the execution of this function. UBQ takes *every* precaution
-    /// without sacrificing performance to enable this cleanup, but it is the
-    /// caller's responsibilty to call it when no other operations are in
-    /// progress, as it is technically UB for shrink to be called during other
-    /// operations.
-    pub unsafe fn shrink(&self) -> Option<NonZeroUsize> {
-        self.get_iref().shrink()
-    }
+        // Cheap hint if queue is empty.
+        if self.chead.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
 
-    /// Returns `true` if this UBQ contains no values.
-    pub fn is_empty(&self) -> bool {
-        self.get_iref().is_empty()
-    }
+        let mut chead = Head::new(self.chead.load(Ordering::Acquire));
 
-    /// Utility function to get the underlying `self.i` as a reference.
-    /// This function is safe, see the safety comment within for details.
-    fn get_iref(&self) -> &I<T> {
-        // SAFETY: `self.i` points to the shared inner allocation, which remains
-        // live while this handle exists.
-        unsafe { self.i.as_ref() }
-    }
-}
+        loop {
+            if chead.index >> 1 >= BLOCK_LENGTH {
+                backoff.snooze();
+                chead = Head::new(self.chead.load(Ordering::Acquire));
+                continue;
+            }
 
-impl<T> Clone for UBQ<T> {
-    fn clone(&self) -> Self {
-        // `n` stores copies - 1. `fetch_add(1)` therefore increments the number
-        // of live handles by one.
-        unsafe { self.i.as_ref().n.fetch_add(1, Ordering::Relaxed) };
+            let mut new_index = chead.index + 2;
 
-        // `NonNull<_>` is `Copy`; clones share the same `I<T>` allocation.
-        Self { i: self.i }
+            if chead.index & 1 == 0 {
+                let phead = Head::<T>::new(self.phead.load(Ordering::Acquire));
+
+                if phead.block.addr() == chead.block.addr() {
+                    if chead.index >> 1 >= phead.index {
+                        return None;
+                    }
+                } else {
+                    new_index |= 1;
+                }
+            }
+
+            let new_chead = Head {
+                block: chead.block,
+                index: new_index,
+            };
+
+            match self.chead.compare_exchange_weak(
+                chead.pack(),
+                new_chead.pack(),
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(head) => chead = Head::new(head),
+            }
+
+            backoff.spin();
+        }
+
+        chead.index >>= 1;
+
+        if chead.index + 1 == BLOCK_LENGTH {
+            self.chead.store(
+                acquire_nonnull(unsafe { &(*chead.block).next }).addr(),
+                Ordering::Release,
+            );
+        }
+
+        let array = unsafe { &(*chead.block).array };
+
+        let slot = unsafe { array.get_unchecked(chead.index) };
+        slot.await_write();
+
+        let e = unsafe { slot.value.get().read().assume_init() };
+
+        if chead.index + 1 == BLOCK_LENGTH
+            || slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0
+        {
+            let mut free = true;
+
+            for i in (chead.index + 1) % BLOCK_LENGTH..BLOCK_LENGTH - 1 {
+                let slot = unsafe { array.get_unchecked(i) };
+
+                if slot.state.load(Ordering::Acquire) & READ == 0
+                    && slot.state.fetch_or(DESTROY, Ordering::AcqRel) & READ == 0
+                {
+                    free = false;
+                    break;
+                }
+            }
+
+            if free {
+                let _ = unsafe { Box::from_raw(chead.block.cast::<ManuallyDrop<Block<T>>>()) };
+            }
+        }
+
+        Some(e)
     }
 }
 
 impl<T> Drop for UBQ<T> {
     fn drop(&mut self) {
-        // `n` stores copies - 1. `fetch_sub(1)` returns the previous n.
-        //
-        // Last-owner case:
-        //   previous n == 0  <=>  previous copies == 1.
-        // We intentionally allow the atomic to wrap to `usize::MAX` here; the
-        // inner allocation is reclaimed immediately after and cannot be observed.
-        let n = unsafe { self.i.as_ref().n.fetch_sub(1, Ordering::Relaxed) };
+        let mut p = Head::<T>::new(*self.chead.get_mut()).block;
 
-        if n == 0 {
-            // Reclaim the shared inner state and drop any queued elements.
-            //
-            // SAFETY:
-            //   · `n == 0` implies this was the final handle.
-            //   · `self.i` came from `Box::into_raw` in `new()` and has not yet
-            //     been reclaimed.
-            unsafe { drop(Box::from_raw(self.i.as_ptr())) }
+        while !p.is_null() {
+            let mut b = unsafe { Box::from_raw(p) };
+            p = *b.next.get_mut();
         }
     }
 }

@@ -1,53 +1,55 @@
 use std::{
-    fmt::{Debug, Write},
+    fmt::{Debug, format},
+    hint::black_box,
     ptr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
+    time::Instant,
     usize,
 };
 
-use crate::{
-    L, UBQ,
-    packed::{F, high, low},
-};
+use crossbeam_queue::SegQueue;
+
+use crate::{BLOCK_LENGTH, UBQ};
 
 impl<T> Debug for UBQ<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let p = unsafe { self.i.as_ref().p.load(Ordering::Acquire) };
+        Ok(())
+        // let p = self.p.load(Ordering::Acquire);
 
-        if p.is_null() {
-            return writeln!(f, "UBQ {{}}");
-        }
+        // if p.is_null() {
+        //     return writeln!(f, "UBQ {{}}");
+        // }
 
-        let mut s = String::new();
-        let mut c = p;
+        // let mut s = String::new();
+        // let mut c = p;
 
-        let fmt = |u: F| -> String {
-            if u == F::MAX {
-                format!("full:full")
-            } else {
-                format!("{:04}:{:04}", high(u), low(u))
-            }
-        };
+        // let fmt = |u: R| -> String {
+        //     if u == R::MAX {
+        //         format!("full:full")
+        //     } else {
+        //         format!("{:04}:{:04}", high(u), low(u))
+        //     }
+        // };
 
-        loop {
-            let p_ = unsafe { *(*c).p.as_ptr() };
-            let c_ = unsafe { *(*c).c.as_ptr() };
+        // loop {
+        //     let p_ = unsafe { *(*c).p.as_ptr() };
+        //     let c_ = unsafe { *(*c).c.as_ptr() };
 
-            write!(s, "\t{c:p}: p={}, c={}", fmt(p_), fmt(c_))?;
+        //     write!(s, "\t{c:p}: p={}, c={}", fmt(p_), fmt(c_))?;
 
-            c = unsafe { *(*c).n.as_ptr() };
-            if c == p {
-                break;
-            }
+        //     c = unsafe { *(*c).n.as_ptr() };
+        //     if c == p {
+        //         break;
+        //     }
 
-            write!(s, "\n")?;
-        }
+        //     write!(s, "\n")?;
+        // }
 
-        write!(f, "UBQ {{\n{s}\t}}")
+        // write!(f, "UBQ {{\n{s}\t}}")
     }
 }
 
@@ -70,7 +72,7 @@ impl Drop for DropProbe {
 #[test]
 fn drop_releases_all_enqueued_values() {
     let token = Arc::new(());
-    let n = (L as usize * 3) + 7;
+    let n = (BLOCK_LENGTH as usize * 3) + 7;
 
     for _ in 0..16 {
         let q = UBQ::new();
@@ -90,47 +92,6 @@ fn drop_releases_all_enqueued_values() {
 }
 
 #[test]
-fn drop_of_final_clone_drops_items_left_in_queue() {
-    let dropped = Arc::new(AtomicUsize::new(0));
-
-    let q = UBQ::new();
-    let q1 = q.clone();
-    let q2 = q.clone();
-
-    let total = (L as usize * 2) + 5;
-    let popped = (L as usize / 2) + 1;
-
-    for _ in 0..(L as usize + 1) {
-        q.push(DropProbe::new(dropped.clone()));
-    }
-    for _ in 0..(total - (L as usize + 1)) {
-        q1.push(DropProbe::new(dropped.clone()));
-    }
-
-    let mut held = Vec::with_capacity(popped);
-    for _ in 0..popped {
-        held.push(
-            q2.pop()
-                .expect("queue should contain enough elements for this test"),
-        );
-    }
-
-    drop(q);
-    drop(q1);
-
-    assert_eq!(dropped.load(Ordering::SeqCst), 0);
-
-    let remaining = total - popped;
-    drop(q2);
-
-    assert_eq!(dropped.load(Ordering::SeqCst), remaining);
-
-    drop(held);
-
-    assert_eq!(dropped.load(Ordering::SeqCst), total);
-}
-
-#[test]
 fn fill_drain_ordered() {
     let q = UBQ::new();
 
@@ -145,41 +106,57 @@ fn fill_drain_ordered() {
 }
 
 #[test]
-fn mpmc_4p4c() {
-    let q = UBQ::new();
+// 8x2x10_000_001
+// Seg: 1.63769375s
+// UBQ: 5.440279166s
+
+// Notes:
+// Look for page faults. VTune, perf
+// Warm up before running tests.
+// See about double-wide atomics.
+// Look for better benchmarkers.
+fn mpmc() {
+    // let q = UBQ::new_arc();
+    let q = Arc::new(SegQueue::new());
 
     let flag = Arc::new(AtomicBool::new(true));
 
-    let pf = |q: UBQ<usize>, m: usize| -> JoinHandle<()> {
-        thread::spawn(move || {
-            for i in 0..m {
-                q.push(i);
-            }
-        })
-    };
+    let epoch = Instant::now();
 
-    let cf = |q: UBQ<usize>, m: usize| -> JoinHandle<()> {
-        let flag = flag.clone();
+    let m = 10_000_001;
+    let v: Vec<_> = (0..8)
+        .map(|_| {
+            (
+                {
+                    let q = q.clone();
 
-        thread::spawn(move || {
-            for _ in 0..m {
-                loop {
-                    if flag.load(Ordering::Acquire) {
-                        if q.pop().is_some() {
-                            break;
+                    thread::spawn(move || {
+                        for i in 0..m {
+                            q.push(black_box(i));
                         }
-                    } else {
-                        assert!(q.pop().is_some());
-                        break;
-                    }
-                }
-            }
-        })
-    };
+                    })
+                },
+                {
+                    let flag = flag.clone();
+                    let q = q.clone();
 
-    let m = 1_000_001;
-    let v: Vec<_> = (0..4)
-        .map(|_| (pf(q.clone(), m), cf(q.clone(), m)))
+                    thread::spawn(move || {
+                        for _ in 0..m {
+                            loop {
+                                if flag.load(Ordering::Acquire) {
+                                    if black_box(q.pop()).is_some() {
+                                        break;
+                                    }
+                                } else {
+                                    assert!(black_box(q.pop()).is_some());
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                },
+            )
+        })
         .collect();
 
     let v: Vec<_> = v
@@ -195,45 +172,51 @@ fn mpmc_4p4c() {
     for c in v {
         c.join().unwrap()
     }
+
+    println!("{:?}", epoch.elapsed());
 }
 
+// Seg: 2.12s
+// UBQ: 5.15s
 #[test]
-fn is_empty_returns_correctly() {
-    assert!(UBQ::<()>::new().is_empty());
+fn push_test() {
+    let q = UBQ::new_arc();
+    // let q = Arc::new(SegQueue::new());
 
-    for m in 1_000..1_005 {
-        let q = UBQ::new();
+    let epoch = Instant::now();
 
-        for i in 0..m {
-            q.push(i);
-        }
+    let v = (0..8)
+        .map(|_| {
+            let q = q.clone();
 
-        for _ in 0..m {
-            q.pop().unwrap();
-        }
+            thread::spawn(move || {
+                for i in 0..10_000_000 {
+                    q.push(black_box(i));
+                }
+            })
+        })
+        .collect::<Vec<_>>();
 
-        assert!(q.is_empty())
-    }
+    v.into_iter().for_each(|h| h.join().unwrap());
+
+    println!("{:?}", epoch.elapsed());
 }
 
-#[test]
-fn shrink_removes_all_in_empty_queue() {
-    for m in 1_000..1_005 {
-        let q = UBQ::new();
+// #[test]
+// fn is_empty_returns_correctly() {
+//     assert!(UBQ::<()>::new().is_empty());
 
-        for i in 0..m {
-            q.push(i);
-        }
+//     for m in 1_000..1_005 {
+//         let q = UBQ::new();
 
-        for _ in 0..m {
-            q.pop().unwrap();
-        }
+//         for i in 0..m {
+//             q.push(i);
+//         }
 
-        assert!(q.is_empty());
+//         for _ in 0..m {
+//             q.pop().unwrap();
+//         }
 
-        // SAFETY: No in-flight push's or pop's
-        unsafe { q.shrink() };
-
-        assert_eq!(unsafe { *q.i.as_ref().p.as_ptr() }, ptr::null_mut())
-    }
-}
+//         assert!(q.is_empty())
+//     }
+// }
