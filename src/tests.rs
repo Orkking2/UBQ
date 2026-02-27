@@ -116,8 +116,8 @@ fn fill_drain_ordered() {
 // See about double-wide atomics.
 // Look for better benchmarkers.
 fn mpmc() {
-    // let q = UBQ::new_arc();
-    let q = Arc::new(SegQueue::new());
+    let q = UBQ::new_arc();
+    // let q = Arc::new(SegQueue::new());
 
     let flag = Arc::new(AtomicBool::new(true));
 

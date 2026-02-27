@@ -1,15 +1,15 @@
 use crate::{
     BLOCK_LENGTH,
-    block::{Block, DESTROY, READ, WRITE},
-    util::{HIGHEST_BIT, INCR, acquire_nonnull},
+    block::{BLOCK_MASK, Block, DESTROY, READ, WRITE},
 };
 use crossbeam_utils::{Backoff, CachePadded};
 use std::{
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
+    ptr::null_mut,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
 };
 
@@ -20,13 +20,14 @@ use std::{
 /// [`Arc<UBQ<T>>`](std::sync::Arc).
 pub struct UBQ<T> {
     /// Atomic pointer to phead: the block currently accepting producer pushes.
-    pub(crate) phead: CachePadded<AtomicUsize>,
+    phead: CachePadded<AtomicUsize>,
     /// Atomic pointer to chead: the block currently being drained by consumers.
-    pub(crate) chead: CachePadded<AtomicUsize>,
-    _marker: PhantomData<T>,
+    chead: CachePadded<AtomicUsize>,
+
+    prealloc: AtomicPtr<Block<T>>,
 }
 
-const MASK: usize = 255;
+const MASK: usize = BLOCK_MASK;
 
 struct Head<T> {
     block: *mut Block<T>,
@@ -74,7 +75,7 @@ impl<T> UBQ<T> {
         Self {
             phead: CachePadded::new(AtomicUsize::new(0)),
             chead: CachePadded::new(AtomicUsize::new(0)),
-            _marker: PhantomData,
+            prealloc: AtomicPtr::new(null_mut()),
         }
     }
 
@@ -83,10 +84,21 @@ impl<T> UBQ<T> {
         unsafe { Arc::new_zeroed().assume_init() }
     }
 
-    // /// Returns `true` if this UBQ contains no values.
-    // pub fn is_empty(&self) -> bool {
-    //     todo!()
-    // }
+    /// Returns `true` if this UBQ contains no values.
+    pub fn is_empty(&self) -> bool {
+        let chead = self.chead.load(Ordering::Acquire);
+        if chead == 0 {
+            return true;
+        }
+
+        let phead = self.phead.load(Ordering::Acquire);
+
+        if (chead & !MASK) != (phead & !MASK) {
+            return false;
+        }
+
+        ((chead & MASK) >> 1) >= (phead & MASK)
+    }
 
     /// Pushes `e` onto the back of the queue.
     #[doc(alias = "enqueue")]
@@ -94,7 +106,6 @@ impl<T> UBQ<T> {
     pub fn push(&self, e: T) {
         let backoff = Backoff::new();
         let mut phead = Head::new(0);
-        let mut block = None;
 
         // This is the only time the ptr part of phead is invalid.
         if self.phead.load(Ordering::Acquire) == 0 {
@@ -113,7 +124,19 @@ impl<T> UBQ<T> {
                         block: ptr,
                     };
                 }
-                Err(_) => block = Some(unsafe { Box::from_raw(ptr) }),
+                Err(_) => {
+                    match self.prealloc.compare_exchange(
+                        null_mut(),
+                        ptr,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {}
+                        Err(_) => {
+                            let _ = unsafe { Box::from_raw(ptr.cast::<ManuallyDrop<Block<T>>>()) };
+                        }
+                    }
+                }
             }
         }
 
@@ -136,7 +159,13 @@ impl<T> UBQ<T> {
         }
 
         if phead.index + 1 == BLOCK_LENGTH {
-            let new = Box::into_raw(block.take().unwrap_or_else(Block::new_zeroed));
+            let mut new = self.prealloc.load(Ordering::Acquire);
+
+            if new.is_null() {
+                new = Box::into_raw(Block::new_zeroed());
+            } else {
+                self.prealloc.store(null_mut(), Ordering::Relaxed);
+            }
 
             unsafe { (*phead.block).next.store(new, Ordering::Release) };
             self.phead.store(new.addr(), Ordering::Release);
@@ -146,6 +175,20 @@ impl<T> UBQ<T> {
         unsafe { slot.value.get().write(MaybeUninit::new(e)) };
 
         slot.state.store(WRITE, Ordering::Release);
+
+        if phead.index == 0 {
+            if self.prealloc.load(Ordering::Relaxed).is_null() {
+                let ptr = Box::into_raw(Block::new_zeroed());
+
+                if self
+                    .prealloc
+                    .compare_exchange(null_mut(), ptr, Ordering::Release, Ordering::Relaxed)
+                    .is_err()
+                {
+                    let _ = unsafe { Box::from_raw(ptr.cast::<ManuallyDrop<Block<T>>>()) };
+                }
+            }
+        }
     }
 
     /// Removes and returns the front element, or [`None`] if the queue is empty.
@@ -203,8 +246,20 @@ impl<T> UBQ<T> {
         chead.index >>= 1;
 
         if chead.index + 1 == BLOCK_LENGTH {
+            let next = loop {
+                let p = unsafe { (*chead.block).next.load(Ordering::Acquire) };
+
+                if !p.is_null() {
+                    break p;
+                }
+
+                backoff.snooze();
+            };
+
+            let has_next = unsafe { !(*next).next.load(Ordering::Relaxed).is_null() };
+
             self.chead.store(
-                acquire_nonnull(unsafe { &(*chead.block).next }).addr(),
+                next.addr() + if has_next { 1 } else { 0 },
                 Ordering::Release,
             );
         }
@@ -248,6 +303,11 @@ impl<T> Drop for UBQ<T> {
         while !p.is_null() {
             let mut b = unsafe { Box::from_raw(p) };
             p = *b.next.get_mut();
+        }
+
+        let p = *self.prealloc.get_mut();
+        if !p.is_null() {
+            let _ = unsafe { Box::from_raw(p.cast::<ManuallyDrop<Block<T>>>()) };
         }
     }
 }

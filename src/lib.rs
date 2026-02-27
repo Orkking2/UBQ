@@ -51,7 +51,6 @@
 #![warn(missing_docs)]
 
 pub(crate) mod block;
-pub(crate) mod util;
 pub(crate) mod queue;
 
 #[cfg(test)]
