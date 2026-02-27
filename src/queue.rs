@@ -4,7 +4,6 @@ use crate::{
 };
 use crossbeam_utils::{Backoff, CachePadded};
 use std::{
-    marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ptr::null_mut,
     sync::{

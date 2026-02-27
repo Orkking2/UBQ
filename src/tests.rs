@@ -1,22 +1,20 @@
 use std::{
-    fmt::{Debug, format},
+    fmt::Debug,
     hint::black_box,
-    ptr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    thread::{self, JoinHandle},
+    thread::{self},
     time::Instant,
     usize,
 };
 
-use crossbeam_queue::SegQueue;
 
 use crate::{BLOCK_LENGTH, UBQ};
 
 impl<T> Debug for UBQ<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Ok(())
         // let p = self.p.load(Ordering::Acquire);
 
