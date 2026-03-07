@@ -2,3 +2,6 @@
 /bench_results
 .claude/
 .venv/
+__pycache__/
+*.pyc
+bench_fleet.toml

@@ -1,15 +1,94 @@
+#[cfg(feature = "ubq_backoff_cq")]
+use crate::backoff::Backoff;
 use crate::{
     BLOCK_LENGTH,
-    block::{BLOCK_MASK, Block, DESTROY, READ, WRITE},
+    block::{BLOCK_MASK, Block, WRITE},
 };
-use crossbeam_utils::{Backoff, CachePadded};
+#[cfg(not(feature = "ubq_backoff_cq"))]
+use crossbeam_utils::Backoff;
+use crossbeam_utils::CachePadded;
 use std::{
+    array,
     mem::{ManuallyDrop, MaybeUninit},
+    ops::DerefMut,
     ptr::null_mut,
     sync::{
         Arc,
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
+        atomic::{AtomicPtr, AtomicUsize, Ordering, fence},
     },
+};
+
+#[cfg(any(
+    all(feature = "ubq_v3", feature = "ubq_v4"),
+    all(feature = "ubq_v3", feature = "ubq_v5"),
+    all(feature = "ubq_v3", feature = "ubq_v6"),
+    all(feature = "ubq_v3", feature = "ubq_v7"),
+    all(feature = "ubq_v4", feature = "ubq_v5"),
+    all(feature = "ubq_v4", feature = "ubq_v6"),
+    all(feature = "ubq_v4", feature = "ubq_v7"),
+    all(feature = "ubq_v5", feature = "ubq_v6"),
+    all(feature = "ubq_v5", feature = "ubq_v7"),
+    all(feature = "ubq_v6", feature = "ubq_v7"),
+))]
+compile_error!("Select at most one UBQ version feature: ubq_v3, ubq_v4, ubq_v5, ubq_v6, ubq_v7");
+
+#[cfg(any(
+    all(feature = "ubq_pool_1", feature = "ubq_pool_2"),
+    all(feature = "ubq_pool_1", feature = "ubq_pool_4"),
+    all(feature = "ubq_pool_1", feature = "ubq_pool_8"),
+    all(feature = "ubq_pool_1", feature = "ubq_pool_16"),
+    all(feature = "ubq_pool_1", feature = "ubq_pool_32"),
+    all(feature = "ubq_pool_1", feature = "ubq_pool_64"),
+    all(feature = "ubq_pool_2", feature = "ubq_pool_4"),
+    all(feature = "ubq_pool_2", feature = "ubq_pool_8"),
+    all(feature = "ubq_pool_2", feature = "ubq_pool_16"),
+    all(feature = "ubq_pool_2", feature = "ubq_pool_32"),
+    all(feature = "ubq_pool_2", feature = "ubq_pool_64"),
+    all(feature = "ubq_pool_4", feature = "ubq_pool_8"),
+    all(feature = "ubq_pool_4", feature = "ubq_pool_16"),
+    all(feature = "ubq_pool_4", feature = "ubq_pool_32"),
+    all(feature = "ubq_pool_4", feature = "ubq_pool_64"),
+    all(feature = "ubq_pool_8", feature = "ubq_pool_16"),
+    all(feature = "ubq_pool_8", feature = "ubq_pool_32"),
+    all(feature = "ubq_pool_8", feature = "ubq_pool_64"),
+    all(feature = "ubq_pool_16", feature = "ubq_pool_32"),
+    all(feature = "ubq_pool_16", feature = "ubq_pool_64"),
+    all(feature = "ubq_pool_32", feature = "ubq_pool_64"),
+))]
+compile_error!(
+    "Select at most one UBQ pool feature: ubq_pool_1, ubq_pool_2, ubq_pool_4, ubq_pool_8, ubq_pool_16, ubq_pool_32, ubq_pool_64"
+);
+
+#[cfg(all(
+    feature = "ubq_v6",
+    any(
+        feature = "ubq_pool_1",
+        feature = "ubq_pool_2",
+        feature = "ubq_pool_4",
+        feature = "ubq_pool_8",
+        feature = "ubq_pool_16",
+        feature = "ubq_pool_32",
+        feature = "ubq_pool_64"
+    )
+))]
+compile_error!("ubq_v6 is no-pool and cannot be combined with ubq_pool_* features");
+
+const POOL_SIZE: usize = if cfg!(feature = "ubq_v6") {
+    0
+} else if cfg!(feature = "ubq_pool_64") {
+    64
+} else if cfg!(feature = "ubq_pool_32") {
+    32
+} else if cfg!(feature = "ubq_pool_16") {
+    16
+} else if cfg!(feature = "ubq_pool_8") {
+    8
+} else if cfg!(feature = "ubq_pool_4") {
+    4
+} else if cfg!(feature = "ubq_pool_2") {
+    2
+} else {
+    1
 };
 
 /// A lock-free, unbounded multi-producer/multi-consumer (MPMC) queue.
@@ -22,8 +101,8 @@ pub struct UBQ<T> {
     phead: CachePadded<AtomicUsize>,
     /// Atomic pointer to chead: the block currently being drained by consumers.
     chead: CachePadded<AtomicUsize>,
-
-    prealloc: AtomicPtr<Block<T>>,
+    /// When popping, we can reuse a block instead of freeing them always.
+    pool: [CachePadded<AtomicPtr<Block<T>>>; POOL_SIZE],
 }
 
 const MASK: usize = BLOCK_MASK;
@@ -66,6 +145,120 @@ unsafe impl<T: Sync> Sync for UBQ<T> {}
 unsafe impl<T: Send> Send for UBQ<T> {}
 
 impl<T> UBQ<T> {
+    #[inline]
+    fn should_prepare_next_block(&self, next_index: usize) -> bool {
+        #[cfg(feature = "ubq_v3")]
+        {
+            return next_index == BLOCK_LENGTH
+                || self
+                    .pool
+                    .iter()
+                    .any(|b| b.load(Ordering::Relaxed).is_null());
+        }
+        #[cfg(feature = "ubq_v5")]
+        {
+            return next_index == BLOCK_LENGTH
+                && self
+                    .pool
+                    .iter()
+                    .all(|b| b.load(Ordering::Relaxed).is_null());
+        }
+        #[cfg(feature = "ubq_v6")]
+        {
+            return next_index == BLOCK_LENGTH;
+        }
+        #[cfg(feature = "ubq_v7")]
+        {
+            return next_index == BLOCK_LENGTH
+                && self
+                    .pool
+                    .iter()
+                    .all(|b| b.load(Ordering::Relaxed).is_null());
+        }
+        #[cfg(any(
+            feature = "ubq_v4",
+            all(
+                not(feature = "ubq_v3"),
+                not(feature = "ubq_v5"),
+                not(feature = "ubq_v6"),
+                not(feature = "ubq_v7")
+            )
+        ))]
+        {
+            return next_index == BLOCK_LENGTH
+                && self
+                    .pool
+                    .iter()
+                    .any(|b| b.load(Ordering::Relaxed).is_null());
+        }
+    }
+
+    #[inline]
+    fn take_pooled_block(&self) -> Option<*mut Block<T>> {
+        #[cfg(feature = "ubq_v6")]
+        {
+            None
+        }
+        #[cfg(not(feature = "ubq_v6"))]
+        {
+            self.pool.iter().find_map(|slot| {
+                let pooled = slot.swap(null_mut(), Ordering::AcqRel);
+                (!pooled.is_null()).then_some(pooled)
+            })
+        }
+    }
+
+    #[inline]
+    fn release_producer_spare_block(&self, block: Box<Block<T>>) {
+        #[cfg(any(feature = "ubq_v6", feature = "ubq_v7"))]
+        {
+            let ptr = Box::into_raw(block);
+            let _ = unsafe { Box::from_raw(ptr.cast::<ManuallyDrop<Block<T>>>()) };
+            return;
+        }
+        #[cfg(not(any(feature = "ubq_v6", feature = "ubq_v7")))]
+        {
+            let new = Box::into_raw(block);
+
+            if self
+                .pool
+                .iter()
+                .filter_map(|slot| {
+                    slot.compare_exchange(null_mut(), new, Ordering::Release, Ordering::Relaxed)
+                        .ok()
+                })
+                .next()
+                .is_none()
+            {
+                let _ = unsafe { Box::from_raw(new.cast::<ManuallyDrop<Block<T>>>()) };
+            }
+        }
+    }
+
+    #[inline]
+    fn release_consumed_block(&self, block: *mut Block<T>) {
+        #[cfg(feature = "ubq_v6")]
+        {
+            let _ = unsafe { Box::from_raw(block.cast::<ManuallyDrop<Block<T>>>()) };
+            return;
+        }
+        #[cfg(not(feature = "ubq_v6"))]
+        {
+            if self
+                .pool
+                .iter()
+                .filter_map(|slot| {
+                    slot.compare_exchange(null_mut(), block, Ordering::Release, Ordering::Relaxed)
+                        .ok()
+                })
+                .next()
+                .is_none()
+            {
+                let _ = unsafe { Box::from_raw(block.cast::<ManuallyDrop<Block<T>>>()) };
+            }
+        }
+    }
+
     /// Creates a new, empty queue.
     ///
     /// No blocks are allocated until the first call to [`push`](Self::push).
@@ -74,7 +267,7 @@ impl<T> UBQ<T> {
         Self {
             phead: CachePadded::new(AtomicUsize::new(0)),
             chead: CachePadded::new(AtomicUsize::new(0)),
-            prealloc: AtomicPtr::new(null_mut()),
+            pool: array::from_fn(|_| CachePadded::new(AtomicPtr::new(null_mut()))),
         }
     }
 
@@ -105,6 +298,7 @@ impl<T> UBQ<T> {
     pub fn push(&self, e: T) {
         let backoff = Backoff::new();
         let mut phead = Head::new(0);
+        let mut next_block = None;
 
         // This is the only time the ptr part of phead is invalid.
         if self.phead.load(Ordering::Acquire) == 0 {
@@ -123,70 +317,64 @@ impl<T> UBQ<T> {
                         block: ptr,
                     };
                 }
-                Err(_) => {
-                    match self.prealloc.compare_exchange(
-                        null_mut(),
-                        ptr,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => {}
-                        Err(_) => {
-                            let _ = unsafe { Box::from_raw(ptr.cast::<ManuallyDrop<Block<T>>>()) };
-                        }
-                    }
-                }
+                Err(_) => next_block = Some(unsafe { Box::from_raw(ptr) }),
             }
         }
 
         if phead.is_zero() {
+            phead = Head::new(self.phead.load(Ordering::Acquire));
+
             loop {
-                if Head::<T>::new(self.phead.load(Ordering::Acquire)).index >= BLOCK_LENGTH {
+                if phead.index == BLOCK_LENGTH {
                     backoff.snooze();
+
+                    phead = Head::new(self.phead.load(Ordering::Acquire));
                     continue;
                 }
 
-                phead = Head::new(self.phead.fetch_add(1, Ordering::Acquire));
+                let new_phead = Head {
+                    block: phead.block,
+                    index: phead.index + 1,
+                };
 
-                if phead.index >= BLOCK_LENGTH {
-                    backoff.snooze();
-                    continue;
+                if next_block.is_none() && self.should_prepare_next_block(new_phead.index) {
+                    next_block = Some(Block::new_zeroed());
                 }
 
-                break;
+                match self.phead.compare_exchange_weak(
+                    phead.pack(),
+                    new_phead.pack(),
+                    Ordering::SeqCst,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(head) => phead = Head::new(head),
+                };
+
+                backoff.spin();
             }
         }
 
         if phead.index + 1 == BLOCK_LENGTH {
-            let mut new = self.prealloc.load(Ordering::Acquire);
-
-            if new.is_null() {
-                new = Box::into_raw(Block::new_zeroed());
+            let new = if let Some(block) = next_block.take() {
+                Box::into_raw(block)
+            } else if let Some(pooled) = self.take_pooled_block() {
+                pooled
             } else {
-                self.prealloc.store(null_mut(), Ordering::Relaxed);
-            }
+                Box::into_raw(Block::new_zeroed())
+            };
 
             unsafe { (*phead.block).next.store(new, Ordering::Release) };
             self.phead.store(new.addr(), Ordering::Release);
         }
 
-        let slot = unsafe { (*phead.block).array.get_unchecked(phead.index) };
+        let slot = unsafe { (*phead.block).slots.get_unchecked(phead.index) };
         unsafe { slot.value.get().write(MaybeUninit::new(e)) };
 
         slot.state.store(WRITE, Ordering::Release);
 
-        if phead.index == 0 {
-            if self.prealloc.load(Ordering::Relaxed).is_null() {
-                let ptr = Box::into_raw(Block::new_zeroed());
-
-                if self
-                    .prealloc
-                    .compare_exchange(null_mut(), ptr, Ordering::Release, Ordering::Relaxed)
-                    .is_err()
-                {
-                    let _ = unsafe { Box::from_raw(ptr.cast::<ManuallyDrop<Block<T>>>()) };
-                }
-            }
+        if let Some(block) = next_block {
+            self.release_producer_spare_block(block);
         }
     }
 
@@ -204,7 +392,7 @@ impl<T> UBQ<T> {
         let mut chead = Head::new(self.chead.load(Ordering::Acquire));
 
         loop {
-            if chead.index >> 1 >= BLOCK_LENGTH {
+            if chead.index >> 1 == BLOCK_LENGTH {
                 backoff.snooze();
                 chead = Head::new(self.chead.load(Ordering::Acquire));
                 continue;
@@ -213,7 +401,8 @@ impl<T> UBQ<T> {
             let mut new_index = chead.index + 2;
 
             if chead.index & 1 == 0 {
-                let phead = Head::<T>::new(self.phead.load(Ordering::Acquire));
+                fence(Ordering::SeqCst);
+                let phead = Head::<T>::new(self.phead.load(Ordering::Relaxed));
 
                 if phead.block.addr() == chead.block.addr() {
                     if chead.index >> 1 >= phead.index {
@@ -232,7 +421,7 @@ impl<T> UBQ<T> {
             match self.chead.compare_exchange_weak(
                 chead.pack(),
                 new_chead.pack(),
-                Ordering::Acquire,
+                Ordering::SeqCst,
                 Ordering::Acquire,
             ) {
                 Ok(_) => break,
@@ -263,32 +452,19 @@ impl<T> UBQ<T> {
             );
         }
 
-        let array = unsafe { &(*chead.block).array };
+        let block = unsafe { &mut (*chead.block) };
 
-        let slot = unsafe { array.get_unchecked(chead.index) };
-        slot.await_write();
+        let slot = unsafe { block.slots.get_unchecked(chead.index) };
+
+        while slot.state.load(Ordering::Acquire) & WRITE == 0 {
+            backoff.snooze();
+        }
 
         let e = unsafe { slot.value.get().read().assume_init() };
 
-        if chead.index + 1 == BLOCK_LENGTH
-            || slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0
-        {
-            let mut free = true;
-
-            for i in (chead.index + 1) % BLOCK_LENGTH..BLOCK_LENGTH - 1 {
-                let slot = unsafe { array.get_unchecked(i) };
-
-                if slot.state.load(Ordering::Acquire) & READ == 0
-                    && slot.state.fetch_or(DESTROY, Ordering::AcqRel) & READ == 0
-                {
-                    free = false;
-                    break;
-                }
-            }
-
-            if free {
-                let _ = unsafe { Box::from_raw(chead.block.cast::<ManuallyDrop<Block<T>>>()) };
-            }
+        if block.consumed.fetch_add(1, Ordering::Relaxed) + 1 == BLOCK_LENGTH {
+            block.reset();
+            self.release_consumed_block(chead.block);
         }
 
         Some(e)
@@ -304,9 +480,11 @@ impl<T> Drop for UBQ<T> {
             p = *b.next.get_mut();
         }
 
-        let p = *self.prealloc.get_mut();
-        if !p.is_null() {
-            let _ = unsafe { Box::from_raw(p.cast::<ManuallyDrop<Block<T>>>()) };
-        }
+        self.pool
+            .iter_mut()
+            .map(CachePadded::deref_mut)
+            .map(AtomicPtr::get_mut)
+            .filter(|p| !p.is_null())
+            .for_each(|p| drop(unsafe { Box::from_raw(p.cast::<ManuallyDrop<Block<T>>>()) }));
     }
 }

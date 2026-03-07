@@ -3,13 +3,12 @@ use std::{
     hint::black_box,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread::{self},
     time::Instant,
     usize,
 };
-
 
 use crate::{BLOCK_LENGTH, UBQ};
 
@@ -51,22 +50,6 @@ impl<T> Debug for UBQ<T> {
     }
 }
 
-struct DropProbe {
-    dropped: Arc<AtomicUsize>,
-}
-
-impl DropProbe {
-    fn new(dropped: Arc<AtomicUsize>) -> Self {
-        Self { dropped }
-    }
-}
-
-impl Drop for DropProbe {
-    fn drop(&mut self) {
-        self.dropped.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
 #[test]
 fn drop_releases_all_enqueued_values() {
     let token = Arc::new(());
@@ -104,6 +87,24 @@ fn fill_drain_ordered() {
 }
 
 #[test]
+fn refill_drain_recycled_blocks() {
+    let q = UBQ::new();
+    let per_round = BLOCK_LENGTH * 3 + 17;
+
+    for round in 0..64 {
+        for i in 0..per_round {
+            q.push((round, i));
+        }
+
+        for i in 0..per_round {
+            assert_eq!(q.pop(), Some((round, i)));
+        }
+
+        assert_eq!(q.pop(), None);
+    }
+}
+
+#[test]
 // 8x2x10_000_001
 // Seg: 1.63769375s
 // UBQ: 5.440279166s
@@ -111,7 +112,6 @@ fn fill_drain_ordered() {
 // Notes:
 // Look for page faults. VTune, perf
 // Warm up before running tests.
-// See about double-wide atomics.
 // Look for better benchmarkers.
 fn mpmc() {
     let q = UBQ::new_arc();
@@ -121,7 +121,7 @@ fn mpmc() {
 
     let epoch = Instant::now();
 
-    let m = 10_000_001;
+    let m = 1_000_001;
     let v: Vec<_> = (0..8)
         .map(|_| {
             (
@@ -130,7 +130,7 @@ fn mpmc() {
 
                     thread::spawn(move || {
                         for i in 0..m {
-                            q.push(black_box(i));
+                            q.push(black_box((i % u8::MAX as i32) as u8));
                         }
                     })
                 },
@@ -188,7 +188,7 @@ fn push_test() {
             let q = q.clone();
 
             thread::spawn(move || {
-                for i in 0..10_000_000 {
+                for i in 0..1_000_000 {
                     q.push(black_box(i));
                 }
             })

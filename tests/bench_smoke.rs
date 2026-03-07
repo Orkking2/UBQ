@@ -1,6 +1,6 @@
-//! Smoke tests that verify UBQ correctly transmits every item across the same
-//! SPSC / MPSC / SPMC / MPMC × throughput / fill-drain scenarios exercised by
-//! the bench harness.  These run under the standard test harness via
+//! Smoke tests that verify UBQ correctly transmits every item across a core
+//! 1p1c / 4p1c / 1p4c / 4p4c / 8p8c throughput/fill-drain matrix. These run under
+//! the standard test harness via
 //! `cargo test` and are independent of the bench binary.
 
 use std::sync::{
@@ -239,6 +239,11 @@ fn mpmc_throughput() {
     run_throughput_integrity(4, 4);
 }
 
+#[test]
+fn p8c8_throughput() {
+    run_throughput_integrity(8, 8);
+}
+
 // ─── Fill / drain (sequential phases) ────────────────────────────────────────
 
 #[test]
@@ -259,4 +264,9 @@ fn spmc_fill_drain() {
 #[test]
 fn mpmc_fill_drain() {
     run_fill_drain_integrity(4, 4);
+}
+
+#[test]
+fn p8c8_fill_drain() {
+    run_fill_drain_integrity(8, 8);
 }

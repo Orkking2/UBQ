@@ -47,9 +47,10 @@
 //!
 //! Ordering and invariants are documented inline near the transitions they govern.
 
-#![feature(integer_atomics)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "ubq_backoff_cq")]
+pub(crate) mod backoff;
 pub(crate) mod block;
 pub(crate) mod queue;
 
