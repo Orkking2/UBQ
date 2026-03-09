@@ -129,7 +129,9 @@ sweeps; pass `--strict-complete` to fail on any incomplete scenario. Default
 scenarios, remote paths, and seed fallback (`v4,8,127`) come from
 `bench_fleet.toml`. Use `--complete-arg=...` to forward additional
 `complete_benches` options. `complete_benches` runs its search rounds directly
-via `cargo bench`. Python is only needed for the plotting helpers.
+via `cargo bench`. Search outputs are written under
+`bench_results/runs/<machine>/<ubq>/<timestamp>.json`. Python is only needed for
+the plotting helpers.
 
 Generate plots manually (PNG + CSV):
 
@@ -139,7 +141,7 @@ python3 scripts/plot_bench.py --out-dir bench_results/plots bench_results/ubq_de
 # Optional: choose error bars from repeated samples (default: sem).
 python3 scripts/plot_bench.py --error-bars stddev --out-dir bench_results/plots bench_results/ubq_default.json
 
-# Render plots from all JSON files under bench_results/runs/* in one command.
+# Render plots from all JSON files under bench_results/runs recursively.
 python3 scripts/plot_runs_folder.py --runs-dir bench_results/runs --out-dir bench_results/plots
 ```
 

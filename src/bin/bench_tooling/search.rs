@@ -221,26 +221,26 @@ fn collect_run_jsons(runs_dir: &Path) -> Result<Vec<PathBuf>, String> {
         return Ok(files);
     }
 
-    let entries = fs::read_dir(runs_dir)
-        .map_err(|err| format!("failed to read runs dir {}: {err}", runs_dir.display()))?;
+    collect_run_jsons_recursive(runs_dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_run_jsons_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|err| format!("failed to read runs dir {}: {err}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|err| format!("failed to read runs dir entry: {err}"))?;
         let path = entry.path();
-        if !path.is_dir() {
+        if path.is_dir() {
+            collect_run_jsons_recursive(&path, files)?;
             continue;
         }
-        let inner = fs::read_dir(&path)
-            .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-        for item in inner {
-            let item = item.map_err(|err| format!("failed to read run file entry: {err}"))?;
-            let json_path = item.path();
-            if json_path.extension() == Some(OsStr::new("json")) && json_path.is_file() {
-                files.push(json_path);
-            }
+        if path.extension() == Some(OsStr::new("json")) && path.is_file() {
+            files.push(path);
         }
     }
-    files.sort();
-    Ok(files)
+    Ok(())
 }
 
 pub fn load_grouped_runs(runs_dir: &Path) -> Result<GroupedRuns, String> {
@@ -765,13 +765,13 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_runs_layout_compat() {
+    fn aggregate_runs_layout_machine_first() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         let root = std::env::temp_dir().join(format!("ubq_tooling_test_{stamp}"));
-        let run_dir = root.join("v4_8_127");
+        let run_dir = root.join("local").join("v4_8_127");
         fs::create_dir_all(&run_dir).expect("mkdir");
         let payload = serde_json::json!({
             "meta": {
@@ -784,7 +784,7 @@ mod tests {
             ]
         });
         fs::write(
-            run_dir.join("local_1.json"),
+            run_dir.join("1773004334181.json"),
             serde_json::to_string_pretty(&payload).expect("json"),
         )
         .expect("write");

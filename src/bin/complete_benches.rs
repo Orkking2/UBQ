@@ -415,31 +415,21 @@ fn bench_mode_args(mode: &str) -> Result<Vec<String>, String> {
     }
 }
 
-fn bench_output_path(
-    args: &CompleteArgs,
-    label_safe: &str,
-    scenario: &str,
-    round_idx: usize,
-    repeat_idx: usize,
-) -> PathBuf {
-    let stamp = SystemTime::now()
+fn bench_output_path(args: &CompleteArgs, label_safe: &str) -> PathBuf {
+    let run_stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    args.runs_dir.join(label_safe).join(format!(
-        "{}_{}_round{}_r{}_{}.json",
-        sanitize_name(&args.machine_label),
-        sanitize_name(scenario),
-        round_idx,
-        repeat_idx,
-        stamp
-    ))
+    args.runs_dir
+        .join(sanitize_name(&args.machine_label))
+        .join(label_safe)
+        .join(format!("{run_stamp}.json"))
 }
 
 fn build_bench_cmds(
     args: &CompleteArgs,
     scenario: &str,
-    round_idx: usize,
+    _round_idx: usize,
     labels: &[String],
 ) -> Result<Vec<BenchCommand>, String> {
     let mode_args = bench_mode_args(&args.mode)?;
@@ -451,7 +441,7 @@ fn build_bench_cmds(
         let safe_label = parsed.safe();
 
         for repeat_idx in 1..=args.bench.repeat_count {
-            let out_path = bench_output_path(args, &safe_label, scenario, round_idx, repeat_idx);
+            let out_path = bench_output_path(args, &safe_label);
             let mut cmd = vec!["cargo".to_string(), "bench".to_string()];
             if let Some(cargo_jobs) = args.bench.cargo_jobs {
                 cmd.push("-j".to_string());
@@ -960,7 +950,11 @@ mod tests {
         assert!(
             commands[0]
                 .out_path
-                .starts_with(Path::new("bench_results/runs/v4_8_127"))
+                .starts_with(Path::new("bench_results/runs/lab/v4_8_127"))
+        );
+        assert_eq!(
+            commands[0].out_path.extension().and_then(|v| v.to_str()),
+            Some("json")
         );
     }
 

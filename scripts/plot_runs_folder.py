@@ -12,31 +12,23 @@ REPO_ROOT = SCRIPT_DIR.parent
 
 
 def collect_run_jsons(runs_dir: Path):
-    files = []
     if not runs_dir.exists():
-        return files
+        return []
 
-    for run_path in sorted(runs_dir.iterdir()):
-        if not run_path.is_dir():
-            continue
-        for json_path in sorted(run_path.glob("*.json")):
-            if json_path.is_file():
-                files.append(json_path)
-
-    return files
+    return sorted(path for path in runs_dir.rglob("*.json") if path.is_file())
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Collect all benchmark JSON files under a runs directory and generate "
+            "Collect all benchmark JSON files under a runs directory tree and generate "
             "per-machine CSV/PNG outputs via scripts/plot_bench.py."
         )
     )
     parser.add_argument(
         "--runs-dir",
         default="bench_results/runs",
-        help="Root directory containing per-label run folders (default: bench_results/runs)",
+        help="Root directory containing machine/label run folders (default: bench_results/runs)",
     )
     parser.add_argument(
         "--out-dir",
