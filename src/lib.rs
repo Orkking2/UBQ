@@ -59,17 +59,3 @@ mod tests;
 
 pub use block::BLOCK_LENGTH;
 pub use queue::UBQ;
-
-/*
-rsync -avz --delete --delete-excluded --prune-empty-dirs \
-  --include='/Cargo.toml' \
-  --include='/Cargo.lock' \
-  --include='/README.md' \
-  --include='/LICENSE' \
-  --include='/src/' --include='/src/**' \
-  --include='/benches/' --include='/benches/**' \
-  --include='/tests/' --include='/tests/**' \
-  --include='/scripts/' --include='/scripts/**' \
-  --exclude='*' \
-  ./ lab:~/UBQ/
-*/*/*/*/*/

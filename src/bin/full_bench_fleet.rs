@@ -1,3 +1,4 @@
+#[path = "bench_tooling/fleet.rs"]
 mod bench_tooling;
 
 use bench_tooling::{
@@ -16,31 +17,15 @@ use std::thread;
 const REPO_SYNC_INCLUDE_PATTERNS: &[&str] = &[
     "/Cargo.toml",
     "/Cargo.lock",
-    "/README.md",
-    "/LICENSE",
     "/src/",
     "/src/**",
     "/benches/",
     "/benches/**",
-    "/tests/",
-    "/tests/**",
-    "/scripts/",
-    "/scripts/**",
 ];
 
 const FORBIDDEN_COMPLETE_ARGS: &[&str] = &["--machine-label", "--runs-dir", "--dry-run"];
-const FORBIDDEN_BENCH_ARGS: &[&str] = &[
-    "--ubq-label",
-    "--ubq-labels",
-    "--remote-host",
-    "--local-machine-label",
-    "--remote-dir",
-    "--out-root",
-    "--skip-remote",
-    "--skip-local",
-    "--skip-plot",
-];
 const REMOVED_COMPLETE_ARGS: &[&str] = &["--max-rounds"];
+const REMOVED_FLEET_ARGS: &[&str] = &["--bench-arg", "--ubq-label", "--ubq-labels"];
 
 #[derive(Clone, Debug, Deserialize)]
 struct FleetConfig {
@@ -76,18 +61,7 @@ struct FleetArgs {
     skip_local_plot: bool,
     plot_partial: bool,
     dry_run: bool,
-    mode: FleetMode,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum FleetMode {
-    Search {
-        complete_args: Vec<String>,
-    },
-    FixedLabels {
-        ubq_labels: Vec<String>,
-        bench_args: Vec<String>,
-    },
+    complete_args: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,7 +84,7 @@ struct FleetRuntime {
     sync_repo: bool,
     strict_complete: bool,
     dry_run: bool,
-    mode: FleetMode,
+    complete_args: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -135,14 +109,7 @@ fn print_usage_and_exit(code: i32) -> ! {
            --skip-local-plot\n\
            --plot-partial\n\
            --dry-run\n\
-         \n\
-         Search Mode:\n\
            --complete-arg ARG        (repeatable)\n\
-         \n\
-         Fixed-Label Mode:\n\
-           --ubq-label LABEL         (repeatable)\n\
-           --ubq-labels LIST         (semicolon-separated labels)\n\
-           --bench-arg ARG           (repeatable; forwarded to bench_dual_host.sh)\n\
            -h, --help"
     );
     std::process::exit(code);
@@ -165,8 +132,6 @@ where
     let mut plot_partial = false;
     let mut dry_run = false;
     let mut complete_args: Vec<String> = Vec::new();
-    let mut bench_args: Vec<String> = Vec::new();
-    let mut ubq_labels: Vec<String> = Vec::new();
 
     let mut args = raw_args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
@@ -226,38 +191,14 @@ where
             complete_args.push(value.to_string());
             continue;
         }
-        if arg == "--bench-arg" {
-            let value = args
-                .next()
-                .ok_or_else(|| "--bench-arg requires a value".to_string())?;
-            bench_args.push(value);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--bench-arg=") {
-            bench_args.push(value.to_string());
-            continue;
-        }
-        if arg == "--ubq-label" {
-            let value = args
-                .next()
-                .ok_or_else(|| "--ubq-label requires a value".to_string())?;
-            ubq_labels.push(value);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--ubq-label=") {
-            ubq_labels.push(value.to_string());
-            continue;
-        }
-        if arg == "--ubq-labels" {
-            let value = args
-                .next()
-                .ok_or_else(|| "--ubq-labels requires a value".to_string())?;
-            ubq_labels.extend(split_label_list(&value));
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--ubq-labels=") {
-            ubq_labels.extend(split_label_list(value));
-            continue;
+        if REMOVED_FLEET_ARGS
+            .iter()
+            .any(|key| arg == *key || arg.starts_with(&format!("{key}=")))
+        {
+            return Err(
+                "fixed-label fleet mode was removed; full_bench_fleet now only coordinates complete_benches and final plotting"
+                    .to_string(),
+            );
         }
         return Err(format!("unknown argument: {arg}"));
     }
@@ -271,30 +212,8 @@ where
         return Err("--machines produced no valid machine names".to_string());
     }
 
-    let ubq_labels = normalize_labels(ubq_labels);
-    let mode = if ubq_labels.is_empty() {
-        if !bench_args.is_empty() {
-            return Err(
-                "--bench-arg requires fixed-label mode; add --ubq-label or --ubq-labels"
-                    .to_string(),
-            );
-        }
-        validate_forwarded_args(&complete_args, FORBIDDEN_COMPLETE_ARGS)?;
-        validate_removed_complete_args(&complete_args)?;
-        FleetMode::Search { complete_args }
-    } else {
-        if !complete_args.is_empty() {
-            return Err(
-                "cannot combine fixed-label mode (--ubq-label/--ubq-labels) with --complete-arg"
-                    .to_string(),
-            );
-        }
-        validate_forwarded_args(&bench_args, FORBIDDEN_BENCH_ARGS)?;
-        FleetMode::FixedLabels {
-            ubq_labels,
-            bench_args,
-        }
-    };
+    validate_forwarded_args(&complete_args, FORBIDDEN_COMPLETE_ARGS)?;
+    validate_removed_complete_args(&complete_args)?;
 
     Ok(FleetArgs {
         machines,
@@ -304,20 +223,8 @@ where
         skip_local_plot,
         plot_partial,
         dry_run,
-        mode,
+        complete_args,
     })
-}
-
-fn split_label_list(raw: &str) -> Vec<String> {
-    raw.split(';').map(|value| value.to_string()).collect()
-}
-
-fn normalize_labels(labels: Vec<String>) -> Vec<String> {
-    labels
-        .into_iter()
-        .map(|label| label.trim().to_string())
-        .filter(|label| !label.is_empty())
-        .collect()
 }
 
 fn validate_removed_complete_args(args: &[String]) -> Result<(), String> {
@@ -331,27 +238,6 @@ fn validate_removed_complete_args(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn forwarded_args_contain_key(args: &[String], key: &str) -> bool {
-    args.iter()
-        .any(|arg| arg == key || arg.starts_with(&format!("{key}=")))
-}
-
-fn derive_out_root_from_runs_dir(runs_dir: &Path) -> Result<String, String> {
-    let path_text = runs_dir.display().to_string();
-    let file_name = runs_dir.file_name().and_then(|value| value.to_str());
-    if file_name != Some("runs") {
-        return Err(format!(
-            "fixed-label mode requires runs dir ending with 'runs' so it can derive --out-root (got: {path_text})"
-        ));
-    }
-    let parent = runs_dir.parent().unwrap_or_else(|| Path::new(""));
-    if parent.as_os_str().is_empty() {
-        Ok(".".to_string())
-    } else {
-        Ok(parent.display().to_string())
-    }
 }
 
 fn load_config(path: &Path) -> Result<FleetConfig, String> {
@@ -534,13 +420,7 @@ fn make_complete_base_args(
     if !runtime.strict_complete {
         complete_args.push("--allow-incomplete".to_string());
     }
-    let forwarded = match &runtime.mode {
-        FleetMode::Search { complete_args } => complete_args,
-        FleetMode::FixedLabels { .. } => {
-            panic!("complete args requested while running fixed-label mode")
-        }
-    };
-    complete_args.extend(forwarded.clone());
+    complete_args.extend(runtime.complete_args.clone());
     if runtime.dry_run {
         complete_args.push("--dry-run".to_string());
     }
@@ -597,81 +477,6 @@ fn build_remote_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) 
     vec!["ssh".to_string(), machine.host.clone(), payload]
 }
 
-fn make_fixed_label_base_args(
-    runtime: &FleetRuntime,
-    machine_label: &str,
-    out_root: &str,
-) -> Vec<String> {
-    let (ubq_labels, bench_args) = match &runtime.mode {
-        FleetMode::FixedLabels {
-            ubq_labels,
-            bench_args,
-        } => (ubq_labels, bench_args),
-        FleetMode::Search { .. } => {
-            panic!("fixed-label args requested while running search mode")
-        }
-    };
-
-    let mut args = Vec::new();
-    for label in ubq_labels {
-        args.push("--ubq-label".to_string());
-        args.push(label.clone());
-    }
-    args.push("--skip-remote".to_string());
-    args.push("--skip-plot".to_string());
-    args.push("--local-machine-label".to_string());
-    args.push(machine_label.to_string());
-    args.push("--out-root".to_string());
-    args.push(out_root.to_string());
-    if !runtime.scenarios.is_empty() && !forwarded_args_contain_key(bench_args, "--scenarios") {
-        args.push("--scenarios".to_string());
-        args.push(runtime.scenarios.join(","));
-    }
-    args.extend(bench_args.clone());
-    args
-}
-
-fn build_local_fixed_label_cmd(
-    runtime: &FleetRuntime,
-    machine: &ResolvedMachine,
-) -> Result<Vec<String>, String> {
-    let out_root = derive_out_root_from_runs_dir(&runtime.runs_dir)?;
-    let mut cmd = vec!["bash".to_string(), "scripts/bench_dual_host.sh".to_string()];
-    cmd.extend(make_fixed_label_base_args(
-        runtime,
-        &machine.machine_label,
-        &out_root,
-    ));
-    Ok(cmd)
-}
-
-fn build_remote_fixed_label_cmd(
-    runtime: &FleetRuntime,
-    machine: &ResolvedMachine,
-) -> Result<Vec<String>, String> {
-    let out_root = derive_out_root_from_runs_dir(Path::new(&machine.remote_runs_dir))?;
-    let mut inner = vec!["bash".to_string(), "scripts/bench_dual_host.sh".to_string()];
-    inner.extend(make_fixed_label_base_args(
-        runtime,
-        &machine.machine_label,
-        &out_root,
-    ));
-    let inner_quoted = inner
-        .iter()
-        .map(|s| bench_tooling::shell_quote(s))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let payload = format!(
-        "if [ -f \"$HOME/.cargo/env\" ]; then . \"$HOME/.cargo/env\"; fi; \
-         export PATH=\"$HOME/.cargo/bin:$PATH\"; \
-         cd {} && {}",
-        remote_cd_expr(&machine.remote_repo_dir),
-        inner_quoted
-    );
-    Ok(vec!["ssh".to_string(), machine.host.clone(), payload])
-}
-
 fn build_sync_cmd(machine: &ResolvedMachine) -> Vec<String> {
     let mut cmd = vec![
         "rsync".to_string(),
@@ -720,40 +525,19 @@ fn build_pull_runs_cmd(
 fn run_machine(runtime: Arc<FleetRuntime>, machine: ResolvedMachine) -> MachineRunResult {
     println!("\n=== Machine: {} ===", machine.name);
     let result = if machine.is_local {
-        match &runtime.mode {
-            FleetMode::Search { .. } => {
-                println!("  starting local search");
-                let cmd = build_local_complete_cmd(&runtime, &machine);
-                run_streaming_cmd(&cmd, &runtime.repo_root, runtime.dry_run, &machine.name)
-                    .and_then(|code| {
-                        if code == 0 {
-                            Ok(())
-                        } else {
-                            Err(format!(
-                                "local complete_benches failed with exit code {code}"
-                            ))
-                        }
-                    })
-            }
-            FleetMode::FixedLabels { ubq_labels, .. } => {
-                println!(
-                    "  starting local fixed-label bench ({} labels)",
-                    ubq_labels.len()
-                );
-                build_local_fixed_label_cmd(&runtime, &machine).and_then(|cmd| {
-                    run_streaming_cmd(&cmd, &runtime.repo_root, runtime.dry_run, &machine.name)
-                        .and_then(|code| {
-                            if code == 0 {
-                                Ok(())
-                            } else {
-                                Err(format!(
-                                    "local fixed-label bench failed with exit code {code}"
-                                ))
-                            }
-                        })
-                })
-            }
-        }
+        println!("  starting local search");
+        let cmd = build_local_complete_cmd(&runtime, &machine);
+        run_streaming_cmd(&cmd, &runtime.repo_root, runtime.dry_run, &machine.name).and_then(
+            |code| {
+                if code == 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "local complete_benches failed with exit code {code}"
+                    ))
+                }
+            },
+        )
     } else {
         let outcome = if runtime.sync_repo {
             println!(
@@ -772,40 +556,20 @@ fn run_machine(runtime: Arc<FleetRuntime>, machine: ResolvedMachine) -> MachineR
             Ok(())
         };
 
-        let outcome = outcome.and_then(|_| match &runtime.mode {
-            FleetMode::Search { .. } => {
-                println!("  starting remote search on {}", machine.host);
-                let cmd = build_remote_complete_cmd(&runtime, &machine);
-                run_streaming_cmd(&cmd, &runtime.repo_root, runtime.dry_run, &machine.name)
-                    .and_then(|code| {
-                        if code == 0 {
-                            Ok(())
-                        } else {
-                            Err(format!(
-                                "remote complete_benches failed with exit code {code}"
-                            ))
-                        }
-                    })
-            }
-            FleetMode::FixedLabels { ubq_labels, .. } => {
-                println!(
-                    "  starting remote fixed-label bench on {} ({} labels)",
-                    machine.host,
-                    ubq_labels.len()
-                );
-                build_remote_fixed_label_cmd(&runtime, &machine).and_then(|cmd| {
-                    run_streaming_cmd(&cmd, &runtime.repo_root, runtime.dry_run, &machine.name)
-                        .and_then(|code| {
-                            if code == 0 {
-                                Ok(())
-                            } else {
-                                Err(format!(
-                                    "remote fixed-label bench failed with exit code {code}"
-                                ))
-                            }
-                        })
-                })
-            }
+        let outcome = outcome.and_then(|_| {
+            println!("  starting remote search on {}", machine.host);
+            let cmd = build_remote_complete_cmd(&runtime, &machine);
+            run_streaming_cmd(&cmd, &runtime.repo_root, runtime.dry_run, &machine.name).and_then(
+                |code| {
+                    if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "remote complete_benches failed with exit code {code}"
+                        ))
+                    }
+                },
+            )
         });
 
         outcome.and_then(|_| {
@@ -915,7 +679,7 @@ fn run(args: FleetArgs) -> Result<i32, String> {
         sync_repo: !args.no_sync_repo,
         strict_complete: args.strict_complete,
         dry_run: args.dry_run,
-        mode: args.mode.clone(),
+        complete_args: args.complete_args.clone(),
     });
 
     let mut resolved = Vec::new();
@@ -937,23 +701,12 @@ fn run(args: FleetArgs) -> Result<i32, String> {
     );
     println!("Local runs dir: {}", runtime.runs_dir.display());
     println!("Plot out dir: {}", runtime.plot_out_dir.display());
-    match &runtime.mode {
-        FleetMode::Search { complete_args } => {
-            println!("Mode: complete search");
-            if !complete_args.is_empty() {
-                println!("Forwarded complete args: {}", complete_args.join(" "));
-            }
-        }
-        FleetMode::FixedLabels {
-            ubq_labels,
-            bench_args,
-        } => {
-            println!("Mode: fixed-label bench");
-            println!("UBQ labels: {}", ubq_labels.join("; "));
-            if !bench_args.is_empty() {
-                println!("Forwarded bench args: {}", bench_args.join(" "));
-            }
-        }
+    println!("Mode: complete search");
+    if !runtime.complete_args.is_empty() {
+        println!(
+            "Forwarded complete args: {}",
+            runtime.complete_args.join(" ")
+        );
     }
 
     let mut joins = Vec::new();
@@ -1060,26 +813,7 @@ mod tests {
             sync_repo: true,
             strict_complete: false,
             dry_run: true,
-            mode: FleetMode::Search {
-                complete_args: vec!["--bench-arg=--items-per-producer=1000".to_string()],
-            },
-        }
-    }
-
-    fn fixed_runtime() -> FleetRuntime {
-        FleetRuntime {
-            repo_root: PathBuf::from("."),
-            runs_dir: PathBuf::from("bench_results/runs"),
-            plot_out_dir: PathBuf::from("bench_results/plots"),
-            scenarios: vec!["1p1c".to_string(), "8p8c".to_string()],
-            seed_label: Some("v4,8,127".to_string()),
-            sync_repo: true,
-            strict_complete: false,
-            dry_run: true,
-            mode: FleetMode::FixedLabels {
-                ubq_labels: vec!["v7,16,511".to_string(), "v6,0,511".to_string()],
-                bench_args: vec!["--throughput-only".to_string()],
-            },
+            complete_args: vec!["--bench-arg=--items-per-producer=1000".to_string()],
         }
     }
 
@@ -1125,26 +859,6 @@ mod tests {
     }
 
     #[test]
-    fn local_fixed_label_command_contains_expected_args() {
-        let runtime = fixed_runtime();
-        let machine = machine_local();
-        let cmd = build_local_fixed_label_cmd(&runtime, &machine).expect("fixed-label command");
-        assert_eq!(cmd[0], "bash");
-        assert_eq!(cmd[1], "scripts/bench_dual_host.sh");
-        assert!(cmd.contains(&"--ubq-label".to_string()));
-        assert!(cmd.contains(&"v7,16,511".to_string()));
-        assert!(cmd.contains(&"v6,0,511".to_string()));
-        assert!(cmd.contains(&"--skip-remote".to_string()));
-        assert!(cmd.contains(&"--skip-plot".to_string()));
-        assert!(cmd.contains(&"--local-machine-label".to_string()));
-        assert!(cmd.contains(&"--out-root".to_string()));
-        assert!(cmd.contains(&"bench_results".to_string()));
-        assert!(cmd.contains(&"--scenarios".to_string()));
-        assert!(cmd.contains(&"1p1c,8p8c".to_string()));
-        assert!(cmd.contains(&"--throughput-only".to_string()));
-    }
-
-    #[test]
     fn remote_complete_command_uses_ssh_and_cargo() {
         let runtime = runtime();
         let machine = machine_remote();
@@ -1154,20 +868,6 @@ mod tests {
         assert!(cmd[2].contains("cargo"));
         assert!(cmd[2].contains("--quiet"));
         assert!(cmd[2].contains("complete_benches"));
-        assert!(cmd[2].contains("cd \"$HOME/UBQ\""));
-    }
-
-    #[test]
-    fn remote_fixed_label_command_uses_ssh_and_bench_script() {
-        let runtime = fixed_runtime();
-        let machine = machine_remote();
-        let cmd = build_remote_fixed_label_cmd(&runtime, &machine).expect("remote fixed command");
-        assert_eq!(cmd[0], "ssh");
-        assert_eq!(cmd[1], "lab");
-        assert!(cmd[2].contains("bash"));
-        assert!(cmd[2].contains("scripts/bench_dual_host.sh"));
-        assert!(cmd[2].contains("--skip-remote"));
-        assert!(cmd[2].contains("--skip-plot"));
         assert!(cmd[2].contains("cd \"$HOME/UBQ\""));
     }
 
@@ -1205,58 +905,10 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_bench_args_block_protected_keys() {
-        let bad = vec!["--out-root=/tmp/bench_results".to_string()];
-        assert!(validate_forwarded_args(&bad, FORBIDDEN_BENCH_ARGS).is_err());
-        let ok = vec!["--throughput-only".to_string(), "--runs=3".to_string()];
-        assert!(validate_forwarded_args(&ok, FORBIDDEN_BENCH_ARGS).is_ok());
-    }
-
-    #[test]
-    fn fixed_label_mode_is_selected_when_labels_are_present() {
-        let args = parse_args_from([
-            "--machines",
-            "local,lab",
-            "--ubq-label",
-            "v7,16,511",
-            "--ubq-labels",
-            "v6,0,511;v5,16,511",
-            "--bench-arg",
-            "--throughput-only",
-        ])
-        .expect("parse fixed-label args");
-        assert_eq!(args.machines, vec!["local".to_string(), "lab".to_string()]);
-        match args.mode {
-            FleetMode::FixedLabels {
-                ubq_labels,
-                bench_args,
-            } => {
-                assert_eq!(
-                    ubq_labels,
-                    vec![
-                        "v7,16,511".to_string(),
-                        "v6,0,511".to_string(),
-                        "v5,16,511".to_string()
-                    ]
-                );
-                assert_eq!(bench_args, vec!["--throughput-only".to_string()]);
-            }
-            FleetMode::Search { .. } => panic!("expected fixed-label mode"),
-        }
-    }
-
-    #[test]
-    fn fixed_label_and_search_modes_cannot_be_combined() {
-        let err = parse_args_from([
-            "--machines",
-            "local",
-            "--ubq-label",
-            "v7,16,511",
-            "--complete-arg",
-            "--mode=throughput",
-        ])
-        .expect_err("expected conflict");
-        assert!(err.contains("cannot combine fixed-label mode"));
+    fn fixed_label_mode_args_are_rejected() {
+        let err = parse_args_from(["--machines", "local", "--ubq-label", "v7,16,511"])
+            .expect_err("expected removal error");
+        assert!(err.contains("fixed-label fleet mode was removed"));
     }
 
     #[test]

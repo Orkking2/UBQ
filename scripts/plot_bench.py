@@ -40,32 +40,10 @@ LEGACY_SCENARIO_MAP = {
     "mpmc": "4p4c",
 }
 
-MACHINE_CANONICAL_MAP = {
-    "arm": "arm",
-    "local": "arm",
-    "hebrides": "arm",
-    "x86": "x86",
-    "lab": "x86",
-}
-
-MACHINE_OUTPUT_ALIASES = {
-    "arm": ["arm"],
-    "x86": ["x86"],
-}
-
 
 def normalize_scenario(name: str) -> str:
     key = str(name).strip().lower()
     return LEGACY_SCENARIO_MAP.get(key, key)
-
-
-def canonical_machine_label(name: str) -> str:
-    raw = str(name).strip()
-    return MACHINE_CANONICAL_MAP.get(raw.lower(), raw)
-
-
-def machine_output_labels(canonical_name: str):
-    return MACHINE_OUTPUT_ALIASES.get(canonical_name, [canonical_name])
 
 
 def scenario_sort_key(name: str):
@@ -330,7 +308,7 @@ def clear_generated_outputs(out_root: Path):
         print(f"Removed {removed} stale plot artifact(s) under: {out_root}")
 
 
-def load_records(path: Path, canonicalize_machine: bool = True):
+def load_records(path: Path):
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -340,11 +318,7 @@ def load_records(path: Path, canonicalize_machine: bool = True):
 
     meta = data.get("meta", {})
     ubq_label = str(meta.get("ubq_label", "default"))
-    machine_label_raw = str(meta.get("machine_label", "local")).strip() or "local"
-    if canonicalize_machine:
-        machine_label = canonical_machine_label(machine_label_raw)
-    else:
-        machine_label = machine_label_raw
+    machine_label = str(meta.get("machine_label", "local")).strip() or "local"
 
     for rec in data.get("results", []):
         if rec.get("skipped_reason"):
@@ -446,7 +420,7 @@ def main():
 
     for file in args.files:
         path = Path(file)
-        for machine, mode, scenario, label, ops in load_records(path, canonicalize_machine=False):
+        for machine, mode, scenario, label, ops in load_records(path):
             key = (machine, mode, scenario, label)
             raw_data.setdefault(key, []).append(ops)
             sample_points += 1
@@ -470,10 +444,9 @@ def main():
                 entries = grouped[machine][mode][scenario]
                 labels = one_step_ubq_labels(entries)
                 values = [(label, entries[label]) for label in labels]
-                for out_machine in machine_output_labels(machine):
-                    csv_path = out_root / out_machine / "csv" / mode / f"{scenario}_throughput.csv"
-                    write_csv(csv_path, values)
-                    print(f"Wrote CSV: {csv_path}")
+                csv_path = out_root / machine / "csv" / mode / f"{scenario}_throughput.csv"
+                write_csv(csv_path, values)
+                print(f"Wrote CSV: {csv_path}")
 
     ensure_mplconfigdir(out_root)
     try:
@@ -538,11 +511,10 @@ def main():
                 ax.legend(loc="upper left")
                 fig.tight_layout()
 
-                for out_machine in machine_output_labels(machine):
-                    png_path = out_root / out_machine / mode / f"{scenario}_throughput.png"
-                    png_path.parent.mkdir(parents=True, exist_ok=True)
-                    fig.savefig(png_path, dpi=200)
-                    print(f"Wrote PNG: {png_path}")
+                png_path = out_root / machine / mode / f"{scenario}_throughput.png"
+                png_path.parent.mkdir(parents=True, exist_ok=True)
+                fig.savefig(png_path, dpi=200)
+                print(f"Wrote PNG: {png_path}")
                 plt.close(fig)
 
 

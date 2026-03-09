@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -243,30 +241,6 @@ fn collect_run_jsons(runs_dir: &Path) -> Result<Vec<PathBuf>, String> {
     }
     files.sort();
     Ok(files)
-}
-
-pub fn collect_machine_labels(runs_dir: &Path) -> Result<Vec<String>, String> {
-    let mut labels = BTreeSet::new();
-    for json_path in collect_run_jsons(runs_dir)? {
-        let raw = match fs::read_to_string(&json_path) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let parsed: serde_json::Value = match serde_json::from_str(&raw) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let label = parsed
-            .get("meta")
-            .and_then(|v| v.get("machine_label"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if !label.is_empty() {
-            labels.insert(label.to_string());
-        }
-    }
-    Ok(labels.into_iter().collect())
 }
 
 pub fn load_grouped_runs(runs_dir: &Path) -> Result<GroupedRuns, String> {
@@ -630,14 +604,6 @@ pub fn format_cmd(args: &[String]) -> String {
     out
 }
 
-pub fn parse_bool_token(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
 pub fn validate_forwarded_args(args: &[String], forbidden: &[&str]) -> Result<(), String> {
     for arg in args {
         for key in forbidden {
@@ -649,76 +615,6 @@ pub fn validate_forwarded_args(args: &[String], forbidden: &[&str]) -> Result<()
         }
     }
     Ok(())
-}
-
-pub fn parse_key_val_arg(
-    raw: &str,
-    key: &str,
-    args_iter_value: Option<String>,
-) -> Result<Option<String>, String> {
-    if raw == key {
-        return args_iter_value
-            .map(Some)
-            .ok_or_else(|| format!("{key} requires a value"));
-    }
-    if let Some(value) = raw.strip_prefix(&format!("{key}=")) {
-        return Ok(Some(value.to_string()));
-    }
-    Ok(None)
-}
-
-pub fn join_remote_path(base: &str, child: &str) -> String {
-    if child.starts_with('/') || child.starts_with("~/") {
-        return child.to_string();
-    }
-    format!(
-        "{}/{}",
-        base.trim_end_matches('/'),
-        child.trim_start_matches('/')
-    )
-}
-
-pub fn remote_cd_expr(path: &str) -> String {
-    let raw = path.trim();
-    if raw == "~" {
-        "\"$HOME\"".to_string()
-    } else if let Some(tail) = raw.strip_prefix("~/") {
-        format!("\"$HOME/{}\"", escape_for_double_quotes(tail))
-    } else {
-        shell_quote(raw)
-    }
-}
-
-pub fn escape_for_double_quotes(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('$', "\\$")
-        .replace('`', "\\`")
-}
-
-pub fn normalize_machine_list(raw: &str) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    for item in raw.split(',') {
-        let value = normalize_machine(item);
-        if value.is_empty() {
-            continue;
-        }
-        if seen.insert(value.clone()) {
-            out.push(value);
-        }
-    }
-    out
-}
-
-pub fn find_missing_machine_labels(requested: &[String], seen: &[String]) -> Vec<String> {
-    let seen_norm: BTreeSet<String> = seen.iter().map(|s| normalize_machine(s)).collect();
-    requested
-        .iter()
-        .filter(|m| !seen_norm.contains(&normalize_machine(m)))
-        .cloned()
-        .collect()
 }
 
 pub fn format_missing_key(winner: &str, missing: &[String]) -> String {
@@ -865,12 +761,6 @@ mod tests {
 
     #[test]
     fn command_helper_generation() {
-        assert_eq!(
-            join_remote_path("~/UBQ", "bench_results/runs"),
-            "~/UBQ/bench_results/runs"
-        );
-        assert_eq!(join_remote_path("~/UBQ", "/tmp/runs"), "/tmp/runs");
-        assert_eq!(remote_cd_expr("~/UBQ"), "\"$HOME/UBQ\"");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
@@ -908,9 +798,6 @@ mod tests {
         assert!(entries.contains_key("ubq_v4,8,127"));
         assert!(entries.contains_key("segqueue"));
 
-        let labels = collect_machine_labels(&root).expect("labels");
-        assert_eq!(labels, vec!["local".to_string()]);
-
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -918,8 +805,4 @@ mod tests {
     fn ubq_label_domain_size_is_finite_and_expected() {
         assert_eq!(total_valid_ubq_label_count(), 464);
     }
-}
-
-fn main() {
-    unimplemented!()
 }

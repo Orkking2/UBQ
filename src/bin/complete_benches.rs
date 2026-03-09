@@ -1,3 +1,4 @@
+#[path = "bench_tooling/search.rs"]
 mod bench_tooling;
 
 use bench_tooling::{

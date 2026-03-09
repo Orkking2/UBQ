@@ -102,19 +102,16 @@ cargo bench --bench ubq_bench -- \
   --scenarios=1p1c,8p8c
 ```
 
-Run local + remote (`lab`) in one command (sync, bench, collect, and plot):
+Run the nearest-neighbor search on a single machine:
 
 ```bash
-./scripts/bench_dual_host.sh --ubq-label v5,8,1023
+cargo run --release --bin complete_benches -- \
+  --machine-label local
 
-# Same variant, but with UBQ's concurrency-queue-style backoff (`b` suffix).
-./scripts/bench_dual_host.sh --ubq-label v5,8,1023,b
-
-# Repeat each benchmark run 5 times to build sample size per bar.
-./scripts/bench_dual_host.sh --ubq-label v5,8,1023 --n=5
-
-# Run multiple UBQ labels in sequence; each label runs --n times.
-./scripts/bench_dual_host.sh --ubq-labels 'v3,4,127;v5,8,2047;v7,4,1023' --n=3
+# Repeat each direct benchmark 5 times to build sample size per bar.
+cargo run --release --bin complete_benches -- \
+  --machine-label local \
+  --bench-arg --runs=5
 ```
 
 Run the full nearest-neighbor search across the machines configured in
@@ -131,37 +128,8 @@ aggregated plots once. By default it allows incomplete per-machine scenario
 sweeps; pass `--strict-complete` to fail on any incomplete scenario. Default
 scenarios, remote paths, and seed fallback (`v4,8,127`) come from
 `bench_fleet.toml`. Use `--complete-arg=...` to forward additional
-`complete_benches` options. `complete_benches` now runs its search rounds
-directly via `cargo bench`; Python is only needed for plotting helpers and the
-fixed-label shell workflow.
-
-To run a fixed set of UBQ variants instead of the search loop:
-
-```bash
-cargo run --release --bin full_bench_fleet -- \
-  --machines local,lab \
-  --ubq-labels 'v7,16,511;v6,0,511;v5,16,511' \
-  --bench-arg --throughput-only \
-  --bench-arg --scenarios=1p1c,8p8c
-```
-
-Fixed-label mode runs `scripts/bench_dual_host.sh` locally on each selected
-machine, then pulls remote runs back into the local aggregated `runs` folder.
-
-`bench_dual_host.sh` stores each UBQ label in `bench_results/runs/<ubq_label>`
-and appends timestamped machine outputs (for example, `local_<run_id>.json` and
-`lab_<run_id>.json`). `plot_bench.py` averages repeated samples per
-machine/mode/scenario/queue and can render error bars from those samples.
-By default the script keeps all labels and only normalizes to one directory per
-label. Labels must match either
-`v(3|4|5|7),(1|2|4|8|16|32|64),(31|63|127|255|511|1023|2047|4095)[,b]` or
-`v6,0,(31|63|127|255|511|1023|2047|4095)[,b]` and map to cargo features:
-`ubq_vX,ubq_pool_N,ubq_block_L[,ubq_backoff_cq]` (or
-`ubq_v6,ubq_block_L[,ubq_backoff_cq]` for no-pool `v6`).
-Use `--n` (or `--runs`) to repeat each label multiple times and append more
-samples. To drop non-winning UBQ labels, pass `--purge-losers`. When enabled,
-labels purged for being non-winners are tracked in
-`bench_results/purged_ubq_labels.txt`.
+`complete_benches` options. `complete_benches` runs its search rounds directly
+via `cargo bench`. Python is only needed for the plotting helpers.
 
 Generate plots manually (PNG + CSV):
 
