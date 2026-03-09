@@ -131,7 +131,9 @@ aggregated plots once. By default it allows incomplete per-machine scenario
 sweeps; pass `--strict-complete` to fail on any incomplete scenario. Default
 scenarios, remote paths, and seed fallback (`v4,8,127`) come from
 `bench_fleet.toml`. Use `--complete-arg=...` to forward additional
-`complete_benches` options.
+`complete_benches` options. `complete_benches` now runs its search rounds
+directly via `cargo bench`; Python is only needed for plotting helpers and the
+fixed-label shell workflow.
 
 To run a fixed set of UBQ variants instead of the search loop:
 

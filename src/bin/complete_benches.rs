@@ -3,8 +3,8 @@ mod bench_tooling;
 use bench_tooling::{
     Stats, bench_label_sort_key, format_cmd, format_missing_key,
     has_complete_immediate_winner_variants, load_grouped_runs, normalize_machine,
-    normalize_ubq_label, parse_scenario_threads, parse_scenarios,
-    strict_immediate_winner_ubq_labels, total_valid_ubq_label_count,
+    normalize_ubq_label, parse_scenario_threads, parse_scenarios, parse_ubq_label,
+    strict_immediate_winner_ubq_labels, total_valid_ubq_label_count, validate_forwarded_args,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -23,9 +23,15 @@ struct CompleteArgs {
     mode: String,
     seed_label: Option<String>,
     allow_incomplete: bool,
-    bench_script: PathBuf,
-    bench_args: Vec<String>,
+    bench: DirectBenchArgs,
     dry_run: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectBenchArgs {
+    cargo_jobs: Option<usize>,
+    repeat_count: usize,
+    harness_args: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,7 +55,37 @@ struct BenchRunContext<'a> {
     scenario: &'a str,
     round_idx: usize,
     label_count: usize,
+    command_tag: &'a str,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BenchCommand {
+    label: String,
+    tag: String,
+    out_path: PathBuf,
+    cmd: Vec<String>,
+}
+
+const FORBIDDEN_DIRECT_BENCH_ARGS: &[&str] = &[
+    "--ubq-label",
+    "--ubq-labels",
+    "--machine-label",
+    "--local-machine-label",
+    "--out",
+    "--out-root",
+    "--scenarios",
+    "--modes",
+    "--throughput-only",
+    "--available-parallelism",
+    "--remote-host",
+    "--remote-dir",
+    "--skip-local",
+    "--skip-remote",
+    "--skip-plot",
+    "--purge-losers",
+    "--tmux",
+    "--tmux-session",
+];
 
 fn has_no_progress(previous_missing_key: Option<&str>, current_missing_key: Option<&str>) -> bool {
     match (previous_missing_key, current_missing_key) {
@@ -93,12 +129,86 @@ fn print_usage_and_exit(code: i32) -> ! {
            --mode MODE               (default: throughput)\n\
            --seed-label LABEL        (default: v4,8,127)\n\
            --allow-incomplete        (default: false)\n\
-           --bench-script PATH       (default: ./scripts/bench_dual_host.sh)\n\
-           --bench-arg ARG           (repeatable)\n\
+           --bench-arg ARG           (repeatable; supports --cargo-jobs, --n/--runs,\n\
+                                      and bench-harness args like --items-per-producer)\n\
            --dry-run\n\
            -h, --help"
     );
     std::process::exit(code);
+}
+
+fn normalize_mode(raw: &str) -> Result<String, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "throughput" => Ok("throughput".to_string()),
+        "fill_drain" | "fill-drain" => Ok("fill_drain".to_string()),
+        _ => Err(format!(
+            "invalid --mode '{}' (expected throughput or fill_drain)",
+            raw.trim()
+        )),
+    }
+}
+
+fn parse_positive_usize(value: &str, key: &str) -> Result<usize, String> {
+    match value.trim().parse::<usize>() {
+        Ok(parsed) if parsed > 0 => Ok(parsed),
+        _ => Err(format!(
+            "{key} must be a positive integer (got: {})",
+            value.trim()
+        )),
+    }
+}
+
+fn parse_direct_bench_args(raw_args: &[String]) -> Result<DirectBenchArgs, String> {
+    validate_forwarded_args(raw_args, FORBIDDEN_DIRECT_BENCH_ARGS)?;
+
+    let mut cargo_jobs = None;
+    let mut repeat_count = 1;
+    let mut harness_args = Vec::new();
+    let mut idx = 0;
+
+    while idx < raw_args.len() {
+        let arg = &raw_args[idx];
+        if arg == "--cargo-jobs" {
+            let value = raw_args
+                .get(idx + 1)
+                .ok_or_else(|| "--cargo-jobs requires a value".to_string())?;
+            cargo_jobs = Some(parse_positive_usize(value, "--cargo-jobs")?);
+            idx += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--cargo-jobs=") {
+            cargo_jobs = Some(parse_positive_usize(value, "--cargo-jobs")?);
+            idx += 1;
+            continue;
+        }
+        if arg == "--n" || arg == "--runs" {
+            let value = raw_args
+                .get(idx + 1)
+                .ok_or_else(|| format!("{arg} requires a value"))?;
+            repeat_count = parse_positive_usize(value, "--n/--runs")?;
+            idx += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--n=") {
+            repeat_count = parse_positive_usize(value, "--n/--runs")?;
+            idx += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--runs=") {
+            repeat_count = parse_positive_usize(value, "--n/--runs")?;
+            idx += 1;
+            continue;
+        }
+
+        harness_args.push(arg.clone());
+        idx += 1;
+    }
+
+    Ok(DirectBenchArgs {
+        cargo_jobs,
+        repeat_count,
+        harness_args,
+    })
 }
 
 fn parse_args() -> Result<CompleteArgs, String> {
@@ -108,7 +218,6 @@ fn parse_args() -> Result<CompleteArgs, String> {
     let mut mode = "throughput".to_string();
     let mut seed_label = Some("v4,8,127".to_string());
     let mut allow_incomplete = false;
-    let mut bench_script = PathBuf::from("./scripts/bench_dual_host.sh");
     let mut bench_args: Vec<String> = Vec::new();
     let mut dry_run = false;
 
@@ -196,17 +305,6 @@ fn parse_args() -> Result<CompleteArgs, String> {
                 "--max-rounds was removed; the search now stops on completion, missing seed, or no-progress within a finite UBQ label space".to_string(),
             );
         }
-        if arg == "--bench-script" {
-            let value = args
-                .next()
-                .ok_or_else(|| "--bench-script requires a value".to_string())?;
-            bench_script = PathBuf::from(value);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--bench-script=") {
-            bench_script = PathBuf::from(value);
-            continue;
-        }
         if arg == "--bench-arg" {
             let value = args
                 .next()
@@ -226,17 +324,12 @@ fn parse_args() -> Result<CompleteArgs, String> {
         .map(|v| normalize_machine(&v))
         .filter(|v| !v.is_empty())
         .ok_or_else(|| "--machine-label is required".to_string())?;
-    if !bench_script.exists() {
-        return Err(format!(
-            "bench script not found: {}",
-            bench_script.display()
-        ));
-    }
 
     let scenarios = parse_scenarios(scenarios_override.as_deref());
     if scenarios.is_empty() {
         return Err("no scenarios configured".to_string());
     }
+    let mode = normalize_mode(&mode)?;
 
     let seed_label = match seed_label {
         Some(seed) => normalize_ubq_label(&seed, true)
@@ -244,6 +337,7 @@ fn parse_args() -> Result<CompleteArgs, String> {
             .into(),
         None => None,
     };
+    let bench = parse_direct_bench_args(&bench_args)?;
 
     Ok(CompleteArgs {
         machine_label,
@@ -252,8 +346,7 @@ fn parse_args() -> Result<CompleteArgs, String> {
         mode,
         seed_label,
         allow_incomplete,
-        bench_script,
-        bench_args,
+        bench,
         dry_run,
     })
 }
@@ -313,31 +406,83 @@ fn evaluate_scenario_round(
     }
 }
 
-fn build_bench_cmd(args: &CompleteArgs, scenario: &str, labels: &[String]) -> Vec<String> {
-    let out_root = args
-        .runs_dir
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .display()
-        .to_string();
-    let mut cmd = vec![
-        args.bench_script.display().to_string(),
-        "--ubq-labels".to_string(),
-        labels.join(";"),
-        "--out-root".to_string(),
-        out_root,
-        "--scenarios".to_string(),
-        scenario.to_string(),
-        "--throughput-only".to_string(),
-        "--n=1".to_string(),
-        "--skip-plot".to_string(),
-        "--skip-remote".to_string(),
-        "--local-machine-label".to_string(),
-        args.machine_label.clone(),
-    ];
-    cmd.extend(args.bench_args.clone());
-    cmd
+fn bench_mode_args(mode: &str) -> Result<Vec<String>, String> {
+    match mode {
+        "throughput" => Ok(vec!["--throughput-only".to_string()]),
+        "fill_drain" => Ok(vec!["--modes".to_string(), "fill_drain".to_string()]),
+        _ => Err(format!("unsupported benchmark mode for execution: {mode}")),
+    }
+}
+
+fn bench_output_path(
+    args: &CompleteArgs,
+    label_safe: &str,
+    scenario: &str,
+    round_idx: usize,
+    repeat_idx: usize,
+) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    args.runs_dir.join(label_safe).join(format!(
+        "{}_{}_round{}_r{}_{}.json",
+        sanitize_name(&args.machine_label),
+        sanitize_name(scenario),
+        round_idx,
+        repeat_idx,
+        stamp
+    ))
+}
+
+fn build_bench_cmds(
+    args: &CompleteArgs,
+    scenario: &str,
+    round_idx: usize,
+    labels: &[String],
+) -> Result<Vec<BenchCommand>, String> {
+    let mode_args = bench_mode_args(&args.mode)?;
+    let mut commands = Vec::new();
+
+    for label in labels {
+        let parsed = parse_ubq_label(label, true)?;
+        let feature_csv = parsed.feature_csv();
+        let safe_label = parsed.safe();
+
+        for repeat_idx in 1..=args.bench.repeat_count {
+            let out_path = bench_output_path(args, &safe_label, scenario, round_idx, repeat_idx);
+            let mut cmd = vec!["cargo".to_string(), "bench".to_string()];
+            if let Some(cargo_jobs) = args.bench.cargo_jobs {
+                cmd.push("-j".to_string());
+                cmd.push(cargo_jobs.to_string());
+            }
+            cmd.extend([
+                "--bench".to_string(),
+                "ubq_bench".to_string(),
+                "--features".to_string(),
+                feature_csv.clone(),
+                "--".to_string(),
+                "--ubq-label".to_string(),
+                label.clone(),
+                "--machine-label".to_string(),
+                args.machine_label.clone(),
+                "--out".to_string(),
+                out_path.display().to_string(),
+                "--scenarios".to_string(),
+                scenario.to_string(),
+            ]);
+            cmd.extend(mode_args.clone());
+            cmd.extend(args.bench.harness_args.clone());
+            commands.push(BenchCommand {
+                label: label.clone(),
+                tag: format!("{}_r{}", safe_label, repeat_idx),
+                out_path,
+                cmd,
+            });
+        }
+    }
+
+    Ok(commands)
 }
 
 fn sanitize_name(raw: &str) -> String {
@@ -357,7 +502,12 @@ fn sanitize_name(raw: &str) -> String {
     }
 }
 
-fn bench_log_path(machine_label: &str, scenario: &str, round_idx: usize) -> PathBuf {
+fn bench_log_path(
+    machine_label: &str,
+    scenario: &str,
+    round_idx: usize,
+    command_tag: &str,
+) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
@@ -366,9 +516,10 @@ fn bench_log_path(machine_label: &str, scenario: &str, round_idx: usize) -> Path
         .join("complete_benches_logs")
         .join(sanitize_name(machine_label))
         .join(format!(
-            "{}_round{}_{}.log",
+            "{}_round{}_{}_{}.log",
             sanitize_name(scenario),
             round_idx,
+            sanitize_name(command_tag),
             stamp
         ))
 }
@@ -393,21 +544,23 @@ fn print_log_tail(path: &Path, max_lines: usize) {
 }
 
 fn run_bench_cmd(
-    cmd: &[String],
+    bench_command: &BenchCommand,
     dry_run: bool,
     machine_label: &str,
     ctx: &BenchRunContext<'_>,
 ) -> Result<(), String> {
     println!(
-        "  bench driver: scenario={} round={} labels={}",
-        ctx.scenario, ctx.round_idx, ctx.label_count
+        "  bench driver: scenario={} round={} labels={} command={}",
+        ctx.scenario, ctx.round_idx, ctx.label_count, ctx.command_tag
     );
+    println!("    label: {}", bench_command.label);
+    println!("    out: {}", bench_command.out_path.display());
     if dry_run {
-        println!("    command: {}", format_cmd(cmd));
+        println!("    command: {}", format_cmd(&bench_command.cmd));
         return Ok(());
     }
 
-    let log_path = bench_log_path(machine_label, ctx.scenario, ctx.round_idx);
+    let log_path = bench_log_path(machine_label, ctx.scenario, ctx.round_idx, ctx.command_tag);
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create log dir {}: {err}", parent.display()))?;
@@ -419,9 +572,9 @@ fn run_bench_cmd(
         .map_err(|err| format!("failed to clone log handle {}: {err}", log_path.display()))?;
 
     println!("    log: {}", log_path.display());
-    let mut command = Command::new(&cmd[0]);
+    let mut command = Command::new(&bench_command.cmd[0]);
     command
-        .args(&cmd[1..])
+        .args(&bench_command.cmd[1..])
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log));
     let mut child = command
@@ -606,17 +759,25 @@ fn run(args: &CompleteArgs) -> Result<(), String> {
         println!("scheduled bench work: {scheduled_summary}");
 
         for (scenario, labels) in planned {
-            let cmd = build_bench_cmd(args, &scenario, &labels);
             let round_idx = state
                 .get(&scenario)
                 .map(|item| item.rounds_run)
                 .ok_or_else(|| format!("internal missing state for {scenario}"))?;
-            let context = BenchRunContext {
-                scenario: &scenario,
-                round_idx,
-                label_count: labels.len(),
-            };
-            run_bench_cmd(&cmd, args.dry_run, &args.machine_label, &context)?;
+            let commands = build_bench_cmds(args, &scenario, round_idx, &labels)?;
+            for command in &commands {
+                let context = BenchRunContext {
+                    scenario: &scenario,
+                    round_idx,
+                    label_count: labels.len(),
+                    command_tag: &command.tag,
+                };
+                run_bench_cmd(command, args.dry_run, &args.machine_label, &context)?;
+            }
+        }
+
+        if args.dry_run {
+            println!("\nDry run complete.");
+            return Ok(());
         }
     }
 
@@ -665,6 +826,7 @@ fn main() {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     fn grouped_with_entries(
         machine: &str,
@@ -766,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn build_cmd_contains_local_only_flags() {
+    fn build_cmd_uses_direct_cargo_bench() {
         let args = CompleteArgs {
             machine_label: "lab".to_string(),
             runs_dir: PathBuf::from("bench_results/runs"),
@@ -774,16 +936,60 @@ mod tests {
             mode: "throughput".to_string(),
             seed_label: Some("v4,8,127".to_string()),
             allow_incomplete: true,
-            bench_script: PathBuf::from("./scripts/bench_dual_host.sh"),
-            bench_args: vec!["--items-per-producer=1000".to_string()],
+            bench: DirectBenchArgs {
+                cargo_jobs: Some(2),
+                repeat_count: 1,
+                harness_args: vec!["--items-per-producer=1000".to_string()],
+            },
             dry_run: true,
         };
-        let cmd = build_bench_cmd(&args, "1p1c", &["v4,8,127".to_string()]);
-        assert!(cmd.contains(&"--skip-remote".to_string()));
-        assert!(cmd.contains(&"--local-machine-label".to_string()));
+        let commands =
+            build_bench_cmds(&args, "1p1c", 3, &["v4,8,127".to_string()]).expect("commands");
+        assert_eq!(commands.len(), 1);
+        let cmd = &commands[0].cmd;
+        assert_eq!(cmd[0], "cargo");
+        assert_eq!(cmd[1], "bench");
+        assert!(cmd.contains(&"-j".to_string()));
+        assert!(cmd.contains(&"--bench".to_string()));
+        assert!(cmd.contains(&"ubq_bench".to_string()));
+        assert!(cmd.contains(&"--machine-label".to_string()));
         assert!(cmd.contains(&"lab".to_string()));
-        assert!(cmd.contains(&"--out-root".to_string()));
-        assert!(cmd.contains(&"bench_results".to_string()));
+        assert!(cmd.contains(&"--throughput-only".to_string()));
+        assert!(cmd.contains(&"--items-per-producer=1000".to_string()));
+        assert!(
+            commands[0]
+                .out_path
+                .starts_with(Path::new("bench_results/runs/v4_8_127"))
+        );
+    }
+
+    #[test]
+    fn parse_direct_bench_args_extracts_repeat_and_cargo_jobs() {
+        let parsed = parse_direct_bench_args(&[
+            "--items-per-producer=1000".to_string(),
+            "--cargo-jobs".to_string(),
+            "3".to_string(),
+            "--runs=2".to_string(),
+            "--only-ubq".to_string(),
+        ])
+        .expect("parsed args");
+        assert_eq!(
+            parsed,
+            DirectBenchArgs {
+                cargo_jobs: Some(3),
+                repeat_count: 2,
+                harness_args: vec![
+                    "--items-per-producer=1000".to_string(),
+                    "--only-ubq".to_string()
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_direct_bench_args_rejects_protected_options() {
+        let err = parse_direct_bench_args(&["--scenarios=1p1c".to_string()]).unwrap_err();
+        assert!(err.contains("--scenarios"));
     }
 
     #[test]
