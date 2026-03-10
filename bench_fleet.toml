@@ -1,0 +1,44 @@
+[defaults]
+runs_dir = "bench_results/runs"
+plot_out_dir = "bench_results/plots"
+remote_repo_dir = "~/UBQ"
+remote_runs_dir = "bench_results/runs"
+scenarios = [
+  "1p1c",
+  "4p1c",
+  "1p4c",
+  "4p4c",
+  "8p1c",
+  "8p4c",
+  "8p8c",
+  "1p8c",
+  "4p8c",
+  "16p1c",
+  "1p16c",
+  "8p16c",
+  "16p8c",
+  "16p16c",
+  "32p1c",
+  "1p32c",
+  "16p32c",
+  "32p16c",
+  "32p32c",
+  "64p1c",
+  "1p64c",
+  "32p64c",
+  "64p32c",
+  "64p64c",
+]
+seed_label = "v4,8,127"
+
+[machines.local]
+local = true
+machine_label = "local"
+
+[machines.lab]
+host = "lab"
+machine_label = "lab"
+
+[machines.hebrides]
+host = "hebrides"
+machine_label = "hebrides"
