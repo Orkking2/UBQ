@@ -10,45 +10,13 @@ use std::{
     usize,
 };
 
-use crate::{BLOCK_LENGTH, UBQ};
-
-impl<T> Debug for UBQ<T> {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Ok(())
-        // let p = self.p.load(Ordering::Acquire);
-
-        // if p.is_null() {
-        //     return writeln!(f, "UBQ {{}}");
-        // }
-
-        // let mut s = String::new();
-        // let mut c = p;
-
-        // let fmt = |u: R| -> String {
-        //     if u == R::MAX {
-        //         format!("full:full")
-        //     } else {
-        //         format!("{:04}:{:04}", high(u), low(u))
-        //     }
-        // };
-
-        // loop {
-        //     let p_ = unsafe { *(*c).p.as_ptr() };
-        //     let c_ = unsafe { *(*c).c.as_ptr() };
-
-        //     write!(s, "\t{c:p}: p={}, c={}", fmt(p_), fmt(c_))?;
-
-        //     c = unsafe { *(*c).n.as_ptr() };
-        //     if c == p {
-        //         break;
-        //     }
-
-        //     write!(s, "\n")?;
-        // }
-
-        // write!(f, "UBQ {{\n{s}\t}}")
-    }
-}
+use crate::{
+    BLOCK_LENGTH, ConfiguredUBQ, UBQ, align, backoff, ubq,
+    variant::{
+        AggressivePrepare, Balanced, ConsumerPoolOnly, NoPool, PoolConservative, PrepareMode,
+        Variant,
+    },
+};
 
 #[test]
 fn drop_releases_all_enqueued_values() {
@@ -172,6 +140,113 @@ fn mpmc() {
     }
 
     println!("{:?}", epoch.elapsed());
+}
+
+#[test]
+fn variant_presets_match_legacy_feature_semantics() {
+    assert_eq!(
+        AggressivePrepare::PREPARE_MODE,
+        PrepareMode::BoundaryOrPoolHasVacancy
+    );
+    assert_eq!(AggressivePrepare::RECYCLE_PRODUCER_SPARE, true);
+    assert_eq!(AggressivePrepare::RECYCLE_CONSUMED, true);
+
+    assert_eq!(
+        Balanced::PREPARE_MODE,
+        PrepareMode::BoundaryIfPoolHasVacancy
+    );
+    assert_eq!(Balanced::RECYCLE_PRODUCER_SPARE, true);
+    assert_eq!(Balanced::RECYCLE_CONSUMED, true);
+
+    assert_eq!(
+        PoolConservative::PREPARE_MODE,
+        PrepareMode::BoundaryIfPoolEmpty
+    );
+    assert_eq!(PoolConservative::RECYCLE_PRODUCER_SPARE, true);
+    assert_eq!(PoolConservative::RECYCLE_CONSUMED, true);
+
+    assert_eq!(NoPool::PREPARE_MODE, PrepareMode::BoundaryOnly);
+    assert_eq!(NoPool::RECYCLE_PRODUCER_SPARE, false);
+    assert_eq!(NoPool::RECYCLE_CONSUMED, false);
+
+    assert_eq!(
+        ConsumerPoolOnly::PREPARE_MODE,
+        PrepareMode::BoundaryIfPoolEmpty
+    );
+    assert_eq!(ConsumerPoolOnly::RECYCLE_PRODUCER_SPARE, false);
+    assert_eq!(ConsumerPoolOnly::RECYCLE_CONSUMED, true);
+}
+
+#[test]
+fn configured_queue_supports_non_default_pool_and_preset_block() {
+    let q = ConfiguredUBQ::<u64, Balanced, backoff::Crossbeam, 8, 127, align::A256>::new();
+
+    for i in 0..10_000 {
+        q.push(i);
+    }
+
+    for i in 0..10_000 {
+        assert_eq!(q.pop(), Some(i));
+    }
+
+    assert_eq!(q.pop(), None);
+}
+
+#[test]
+fn configured_queue_supports_arbitrary_block_with_explicit_alignment() {
+    #[repr(align(1024))]
+    #[derive(Clone, Copy, Debug, Default)]
+    struct A1024;
+
+    let q = ConfiguredUBQ::<u64, Balanced, backoff::Crossbeam, 2, 100, A1024>::new();
+
+    for i in 0..2_000 {
+        q.push(i);
+    }
+
+    for i in 0..2_000 {
+        assert_eq!(q.pop(), Some(i));
+    }
+
+    assert_eq!(q.pop(), None);
+}
+
+#[test]
+fn ubq_macro_defaults_to_public_alias() {
+    let q: ConfiguredUBQ<u64> = ubq!(type: u64);
+    q.push(9);
+    assert_eq!(q.pop(), Some(9));
+}
+
+#[test]
+fn ubq_macro_applies_explicit_overrides() {
+    let q: ConfiguredUBQ<u64, PoolConservative, backoff::Yield, 2, 127, align::A256> = ubq!(
+        type: u64,
+        variant: PoolConservative,
+        backoff: backoff::Yield,
+        pool: 2,
+        block: 127,
+    );
+
+    q.push(11);
+    assert_eq!(q.pop(), Some(11));
+}
+
+#[test]
+fn ubq_macro_supports_custom_alignment_override() {
+    #[repr(align(1024))]
+    #[derive(Clone, Copy, Debug, Default)]
+    struct A1024;
+
+    let q: ConfiguredUBQ<u64, Balanced, backoff::Crossbeam, 4, 100, A1024> = ubq!(
+        type: u64,
+        pool: 4,
+        block: 100,
+        align: A1024,
+    );
+
+    q.push(13);
+    assert_eq!(q.pop(), Some(13));
 }
 
 // Seg: 2.12s

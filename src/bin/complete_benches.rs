@@ -128,7 +128,7 @@ fn print_usage_and_exit(code: i32) -> ! {
            --runs-dir DIR            (default: bench_results/runs)\n\
            --scenarios CSV           (default: complete scenario list)\n\
            --mode MODE               (default: throughput)\n\
-           --seed-label LABEL        (default: v4,8,127)\n\
+           --seed-label LABEL        (default: balanced,8,127,crossbeam)\n\
            --allow-incomplete        (default: false)\n\
            --bench-arg ARG           (repeatable; supports --cargo-jobs, --n/--runs,\n\
                                       and bench-harness args like --items-per-producer)\n\
@@ -217,7 +217,7 @@ fn parse_args() -> Result<CompleteArgs, String> {
     let mut runs_dir = PathBuf::from("bench_results/runs");
     let mut scenarios_override: Option<String> = None;
     let mut mode = "throughput".to_string();
-    let mut seed_label = Some("v4,8,127".to_string());
+    let mut seed_label = Some("balanced,8,127,crossbeam".to_string());
     let mut allow_incomplete = false;
     let mut bench_args: Vec<String> = Vec::new();
     let mut dry_run = false;
@@ -437,7 +437,6 @@ fn build_bench_cmds(
 
     for label in labels {
         let parsed = parse_ubq_label(label, true)?;
-        let feature_csv = parsed.feature_csv();
         let safe_label = parsed.safe();
 
         for repeat_idx in 1..=args.bench.repeat_count {
@@ -450,8 +449,6 @@ fn build_bench_cmds(
             cmd.extend([
                 "--bench".to_string(),
                 "ubq_bench".to_string(),
-                "--features".to_string(),
-                feature_csv.clone(),
                 "--".to_string(),
                 "--ubq-label".to_string(),
                 label.clone(),
@@ -838,62 +835,67 @@ mod tests {
     fn scenario_round_complete() {
         let mut entries = BTreeMap::new();
         entries.insert(
-            "ubq_v4,1,1023".to_string(),
+            "ubq_balanced,1,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 120.0,
             },
         );
         entries.insert(
-            "ubq_v3,1,1023".to_string(),
+            "ubq_aggressive_prepare,1,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 110.0,
             },
         );
         entries.insert(
-            "ubq_v5,1,1023".to_string(),
+            "ubq_pool_conservative,1,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 109.0,
             },
         );
         entries.insert(
-            "ubq_v7,1,1023".to_string(),
+            "ubq_consumer_pool_only,1,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 108.0,
             },
         );
         entries.insert(
-            "ubq_v6,0,1023".to_string(),
+            "ubq_no_pool,0,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 107.0,
             },
         );
         entries.insert(
-            "ubq_v4,2,1023".to_string(),
+            "ubq_balanced,2,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 106.0,
             },
         );
         entries.insert(
-            "ubq_v4,1,511".to_string(),
+            "ubq_balanced,1,511,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 105.0,
             },
         );
         entries.insert(
-            "ubq_v4,1,2047".to_string(),
+            "ubq_balanced,1,2047,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 104.0,
             },
         );
         entries.insert(
-            "ubq_v4,1,1023,b".to_string(),
+            "ubq_balanced,1,1023,yield".to_string(),
             Stats {
                 mean_ops_per_sec: 103.0,
             },
         );
         let grouped = grouped_with_entries("local", "1p1c", entries);
-        let plan =
-            evaluate_scenario_round("local", "1p1c", "throughput", &grouped, Some("v4,8,127"));
+        let plan = evaluate_scenario_round(
+            "local",
+            "1p1c",
+            "throughput",
+            &grouped,
+            Some("balanced,8,127,crossbeam"),
+        );
         assert!(plan.complete);
         assert!(plan.plan_labels.is_empty());
     }
@@ -912,10 +914,18 @@ mod tests {
     fn scenario_round_uses_seed_when_no_winner() {
         let grouped: BTreeMap<String, BTreeMap<String, BTreeMap<String, BTreeMap<String, Stats>>>> =
             BTreeMap::new();
-        let plan =
-            evaluate_scenario_round("local", "1p1c", "throughput", &grouped, Some("v4,8,127"));
+        let plan = evaluate_scenario_round(
+            "local",
+            "1p1c",
+            "throughput",
+            &grouped,
+            Some("balanced,8,127,crossbeam"),
+        );
         assert!(!plan.complete);
-        assert_eq!(plan.plan_labels, vec!["v4,8,127".to_string()]);
+        assert_eq!(
+            plan.plan_labels,
+            vec!["balanced,8,127,crossbeam".to_string()]
+        );
     }
 
     #[test]
@@ -925,7 +935,7 @@ mod tests {
             runs_dir: PathBuf::from("bench_results/runs"),
             scenarios: vec!["1p1c".to_string()],
             mode: "throughput".to_string(),
-            seed_label: Some("v4,8,127".to_string()),
+            seed_label: Some("balanced,8,127,crossbeam".to_string()),
             allow_incomplete: true,
             bench: DirectBenchArgs {
                 cargo_jobs: Some(2),
@@ -935,7 +945,8 @@ mod tests {
             dry_run: true,
         };
         let commands =
-            build_bench_cmds(&args, "1p1c", 3, &["v4,8,127".to_string()]).expect("commands");
+            build_bench_cmds(&args, "1p1c", 3, &["balanced,8,127,crossbeam".to_string()])
+                .expect("commands");
         assert_eq!(commands.len(), 1);
         let cmd = &commands[0].cmd;
         assert_eq!(cmd[0], "cargo");
@@ -943,6 +954,7 @@ mod tests {
         assert!(cmd.contains(&"-j".to_string()));
         assert!(cmd.contains(&"--bench".to_string()));
         assert!(cmd.contains(&"ubq_bench".to_string()));
+        assert!(!cmd.contains(&"--features".to_string()));
         assert!(cmd.contains(&"--machine-label".to_string()));
         assert!(cmd.contains(&"lab".to_string()));
         assert!(cmd.contains(&"--throughput-only".to_string()));
@@ -950,7 +962,7 @@ mod tests {
         assert!(
             commands[0]
                 .out_path
-                .starts_with(Path::new("bench_results/runs/lab/v4_8_127"))
+                .starts_with(Path::new("bench_results/runs/lab/balanced_8_127_crossbeam"))
         );
         assert_eq!(
             commands[0].out_path.extension().and_then(|v| v.to_str()),
@@ -990,12 +1002,12 @@ mod tests {
     #[test]
     fn detects_no_progress_from_missing_key() {
         assert!(has_no_progress(
-            Some("ubq_v4,8,127|v4,4,127"),
-            Some("ubq_v4,8,127|v4,4,127")
+            Some("ubq_balanced,8,127,crossbeam|balanced,4,127,crossbeam"),
+            Some("ubq_balanced,8,127,crossbeam|balanced,4,127,crossbeam")
         ));
         assert!(!has_no_progress(
-            Some("ubq_v4,8,127|v4,4,127"),
-            Some("ubq_v4,8,127|v4,16,127")
+            Some("ubq_balanced,8,127,crossbeam|balanced,4,127,crossbeam"),
+            Some("ubq_balanced,8,127,crossbeam|balanced,16,127,crossbeam")
         ));
         assert!(!has_no_progress(None, Some("x")));
         assert!(!has_no_progress(Some("x"), None));

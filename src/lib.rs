@@ -3,7 +3,8 @@
 //!
 //! # Overview
 //!
-//! [`UBQ<T>`] is a **lock-free MPMC queue** with no upper bound on capacity.
+//! [`UBQ<T>`] is the default **lock-free MPMC queue** with no upper bound on
+//! capacity.
 //!
 //! [`UBQ<T>`] itself is not clonable. To share it across threads, wrap it in
 //! [`Arc<UBQ<T>>`](std::sync::Arc), then clone the `Arc`.
@@ -49,13 +50,232 @@
 
 #![warn(missing_docs)]
 
-#[cfg(feature = "ubq_backoff_cq")]
-pub(crate) mod backoff;
+pub mod align;
+pub mod backoff;
 pub(crate) mod block;
 pub(crate) mod queue;
+pub mod variant;
 
 #[cfg(test)]
 mod tests;
 
 pub use block::BLOCK_LENGTH;
-pub use queue::UBQ;
+pub use queue::{ConfiguredUBQ, DEFAULT_POOL_SIZE};
+
+/// Default queue type alias that preserves the crate's legacy no-feature
+/// configuration.
+pub type UBQ<T> = ConfiguredUBQ<T>;
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ubq_align_for_block {
+    (31) => {
+        $crate::align::A64
+    };
+    (63) => {
+        $crate::align::A128
+    };
+    (127) => {
+        $crate::align::A256
+    };
+    (255) => {
+        $crate::align::A512
+    };
+    (511) => {
+        $crate::align::A1024
+    };
+    (1023) => {
+        $crate::align::A2048
+    };
+    (2047) => {
+        $crate::align::A4096
+    };
+    (4095) => {
+        $crate::align::A8192
+    };
+    ($other:expr) => {
+        compile_error!(
+            "ubq! requires an explicit `align:` when `block:` is not one of 31, 63, 127, 255, 511, 1023, 2047, or 4095"
+        )
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ubq_internal {
+    (
+        @parse
+        type = $ty:ty,
+        variant = $variant:path,
+        backoff = $backoff:path,
+        pool = $pool:tt,
+        block = $block:tt,
+        align = [];
+        $(,)?
+    ) => {
+        $crate::ConfiguredUBQ::<
+            $ty,
+            $variant,
+            $backoff,
+            { $pool },
+            { $block },
+            $crate::__ubq_align_for_block!($block)
+        >::new()
+    };
+    (
+        @parse
+        type = $ty:ty,
+        variant = $variant:path,
+        backoff = $backoff:path,
+        pool = $pool:tt,
+        block = $block:tt,
+        align = [$align:path];
+        $(,)?
+    ) => {
+        $crate::ConfiguredUBQ::<$ty, $variant, $backoff, { $pool }, { $block }, $align>::new()
+    };
+    (
+        @parse
+        type = $ty:ty,
+        variant = $variant:path,
+        backoff = $backoff:path,
+        pool = $pool:tt,
+        block = $block:tt,
+        align = [$($align:tt)*];
+        variant: $new_variant:path $(, $($rest:tt)*)?
+    ) => {
+        $crate::__ubq_internal!(
+            @parse
+            type = $ty,
+            variant = $new_variant,
+            backoff = $backoff,
+            pool = $pool,
+            block = $block,
+            align = [$($align)*];
+            $($($rest)*)?
+        )
+    };
+    (
+        @parse
+        type = $ty:ty,
+        variant = $variant:path,
+        backoff = $backoff:path,
+        pool = $pool:tt,
+        block = $block:tt,
+        align = [$($align:tt)*];
+        backoff: $new_backoff:path $(, $($rest:tt)*)?
+    ) => {
+        $crate::__ubq_internal!(
+            @parse
+            type = $ty,
+            variant = $variant,
+            backoff = $new_backoff,
+            pool = $pool,
+            block = $block,
+            align = [$($align)*];
+            $($($rest)*)?
+        )
+    };
+    (
+        @parse
+        type = $ty:ty,
+        variant = $variant:path,
+        backoff = $backoff:path,
+        pool = $pool:tt,
+        block = $block:tt,
+        align = [$($align:tt)*];
+        pool: $new_pool:tt $(, $($rest:tt)*)?
+    ) => {
+        $crate::__ubq_internal!(
+            @parse
+            type = $ty,
+            variant = $variant,
+            backoff = $backoff,
+            pool = $new_pool,
+            block = $block,
+            align = [$($align)*];
+            $($($rest)*)?
+        )
+    };
+    (
+        @parse
+        type = $ty:ty,
+        variant = $variant:path,
+        backoff = $backoff:path,
+        pool = $pool:tt,
+        block = $block:tt,
+        align = [$($align:tt)*];
+        block: $new_block:tt $(, $($rest:tt)*)?
+    ) => {
+        $crate::__ubq_internal!(
+            @parse
+            type = $ty,
+            variant = $variant,
+            backoff = $backoff,
+            pool = $pool,
+            block = $new_block,
+            align = [$($align)*];
+            $($($rest)*)?
+        )
+    };
+    (
+        @parse
+        type = $ty:ty,
+        variant = $variant:path,
+        backoff = $backoff:path,
+        pool = $pool:tt,
+        block = $block:tt,
+        align = [$($align:tt)*];
+        align: $new_align:path $(, $($rest:tt)*)?
+    ) => {
+        $crate::__ubq_internal!(
+            @parse
+            type = $ty,
+            variant = $variant,
+            backoff = $backoff,
+            pool = $pool,
+            block = $block,
+            align = [$new_align];
+            $($($rest)*)?
+        )
+    };
+    (
+        @parse
+        type = $ty:ty,
+        variant = $variant:path,
+        backoff = $backoff:path,
+        pool = $pool:tt,
+        block = $block:tt,
+        align = [$($align:tt)*];
+        $unknown:ident : $value:tt $(, $($rest:tt)*)?
+    ) => {
+        compile_error!(concat!("unsupported ubq! option `", stringify!($unknown), "`"));
+    };
+}
+
+/// Creates a [`ConfiguredUBQ`] with compile-time-selected defaults and policies.
+///
+/// Built-in block lengths `31`, `63`, `127`, `255`, `511`, `1023`, `2047`, and
+/// `4095` automatically select the matching alignment marker. Other block
+/// lengths require an explicit `align:` marker.
+///
+/// ```rust
+/// let q = ubq::ubq!(type: u64, pool: 2, block: 127);
+/// q.push(7);
+/// assert_eq!(q.pop(), Some(7));
+/// ```
+#[macro_export]
+macro_rules! ubq {
+    (type: $ty:ty $(, $($rest:tt)*)?) => {
+        $crate::__ubq_internal!(
+            @parse
+            type = $ty,
+            variant = $crate::variant::Balanced,
+            backoff = $crate::backoff::Crossbeam,
+            pool = 1,
+            block = 2047,
+            align = [];
+            $($($rest)*)?
+        )
+    };
+}

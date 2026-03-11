@@ -1,14 +1,13 @@
-#[cfg(feature = "ubq_backoff_cq")]
-use crate::backoff::Backoff;
 use crate::{
-    BLOCK_LENGTH,
-    block::{BLOCK_MASK, Block, WRITE},
+    align::A4096,
+    backoff::{BackoffPolicy, Crossbeam},
+    block::{Block, DEFAULT_BLOCK_LENGTH, WRITE},
+    variant::{Balanced, PrepareMode, Variant},
 };
-#[cfg(not(feature = "ubq_backoff_cq"))]
-use crossbeam_utils::Backoff;
 use crossbeam_utils::CachePadded;
 use std::{
-    array,
+    array, fmt,
+    marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::DerefMut,
     ptr::null_mut,
@@ -18,115 +17,84 @@ use std::{
     },
 };
 
-#[cfg(any(
-    all(feature = "ubq_v3", feature = "ubq_v4"),
-    all(feature = "ubq_v3", feature = "ubq_v5"),
-    all(feature = "ubq_v3", feature = "ubq_v6"),
-    all(feature = "ubq_v3", feature = "ubq_v7"),
-    all(feature = "ubq_v4", feature = "ubq_v5"),
-    all(feature = "ubq_v4", feature = "ubq_v6"),
-    all(feature = "ubq_v4", feature = "ubq_v7"),
-    all(feature = "ubq_v5", feature = "ubq_v6"),
-    all(feature = "ubq_v5", feature = "ubq_v7"),
-    all(feature = "ubq_v6", feature = "ubq_v7"),
-))]
-compile_error!("Select at most one UBQ version feature: ubq_v3, ubq_v4, ubq_v5, ubq_v6, ubq_v7");
-
-#[cfg(any(
-    all(feature = "ubq_pool_1", feature = "ubq_pool_2"),
-    all(feature = "ubq_pool_1", feature = "ubq_pool_4"),
-    all(feature = "ubq_pool_1", feature = "ubq_pool_8"),
-    all(feature = "ubq_pool_1", feature = "ubq_pool_16"),
-    all(feature = "ubq_pool_1", feature = "ubq_pool_32"),
-    all(feature = "ubq_pool_1", feature = "ubq_pool_64"),
-    all(feature = "ubq_pool_2", feature = "ubq_pool_4"),
-    all(feature = "ubq_pool_2", feature = "ubq_pool_8"),
-    all(feature = "ubq_pool_2", feature = "ubq_pool_16"),
-    all(feature = "ubq_pool_2", feature = "ubq_pool_32"),
-    all(feature = "ubq_pool_2", feature = "ubq_pool_64"),
-    all(feature = "ubq_pool_4", feature = "ubq_pool_8"),
-    all(feature = "ubq_pool_4", feature = "ubq_pool_16"),
-    all(feature = "ubq_pool_4", feature = "ubq_pool_32"),
-    all(feature = "ubq_pool_4", feature = "ubq_pool_64"),
-    all(feature = "ubq_pool_8", feature = "ubq_pool_16"),
-    all(feature = "ubq_pool_8", feature = "ubq_pool_32"),
-    all(feature = "ubq_pool_8", feature = "ubq_pool_64"),
-    all(feature = "ubq_pool_16", feature = "ubq_pool_32"),
-    all(feature = "ubq_pool_16", feature = "ubq_pool_64"),
-    all(feature = "ubq_pool_32", feature = "ubq_pool_64"),
-))]
-compile_error!(
-    "Select at most one UBQ pool feature: ubq_pool_1, ubq_pool_2, ubq_pool_4, ubq_pool_8, ubq_pool_16, ubq_pool_32, ubq_pool_64"
-);
-
-#[cfg(all(
-    feature = "ubq_v6",
-    any(
-        feature = "ubq_pool_1",
-        feature = "ubq_pool_2",
-        feature = "ubq_pool_4",
-        feature = "ubq_pool_8",
-        feature = "ubq_pool_16",
-        feature = "ubq_pool_32",
-        feature = "ubq_pool_64"
-    )
-))]
-compile_error!("ubq_v6 is no-pool and cannot be combined with ubq_pool_* features");
-
-const POOL_SIZE: usize = if cfg!(feature = "ubq_v6") {
-    0
-} else if cfg!(feature = "ubq_pool_64") {
-    64
-} else if cfg!(feature = "ubq_pool_32") {
-    32
-} else if cfg!(feature = "ubq_pool_16") {
-    16
-} else if cfg!(feature = "ubq_pool_8") {
-    8
-} else if cfg!(feature = "ubq_pool_4") {
-    4
-} else if cfg!(feature = "ubq_pool_2") {
-    2
-} else {
-    1
-};
+/// Default number of pooled blocks retained by [`crate::UBQ`].
+pub const DEFAULT_POOL_SIZE: usize = 1;
 
 /// A lock-free, unbounded multi-producer/multi-consumer (MPMC) queue.
 ///
-/// See the [crate-level documentation](crate) for an overview and quick-start
-/// example. `UBQ<T>` itself is not clonable; share it with
-/// [`Arc<UBQ<T>>`](std::sync::Arc).
-pub struct UBQ<T> {
+/// `ConfiguredUBQ` is the fully-configurable queue type. The crate-level
+/// [`crate::UBQ`] alias preserves the default configuration.
+///
+/// ```rust
+/// use ubq::{ConfiguredUBQ, align, backoff, variant};
+///
+/// let q = ConfiguredUBQ::<u64, variant::Balanced, backoff::Crossbeam, 2, 127, align::A256>::new();
+/// q.push(42);
+/// assert_eq!(q.pop(), Some(42));
+/// ```
+///
+/// ```compile_fail
+/// use ubq::{ConfiguredUBQ, align, backoff, variant};
+///
+/// let _ = ConfiguredUBQ::<u64, variant::Balanced, backoff::Crossbeam, 1, 1024, align::A512>::new();
+/// ```
+///
+/// ```compile_fail
+/// use ubq::{ConfiguredUBQ, backoff, variant};
+///
+/// #[repr(align(64))]
+/// struct BadAlign([u8; 8]);
+///
+/// let _ = ConfiguredUBQ::<u64, variant::Balanced, backoff::Crossbeam, 1, 31, BadAlign>::new();
+/// ```
+pub struct ConfiguredUBQ<
+    T,
+    V = Balanced,
+    B = Crossbeam,
+    const POOL: usize = DEFAULT_POOL_SIZE,
+    const BLOCK: usize = DEFAULT_BLOCK_LENGTH,
+    A = A4096,
+> {
     /// Atomic pointer to phead: the block currently accepting producer pushes.
     phead: CachePadded<AtomicUsize>,
     /// Atomic pointer to chead: the block currently being drained by consumers.
     chead: CachePadded<AtomicUsize>,
-    /// When popping, we can reuse a block instead of freeing them always.
-    pool: [CachePadded<AtomicPtr<Block<T>>>; POOL_SIZE],
+    /// Recycled blocks used to avoid repeated allocations.
+    pool: [CachePadded<AtomicPtr<Block<T, BLOCK, A>>>; POOL],
+
+    _variant: PhantomData<V>,
+    _backoff: PhantomData<B>,
 }
 
-const MASK: usize = BLOCK_MASK;
-
-struct Head<T> {
-    block: *mut Block<T>,
+struct Head<T, const BLOCK: usize, A> {
+    block: *mut Block<T, BLOCK, A>,
     index: usize,
 }
 
-impl<T> Copy for Head<T> {}
-impl<T> Clone for Head<T> {
+#[inline]
+fn drop_spare_block<T, const BLOCK: usize, A>(block: *mut Block<T, BLOCK, A>) {
+    let _ = unsafe { Box::from_raw(block.cast::<ManuallyDrop<Block<T, BLOCK, A>>>()) };
+}
+
+impl<T, const BLOCK: usize, A> Copy for Head<T, BLOCK, A> {}
+
+impl<T, const BLOCK: usize, A> Clone for Head<T, BLOCK, A> {
     fn clone(&self) -> Self {
-        Self {
-            block: self.block.clone(),
-            index: self.index.clone(),
-        }
+        *self
     }
 }
 
-impl<T> Head<T> {
+impl<T, const BLOCK: usize, A> Head<T, BLOCK, A> {
+    #[inline]
+    fn mask() -> usize {
+        Block::<T, BLOCK, A>::block_mask()
+    }
+
     fn new(u: usize) -> Self {
+        let mask = Self::mask();
         Self {
-            block: (u & !MASK) as *mut Block<T>,
-            index: u & MASK,
+            block: (u & !mask) as *mut Block<T, BLOCK, A>,
+            index: u & mask,
         }
     }
 
@@ -141,122 +109,99 @@ impl<T> Head<T> {
 
 // SAFETY: Slot ownership is assigned with atomic counters, and producer/consumer
 // commits are synchronized with Release/Acquire ordering before cross-thread reads.
-unsafe impl<T: Sync> Sync for UBQ<T> {}
-unsafe impl<T: Send> Send for UBQ<T> {}
+unsafe impl<T: Sync, V, B, A: Sync, const POOL: usize, const BLOCK: usize> Sync
+    for ConfiguredUBQ<T, V, B, POOL, BLOCK, A>
+{
+}
+unsafe impl<T: Send, V, B, A: Send, const POOL: usize, const BLOCK: usize> Send
+    for ConfiguredUBQ<T, V, B, POOL, BLOCK, A>
+{
+}
 
-impl<T> UBQ<T> {
+impl<T, V, B, const POOL: usize, const BLOCK: usize, A> fmt::Debug
+    for ConfiguredUBQ<T, V, B, POOL, BLOCK, A>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("ConfiguredUBQ { .. }")
+    }
+}
+
+impl<T, V, B, const POOL: usize, const BLOCK: usize, A> ConfiguredUBQ<T, V, B, POOL, BLOCK, A>
+where
+    V: Variant,
+    B: BackoffPolicy,
+{
+    const LAYOUT_CHECKS: () = Block::<T, BLOCK, A>::LAYOUT_CHECKS;
+
+    /// Number of retained pooled blocks.
+    pub const POOL_SIZE: usize = POOL;
+    /// Number of slots in each block for this queue type.
+    pub const BLOCK_LENGTH: usize = BLOCK;
+
+    #[inline]
+    fn pool_has_vacancy(&self) -> bool {
+        self.pool
+            .iter()
+            .any(|b| b.load(Ordering::Relaxed).is_null())
+    }
+
+    #[inline]
+    fn pool_is_empty(&self) -> bool {
+        self.pool
+            .iter()
+            .all(|b| b.load(Ordering::Relaxed).is_null())
+    }
+
     #[inline]
     fn should_prepare_next_block(&self, next_index: usize) -> bool {
-        #[cfg(feature = "ubq_v3")]
-        {
-            return next_index == BLOCK_LENGTH
-                || self
-                    .pool
-                    .iter()
-                    .any(|b| b.load(Ordering::Relaxed).is_null());
-        }
-        #[cfg(feature = "ubq_v5")]
-        {
-            return next_index == BLOCK_LENGTH
-                && self
-                    .pool
-                    .iter()
-                    .all(|b| b.load(Ordering::Relaxed).is_null());
-        }
-        #[cfg(feature = "ubq_v6")]
-        {
-            return next_index == BLOCK_LENGTH;
-        }
-        #[cfg(feature = "ubq_v7")]
-        {
-            return next_index == BLOCK_LENGTH
-                && self
-                    .pool
-                    .iter()
-                    .all(|b| b.load(Ordering::Relaxed).is_null());
-        }
-        #[cfg(any(
-            feature = "ubq_v4",
-            all(
-                not(feature = "ubq_v3"),
-                not(feature = "ubq_v5"),
-                not(feature = "ubq_v6"),
-                not(feature = "ubq_v7")
-            )
-        ))]
-        {
-            return next_index == BLOCK_LENGTH
-                && self
-                    .pool
-                    .iter()
-                    .any(|b| b.load(Ordering::Relaxed).is_null());
+        let () = Self::LAYOUT_CHECKS;
+
+        match V::PREPARE_MODE {
+            PrepareMode::BoundaryOnly => next_index == BLOCK,
+            PrepareMode::BoundaryIfPoolHasVacancy => next_index == BLOCK && self.pool_has_vacancy(),
+            PrepareMode::BoundaryIfPoolEmpty => next_index == BLOCK && self.pool_is_empty(),
+            PrepareMode::BoundaryOrPoolHasVacancy => next_index == BLOCK || self.pool_has_vacancy(),
         }
     }
 
     #[inline]
-    fn take_pooled_block(&self) -> Option<*mut Block<T>> {
-        #[cfg(feature = "ubq_v6")]
-        {
-            None
-        }
-        #[cfg(not(feature = "ubq_v6"))]
-        {
-            self.pool.iter().find_map(|slot| {
-                let pooled = slot.swap(null_mut(), Ordering::AcqRel);
-                (!pooled.is_null()).then_some(pooled)
-            })
-        }
+    fn try_store_pooled_block(&self, block: *mut Block<T, BLOCK, A>) -> bool {
+        self.pool.iter().any(|slot| {
+            slot.compare_exchange(null_mut(), block, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+        })
     }
 
     #[inline]
-    fn release_producer_spare_block(&self, block: Box<Block<T>>) {
-        #[cfg(any(feature = "ubq_v6", feature = "ubq_v7"))]
-        {
-            let ptr = Box::into_raw(block);
-            let _ = unsafe { Box::from_raw(ptr.cast::<ManuallyDrop<Block<T>>>()) };
+    fn take_pooled_block(&self) -> Option<*mut Block<T, BLOCK, A>> {
+        if !(V::RECYCLE_PRODUCER_SPARE || V::RECYCLE_CONSUMED) {
+            return None;
+        }
+
+        self.pool.iter().find_map(|slot| {
+            let pooled = slot.swap(null_mut(), Ordering::AcqRel);
+            (!pooled.is_null()).then_some(pooled)
+        })
+    }
+
+    #[inline]
+    fn release_producer_spare_block(&self, block: Box<Block<T, BLOCK, A>>) {
+        let new = Box::into_raw(block);
+
+        if V::RECYCLE_PRODUCER_SPARE && self.try_store_pooled_block(new) {
             return;
         }
-        #[cfg(not(any(feature = "ubq_v6", feature = "ubq_v7")))]
-        {
-            let new = Box::into_raw(block);
 
-            if self
-                .pool
-                .iter()
-                .filter_map(|slot| {
-                    slot.compare_exchange(null_mut(), new, Ordering::Release, Ordering::Relaxed)
-                        .ok()
-                })
-                .next()
-                .is_none()
-            {
-                let _ = unsafe { Box::from_raw(new.cast::<ManuallyDrop<Block<T>>>()) };
-            }
-        }
+        drop_spare_block(new);
     }
 
     #[inline]
-    fn release_consumed_block(&self, block: *mut Block<T>) {
-        #[cfg(feature = "ubq_v6")]
-        {
-            let _ = unsafe { Box::from_raw(block.cast::<ManuallyDrop<Block<T>>>()) };
+    fn release_consumed_block(&self, block: *mut Block<T, BLOCK, A>) {
+        if V::RECYCLE_CONSUMED && self.try_store_pooled_block(block) {
             return;
         }
-        #[cfg(not(feature = "ubq_v6"))]
-        {
-            if self
-                .pool
-                .iter()
-                .filter_map(|slot| {
-                    slot.compare_exchange(null_mut(), block, Ordering::Release, Ordering::Relaxed)
-                        .ok()
-                })
-                .next()
-                .is_none()
-            {
-                let _ = unsafe { Box::from_raw(block.cast::<ManuallyDrop<Block<T>>>()) };
-            }
-        }
+
+        drop_spare_block(block);
     }
 
     /// Creates a new, empty queue.
@@ -264,45 +209,56 @@ impl<T> UBQ<T> {
     /// No blocks are allocated until the first call to [`push`](Self::push).
     #[inline]
     pub fn new() -> Self {
+        let () = Self::LAYOUT_CHECKS;
+
         Self {
             phead: CachePadded::new(AtomicUsize::new(0)),
             chead: CachePadded::new(AtomicUsize::new(0)),
             pool: array::from_fn(|_| CachePadded::new(AtomicPtr::new(null_mut()))),
+            
+            _variant: PhantomData,
+            _backoff: PhantomData,
         }
     }
 
     /// Creates a new queue, like [`new`](Self::new), but using [`Arc::new_zeroed`].
     pub fn new_arc() -> Arc<Self> {
+        let () = Self::LAYOUT_CHECKS;
         unsafe { Arc::new_zeroed().assume_init() }
     }
 
     /// Returns `true` if this UBQ contains no values.
     pub fn is_empty(&self) -> bool {
+        let () = Self::LAYOUT_CHECKS;
+
         let chead = self.chead.load(Ordering::Acquire);
         if chead == 0 {
             return true;
         }
 
         let phead = self.phead.load(Ordering::Acquire);
+        let mask = Head::<T, BLOCK, A>::mask();
 
-        if (chead & !MASK) != (phead & !MASK) {
+        if (chead & !mask) != (phead & !mask) {
             return false;
         }
 
-        ((chead & MASK) >> 1) >= (phead & MASK)
+        ((chead & mask) >> 1) >= (phead & mask)
     }
 
     /// Pushes `e` onto the back of the queue.
     #[doc(alias = "enqueue")]
     #[doc(alias = "send")]
     pub fn push(&self, e: T) {
-        let backoff = Backoff::new();
+        let () = Self::LAYOUT_CHECKS;
+
+        let backoff = B::new();
         let mut phead = Head::new(0);
         let mut next_block = None;
 
         // This is the only time the ptr part of phead is invalid.
         if self.phead.load(Ordering::Acquire) == 0 {
-            let ptr = Box::into_raw(Block::new_zeroed());
+            let ptr = Box::into_raw(Block::<T, BLOCK, A>::new_zeroed());
 
             match self.phead.compare_exchange(
                 0,
@@ -325,7 +281,7 @@ impl<T> UBQ<T> {
             phead = Head::new(self.phead.load(Ordering::Acquire));
 
             loop {
-                if phead.index == BLOCK_LENGTH {
+                if phead.index >= BLOCK {
                     backoff.snooze();
 
                     phead = Head::new(self.phead.load(Ordering::Acquire));
@@ -338,7 +294,7 @@ impl<T> UBQ<T> {
                 };
 
                 if next_block.is_none() && self.should_prepare_next_block(new_phead.index) {
-                    next_block = Some(Block::new_zeroed());
+                    next_block = Some(Block::<T, BLOCK, A>::new_zeroed());
                 }
 
                 match self.phead.compare_exchange_weak(
@@ -355,13 +311,13 @@ impl<T> UBQ<T> {
             }
         }
 
-        if phead.index + 1 == BLOCK_LENGTH {
+        if phead.index + 1 == BLOCK {
             let new = if let Some(block) = next_block.take() {
                 Box::into_raw(block)
             } else if let Some(pooled) = self.take_pooled_block() {
                 pooled
             } else {
-                Box::into_raw(Block::new_zeroed())
+                Box::into_raw(Block::<T, BLOCK, A>::new_zeroed())
             };
 
             unsafe { (*phead.block).next.store(new, Ordering::Release) };
@@ -382,7 +338,9 @@ impl<T> UBQ<T> {
     #[doc(alias = "dequeue")]
     #[doc(alias = "recv")]
     pub fn pop(&self) -> Option<T> {
-        let backoff = Backoff::new();
+        let () = Self::LAYOUT_CHECKS;
+
+        let backoff = B::new();
 
         // Cheap hint if queue is empty.
         if self.chead.load(Ordering::Relaxed) == 0 {
@@ -392,7 +350,7 @@ impl<T> UBQ<T> {
         let mut chead = Head::new(self.chead.load(Ordering::Acquire));
 
         loop {
-            if chead.index >> 1 == BLOCK_LENGTH {
+            if chead.index >> 1 == BLOCK {
                 backoff.snooze();
                 chead = Head::new(self.chead.load(Ordering::Acquire));
                 continue;
@@ -402,7 +360,7 @@ impl<T> UBQ<T> {
 
             if chead.index & 1 == 0 {
                 fence(Ordering::SeqCst);
-                let phead = Head::<T>::new(self.phead.load(Ordering::Relaxed));
+                let phead = Head::<T, BLOCK, A>::new(self.phead.load(Ordering::Relaxed));
 
                 if phead.block.addr() == chead.block.addr() {
                     if chead.index >> 1 >= phead.index {
@@ -433,7 +391,7 @@ impl<T> UBQ<T> {
 
         chead.index >>= 1;
 
-        if chead.index + 1 == BLOCK_LENGTH {
+        if chead.index + 1 == BLOCK {
             let next = loop {
                 let p = unsafe { (*chead.block).next.load(Ordering::Acquire) };
 
@@ -453,7 +411,6 @@ impl<T> UBQ<T> {
         }
 
         let block = unsafe { &mut (*chead.block) };
-
         let slot = unsafe { block.slots.get_unchecked(chead.index) };
 
         while slot.state.load(Ordering::Acquire) & WRITE == 0 {
@@ -462,7 +419,7 @@ impl<T> UBQ<T> {
 
         let e = unsafe { slot.value.get().read().assume_init() };
 
-        if block.consumed.fetch_add(1, Ordering::Relaxed) + 1 == BLOCK_LENGTH {
+        if block.consumed.fetch_add(1, Ordering::Relaxed) + 1 == BLOCK {
             block.reset();
             self.release_consumed_block(chead.block);
         }
@@ -471,9 +428,11 @@ impl<T> UBQ<T> {
     }
 }
 
-impl<T> Drop for UBQ<T> {
+impl<T, V, B, const POOL: usize, const BLOCK: usize, A> Drop
+    for ConfiguredUBQ<T, V, B, POOL, BLOCK, A>
+{
     fn drop(&mut self) {
-        let mut p = Head::<T>::new(*self.chead.get_mut()).block;
+        let mut p = Head::<T, BLOCK, A>::new(*self.chead.get_mut()).block;
 
         while !p.is_null() {
             let mut b = unsafe { Box::from_raw(p) };
@@ -485,6 +444,6 @@ impl<T> Drop for UBQ<T> {
             .map(CachePadded::deref_mut)
             .map(AtomicPtr::get_mut)
             .filter(|p| !p.is_null())
-            .for_each(|p| drop(unsafe { Box::from_raw(p.cast::<ManuallyDrop<Block<T>>>()) }));
+            .for_each(|p| drop_spare_block(*p));
     }
 }

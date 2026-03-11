@@ -4,6 +4,17 @@ from __future__ import annotations
 
 from typing import Sequence
 
+VERSION_TO_PRESET = {
+    3: "aggressive_prepare",
+    4: "balanced",
+    5: "pool_conservative",
+    6: "no_pool",
+    7: "consumer_pool_only",
+}
+PRESET_TO_VERSION = {value: key for key, value in VERSION_TO_PRESET.items()}
+BACKOFF_SUFFIX_TO_NAME = {"": "crossbeam", "b": "yield"}
+BACKOFF_NAME_TO_SUFFIX = {value: key for key, value in BACKOFF_SUFFIX_TO_NAME.items()}
+
 UBQ_POOLED_VERSIONS = (3, 4, 5, 7)
 UBQ_NO_POOL_VERSION = 6
 UBQ_MIN_POOL_SIZE = 1
@@ -30,27 +41,48 @@ def _strip_ubq_prefix(token: str) -> str:
 
 
 def format_ubq_label_parts(version: int, pool: int, block: int, backoff: str = "") -> str:
-    if backoff:
-        return f"v{version},{pool},{block},{backoff}"
-    return f"v{version},{pool},{block}"
+    preset = VERSION_TO_PRESET.get(version)
+    if preset is None:
+        raise ValueError(f"unknown UBQ version: {version}")
+
+    backoff_name = BACKOFF_SUFFIX_TO_NAME.get(backoff)
+    if backoff_name is None:
+        raise ValueError(f"unknown UBQ backoff: {backoff}")
+
+    return f"{preset},{pool},{block},{backoff_name}"
 
 
 def parse_ubq_queue_label(token: str, require_valid: bool = True):
     text = _strip_ubq_prefix(token)
-    parts = [part.strip() for part in text.replace("_", ",").split(",") if part.strip()]
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if len(parts) == 1 and "_" in text:
+        parts = [part.strip() for part in text.split("_") if part.strip()]
     if len(parts) not in (3, 4):
         return None
-    if not parts[0].startswith("v"):
-        return None
 
-    try:
-        version = int(parts[0][1:])
-        pool = int(parts[1])
-        block = int(parts[2])
-    except ValueError:
-        return None
+    if parts[0].startswith("v"):
+        try:
+            version = int(parts[0][1:])
+            pool = int(parts[1])
+            block = int(parts[2])
+        except ValueError:
+            return None
+        backoff = parts[3] if len(parts) == 4 else ""
+    else:
+        preset = parts[0]
+        version = PRESET_TO_VERSION.get(preset)
+        if version is None:
+            return None
+        try:
+            pool = int(parts[1])
+            block = int(parts[2])
+        except ValueError:
+            return None
+        backoff_name = parts[3] if len(parts) == 4 else "crossbeam"
+        backoff = BACKOFF_NAME_TO_SUFFIX.get(backoff_name)
+        if backoff is None:
+            return None
 
-    backoff = parts[3] if len(parts) == 4 else ""
     params = (version, pool, block, backoff)
     if require_valid and not is_valid_ubq_params(params):
         return None

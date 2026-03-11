@@ -1,6 +1,6 @@
 [package]
 name = "ubq"
-version = "2.1.3"
+version = "3.0.0"
 edition = "2024"
 description = "Lock-free unbounded MPMC queue backed by a linked ring of fixed-size blocks."
 license = "MIT"
@@ -21,30 +21,9 @@ toml = "0.8"
 [features]
 default = []
 ubq_debug = []
-ubq_v3 = []
-ubq_v4 = []
-ubq_v5 = []
-ubq_v6 = []
-ubq_v7 = []
-ubq_pool_1 = []
-ubq_pool_2 = []
-ubq_pool_4 = []
-ubq_pool_8 = []
-ubq_pool_16 = []
-ubq_pool_32 = []
-ubq_pool_64 = []
-ubq_backoff_cq = []
-ubq_block_31 = []
-ubq_block_63 = []
-ubq_block_127 = []
-ubq_block_255 = []
-ubq_block_511 = []
-ubq_block_1023 = []
-ubq_block_2047 = []
-ubq_block_4095 = []
-bench_small = ["ubq_block_31"]
-bench_medium = ["ubq_block_1023"]
-bench_large = ["ubq_block_4095"]
+bench_small = []
+bench_medium = []
+bench_large = []
 
 [dev-dependencies]
 crossbeam-queue = "0.3"

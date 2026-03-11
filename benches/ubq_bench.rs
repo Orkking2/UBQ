@@ -12,9 +12,12 @@ use std::{
     thread::{self, JoinHandle, available_parallelism},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use ubq::{BLOCK_LENGTH, UBQ};
+use ubq::{ConfiguredUBQ, align, backoff, variant};
 
 const SENTINEL: u64 = u64::MAX;
+#[cfg(test)]
+#[allow(dead_code)]
+const DEFAULT_UBQ_LABEL: &str = "balanced,1,2047,crossbeam";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueueKind {
@@ -44,52 +47,80 @@ impl QueueKind {
     }
 }
 
-#[derive(Clone)]
-enum Queue {
-    Ubq(Arc<UBQ<u64>>),
-    SegQueue(Arc<crossbeam_queue::SegQueue<u64>>),
-    ConcurrentQueue(Arc<concurrent_queue::ConcurrentQueue<u64>>),
+trait BenchQueue: Send + Sync + 'static {
+    fn new_queue() -> Arc<Self>
+    where
+        Self: Sized;
+
+    fn send_value(&self, value: u64);
+    fn recv_value(&self) -> u64;
 }
 
-fn make_queue(kind: QueueKind) -> Queue {
-    match kind {
-        QueueKind::Ubq => Queue::Ubq(Arc::new(UBQ::new())),
-        QueueKind::SegQueue => Queue::SegQueue(Arc::new(crossbeam_queue::SegQueue::new())),
-        QueueKind::ConcurrentQueue => {
-            Queue::ConcurrentQueue(Arc::new(concurrent_queue::ConcurrentQueue::unbounded()))
+impl<V, B, const POOL: usize, const BLOCK: usize, A> BenchQueue
+    for ConfiguredUBQ<u64, V, B, POOL, BLOCK, A>
+where
+    V: variant::Variant + 'static,
+    B: backoff::BackoffPolicy + 'static,
+    A: Send + Sync + 'static,
+{
+    fn new_queue() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+
+    fn send_value(&self, value: u64) {
+        self.push(value);
+    }
+
+    fn recv_value(&self) -> u64 {
+        let backoff = Backoff::new();
+        loop {
+            if let Some(value) = self.pop() {
+                return value;
+            }
+            backoff.snooze();
         }
     }
 }
 
-fn send(queue: &Queue, value: u64) {
-    match queue {
-        Queue::Ubq(q) => q.push(value),
-        Queue::SegQueue(q) => q.push(value),
-        Queue::ConcurrentQueue(q) => q.push(value).expect("send failed"),
+impl BenchQueue for crossbeam_queue::SegQueue<u64> {
+    fn new_queue() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+
+    fn send_value(&self, value: u64) {
+        self.push(value);
+    }
+
+    fn recv_value(&self) -> u64 {
+        let backoff = Backoff::new();
+        loop {
+            if let Some(value) = self.pop() {
+                return value;
+            }
+            backoff.snooze();
+        }
     }
 }
 
-fn recv(queue: &Queue) -> u64 {
-    let backoff = Backoff::new();
-    loop {
-        match queue {
-            Queue::Ubq(q) => {
-                if let Some(value) = q.pop() {
-                    return value;
-                }
-            }
-            Queue::SegQueue(q) => {
-                if let Some(value) = q.pop() {
-                    return value;
-                }
-            }
-            Queue::ConcurrentQueue(q) => match q.pop() {
+impl BenchQueue for concurrent_queue::ConcurrentQueue<u64> {
+    fn new_queue() -> Arc<Self> {
+        Arc::new(Self::unbounded())
+    }
+
+    fn send_value(&self, value: u64) {
+        self.push(value).expect("send failed");
+    }
+
+    fn recv_value(&self) -> u64 {
+        let backoff = Backoff::new();
+        loop {
+            match self.pop() {
                 Ok(value) => return value,
                 Err(PopError::Empty) => {}
                 Err(PopError::Closed) => panic!("recv failed: queue closed"),
-            },
+            }
+            backoff.snooze();
         }
-        backoff.snooze();
     }
 }
 
@@ -171,6 +202,7 @@ struct BenchConfig {
     queues: Vec<QueueKind>,
     packed_scenarios: Vec<Vec<ScenarioConfig>>,
     modes: Vec<Mode>,
+    block_cap: usize,
     ubq_label: String,
     machine_label: String,
     out_path: Option<PathBuf>,
@@ -219,6 +251,316 @@ struct Record {
 struct Output {
     meta: Meta,
     results: Vec<Record>,
+}
+
+struct UbqBenchEntry {
+    label: &'static str,
+    block_cap: usize,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    throughput: fn(&ScenarioConfig, u64) -> Record,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fill_drain: fn(&ScenarioConfig, u64) -> Record,
+    factory: fn(Arc<BenchConfig>, (usize, usize), u64) -> JoinHandle<Vec<Record>>,
+}
+
+macro_rules! ubq_bench_entry {
+    ($label:expr, $variant:path, $backoff:path, $pool:literal, $block:literal, $align:path) => {
+        UbqBenchEntry {
+            label: $label,
+            block_cap: $block,
+            #[cfg(test)]
+            throughput: |scenario, items_per_producer| {
+                bench_throughput_for::<ConfiguredUBQ<
+                    u64,
+                    $variant,
+                    $backoff,
+                    $pool,
+                    $block,
+                    $align,
+                >>("ubq", $block, scenario, items_per_producer)
+            },
+            #[cfg(test)]
+            fill_drain: |scenario, items_per_producer| {
+                bench_fill_drain_for::<ConfiguredUBQ<
+                    u64,
+                    $variant,
+                    $backoff,
+                    $pool,
+                    $block,
+                    $align,
+                >>("ubq", $block, scenario, items_per_producer)
+            },
+            factory: |config, packed_indices, items_per_producer| {
+                bench_factory_typed::<ConfiguredUBQ<
+                    u64,
+                    $variant,
+                    $backoff,
+                    $pool,
+                    $block,
+                    $align,
+                >>("ubq", $block, config, packed_indices, items_per_producer)
+            },
+        }
+    };
+}
+
+macro_rules! ubq_block_entries {
+    ($preset_name:literal, $variant:path, $pool:literal, $backoff_name:literal, $backoff:path) => {
+        vec![
+            ubq_bench_entry!(
+                concat!($preset_name, ",", stringify!($pool), ",31,", $backoff_name),
+                $variant,
+                $backoff,
+                $pool,
+                31,
+                align::A64
+            ),
+            ubq_bench_entry!(
+                concat!($preset_name, ",", stringify!($pool), ",63,", $backoff_name),
+                $variant,
+                $backoff,
+                $pool,
+                63,
+                align::A128
+            ),
+            ubq_bench_entry!(
+                concat!($preset_name, ",", stringify!($pool), ",127,", $backoff_name),
+                $variant,
+                $backoff,
+                $pool,
+                127,
+                align::A256
+            ),
+            ubq_bench_entry!(
+                concat!($preset_name, ",", stringify!($pool), ",255,", $backoff_name),
+                $variant,
+                $backoff,
+                $pool,
+                255,
+                align::A512
+            ),
+            ubq_bench_entry!(
+                concat!($preset_name, ",", stringify!($pool), ",511,", $backoff_name),
+                $variant,
+                $backoff,
+                $pool,
+                511,
+                align::A1024
+            ),
+            ubq_bench_entry!(
+                concat!(
+                    $preset_name,
+                    ",",
+                    stringify!($pool),
+                    ",1023,",
+                    $backoff_name
+                ),
+                $variant,
+                $backoff,
+                $pool,
+                1023,
+                align::A2048
+            ),
+            ubq_bench_entry!(
+                concat!(
+                    $preset_name,
+                    ",",
+                    stringify!($pool),
+                    ",2047,",
+                    $backoff_name
+                ),
+                $variant,
+                $backoff,
+                $pool,
+                2047,
+                align::A4096
+            ),
+            ubq_bench_entry!(
+                concat!(
+                    $preset_name,
+                    ",",
+                    stringify!($pool),
+                    ",4095,",
+                    $backoff_name
+                ),
+                $variant,
+                $backoff,
+                $pool,
+                4095,
+                align::A8192
+            ),
+        ]
+    };
+}
+
+macro_rules! ubq_backoff_entries {
+    ($preset_name:literal, $variant:path, $pool:literal) => {{
+        let mut entries = ubq_block_entries!(
+            $preset_name,
+            $variant,
+            $pool,
+            "crossbeam",
+            backoff::Crossbeam
+        );
+        entries.extend(ubq_block_entries!(
+            $preset_name,
+            $variant,
+            $pool,
+            "yield",
+            backoff::Yield
+        ));
+        entries
+    }};
+}
+
+static UBQ_BENCH_REGISTRY: OnceLock<Vec<UbqBenchEntry>> = OnceLock::new();
+
+fn ubq_bench_registry() -> &'static [UbqBenchEntry] {
+    UBQ_BENCH_REGISTRY
+        .get_or_init(|| {
+            let mut entries = Vec::new();
+            entries.extend(ubq_backoff_entries!(
+                "aggressive_prepare",
+                variant::AggressivePrepare,
+                1
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "aggressive_prepare",
+                variant::AggressivePrepare,
+                2
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "aggressive_prepare",
+                variant::AggressivePrepare,
+                4
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "aggressive_prepare",
+                variant::AggressivePrepare,
+                8
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "aggressive_prepare",
+                variant::AggressivePrepare,
+                16
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "aggressive_prepare",
+                variant::AggressivePrepare,
+                32
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "aggressive_prepare",
+                variant::AggressivePrepare,
+                64
+            ));
+            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 1));
+            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 2));
+            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 4));
+            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 8));
+            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 16));
+            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 32));
+            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 64));
+            entries.extend(ubq_backoff_entries!(
+                "pool_conservative",
+                variant::PoolConservative,
+                1
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "pool_conservative",
+                variant::PoolConservative,
+                2
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "pool_conservative",
+                variant::PoolConservative,
+                4
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "pool_conservative",
+                variant::PoolConservative,
+                8
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "pool_conservative",
+                variant::PoolConservative,
+                16
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "pool_conservative",
+                variant::PoolConservative,
+                32
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "pool_conservative",
+                variant::PoolConservative,
+                64
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "consumer_pool_only",
+                variant::ConsumerPoolOnly,
+                1
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "consumer_pool_only",
+                variant::ConsumerPoolOnly,
+                2
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "consumer_pool_only",
+                variant::ConsumerPoolOnly,
+                4
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "consumer_pool_only",
+                variant::ConsumerPoolOnly,
+                8
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "consumer_pool_only",
+                variant::ConsumerPoolOnly,
+                16
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "consumer_pool_only",
+                variant::ConsumerPoolOnly,
+                32
+            ));
+            entries.extend(ubq_backoff_entries!(
+                "consumer_pool_only",
+                variant::ConsumerPoolOnly,
+                64
+            ));
+            entries.extend(ubq_block_entries!(
+                "no_pool",
+                variant::NoPool,
+                0,
+                "crossbeam",
+                backoff::Crossbeam
+            ));
+            entries.extend(ubq_block_entries!(
+                "no_pool",
+                variant::NoPool,
+                0,
+                "yield",
+                backoff::Yield
+            ));
+            entries
+        })
+        .as_slice()
+}
+
+fn normalize_ubq_label(input: &str) -> String {
+    input.trim().to_ascii_lowercase()
+}
+
+fn find_ubq_entry(label: &str) -> Option<&'static UbqBenchEntry> {
+    let normalized = normalize_ubq_label(label);
+    ubq_bench_registry()
+        .iter()
+        .find(|entry| entry.label == normalized)
 }
 
 fn main() {
@@ -339,12 +681,17 @@ fn parse_args() -> BenchConfig {
     }
 
     if ubq_label.len() == 0 {
-        die("please supply a non-zero label using --ubq=label={}");
+        die("please supply a non-empty UBQ label using --ubq-label=<preset,pool,block,backoff>");
     }
 
     if machine_label.len() == 0 {
         die("please supply a non-zero label using --machine-label={}");
     }
+
+    let ubq_label = normalize_ubq_label(&ubq_label);
+    let block_cap = find_ubq_entry(&ubq_label)
+        .map(|entry| entry.block_cap)
+        .unwrap_or_else(|| die(&format!("unsupported UBQ label: {ubq_label}")));
 
     let available_parallelism = available_parallelism.unwrap_or_else(|| die("unable to determine available parallelism, please pass a --available-parallelism value"));
 
@@ -392,6 +739,7 @@ fn parse_args() -> BenchConfig {
         queues,
         packed_scenarios,
         modes,
+        block_cap,
         ubq_label,
         machine_label,
         out_path,
@@ -469,7 +817,7 @@ fn run_benches_parallel(config: Arc<BenchConfig>) -> Output {
 
     let meta = Meta {
         timestamp_unix_ms,
-        block_cap: BLOCK_LENGTH as usize,
+        block_cap: config.block_cap,
         items_per_producer: config.items_per_producer,
         ubq_label: config.ubq_label.clone(),
         machine_label: config.machine_label.clone(),
@@ -530,13 +878,44 @@ fn bench_factory(
     (pack, subpack): (usize, usize),
     items_per_producer: u64,
 ) -> JoinHandle<Vec<Record>> {
+    match queue {
+        QueueKind::Ubq => (find_ubq_entry(&config.ubq_label)
+            .unwrap_or_else(|| die(&format!("unsupported UBQ label: {}", config.ubq_label)))
+            .factory)(config, (pack, subpack), items_per_producer),
+        QueueKind::SegQueue => bench_factory_typed::<crossbeam_queue::SegQueue<u64>>(
+            queue.name(),
+            config.block_cap,
+            config,
+            (pack, subpack),
+            items_per_producer,
+        ),
+        QueueKind::ConcurrentQueue => {
+            bench_factory_typed::<concurrent_queue::ConcurrentQueue<u64>>(
+                queue.name(),
+                config.block_cap,
+                config,
+                (pack, subpack),
+                items_per_producer,
+            )
+        }
+    }
+}
+
+fn bench_factory_typed<Q: BenchQueue>(
+    queue_name: &'static str,
+    block_cap: usize,
+    config: Arc<BenchConfig>,
+    (pack, subpack): (usize, usize),
+    items_per_producer: u64,
+) -> JoinHandle<Vec<Record>> {
     thread::spawn(move || {
         config
             .modes
             .iter()
             .map(|mode| match mode {
-                Mode::Throughput => bench_throughput(
-                    queue,
+                Mode::Throughput => bench_throughput_for::<Q>(
+                    queue_name,
+                    block_cap,
                     unsafe {
                         config
                             .packed_scenarios
@@ -545,8 +924,9 @@ fn bench_factory(
                     },
                     items_per_producer,
                 ),
-                Mode::FillDrain => bench_fill_drain(
-                    queue,
+                Mode::FillDrain => bench_fill_drain_for::<Q>(
+                    queue_name,
+                    block_cap,
                     unsafe {
                         config
                             .packed_scenarios
@@ -560,14 +940,58 @@ fn bench_factory(
     })
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn bench_throughput(
     queue: QueueKind,
     scenario: &ScenarioConfig,
     items_per_producer: u64,
 ) -> Record {
+    bench_throughput_with_label(queue, DEFAULT_UBQ_LABEL, scenario, items_per_producer)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn bench_throughput_with_label(
+    queue: QueueKind,
+    ubq_label: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+) -> Record {
+    match queue {
+        QueueKind::Ubq => (find_ubq_entry(ubq_label)
+            .unwrap_or_else(|| die(&format!("unsupported UBQ label: {ubq_label}")))
+            .throughput)(scenario, items_per_producer),
+        QueueKind::SegQueue => bench_throughput_for::<crossbeam_queue::SegQueue<u64>>(
+            queue.name(),
+            find_ubq_entry(ubq_label)
+                .map(|entry| entry.block_cap)
+                .unwrap_or_else(|| die(&format!("unsupported UBQ label: {ubq_label}"))),
+            scenario,
+            items_per_producer,
+        ),
+        QueueKind::ConcurrentQueue => {
+            bench_throughput_for::<concurrent_queue::ConcurrentQueue<u64>>(
+                queue.name(),
+                find_ubq_entry(ubq_label)
+                    .map(|entry| entry.block_cap)
+                    .unwrap_or_else(|| die(&format!("unsupported UBQ label: {ubq_label}"))),
+                scenario,
+                items_per_producer,
+            )
+        }
+    }
+}
+
+fn bench_throughput_for<Q: BenchQueue>(
+    queue_name: &'static str,
+    block_cap: usize,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+) -> Record {
     let total_items = total_items(items_per_producer, scenario.producers);
 
-    let queue_handle = make_queue(queue);
+    let queue_handle = Q::new_queue();
 
     let total_threads = scenario_total_threads(scenario);
     let ready = Arc::new(Barrier::new(total_threads + 1));
@@ -594,7 +1018,7 @@ fn bench_throughput(
                 .expect("item count overflow");
             for offset in 0..items_per_producer {
                 let value = base.checked_add(offset).expect("item count overflow");
-                send(&queue_handle, value);
+                queue_handle.send_value(value);
             }
             let end_ns = start.elapsed().as_nanos() as u64;
             producer_max.fetch_max(end_ns, Ordering::Relaxed);
@@ -614,7 +1038,7 @@ fn bench_throughput(
             start_gate.wait();
             let start = *start.get().expect("start set");
             loop {
-                let value = recv(&queue_handle);
+                let value = queue_handle.recv_value();
                 if value == SENTINEL {
                     break;
                 }
@@ -634,7 +1058,7 @@ fn bench_throughput(
     }
 
     for _ in 0..scenario.consumers {
-        send(&queue_handle, SENTINEL);
+        queue_handle.send_value(SENTINEL);
     }
 
     for handle in consumer_handles {
@@ -645,7 +1069,7 @@ fn bench_throughput(
 
     let consumed = consumed_total.load(Ordering::Relaxed);
     if consumed != total_items {
-        warn_mismatch(queue, scenario, total_items, consumed);
+        warn_mismatch(queue_name, scenario, total_items, consumed);
     }
 
     let ops_per_sec = if elapsed_ns > 0 && consumed > 0 {
@@ -655,7 +1079,7 @@ fn bench_throughput(
     };
 
     Record {
-        queue: queue.name().to_string(),
+        queue: queue_name.to_string(),
         scenario: scenario.name.clone(),
         mode: Mode::Throughput.name().to_string(),
         producers: scenario.producers,
@@ -669,35 +1093,80 @@ fn bench_throughput(
         pop_elapsed_ns: Some(consumer_max.load(Ordering::Relaxed)),
         fill_elapsed_ns: None,
         drain_elapsed_ns: None,
-        block_cap: BLOCK_LENGTH as usize,
+        block_cap,
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn bench_fill_drain(
     queue: QueueKind,
     scenario: &ScenarioConfig,
     items_per_producer: u64,
 ) -> Record {
+    bench_fill_drain_with_label(queue, DEFAULT_UBQ_LABEL, scenario, items_per_producer)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn bench_fill_drain_with_label(
+    queue: QueueKind,
+    ubq_label: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+) -> Record {
+    match queue {
+        QueueKind::Ubq => (find_ubq_entry(ubq_label)
+            .unwrap_or_else(|| die(&format!("unsupported UBQ label: {ubq_label}")))
+            .fill_drain)(scenario, items_per_producer),
+        QueueKind::SegQueue => bench_fill_drain_for::<crossbeam_queue::SegQueue<u64>>(
+            queue.name(),
+            find_ubq_entry(ubq_label)
+                .map(|entry| entry.block_cap)
+                .unwrap_or_else(|| die(&format!("unsupported UBQ label: {ubq_label}"))),
+            scenario,
+            items_per_producer,
+        ),
+        QueueKind::ConcurrentQueue => {
+            bench_fill_drain_for::<concurrent_queue::ConcurrentQueue<u64>>(
+                queue.name(),
+                find_ubq_entry(ubq_label)
+                    .map(|entry| entry.block_cap)
+                    .unwrap_or_else(|| die(&format!("unsupported UBQ label: {ubq_label}"))),
+                scenario,
+                items_per_producer,
+            )
+        }
+    }
+}
+
+fn bench_fill_drain_for<Q: BenchQueue>(
+    queue_name: &'static str,
+    block_cap: usize,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+) -> Record {
     let total_items = total_items(items_per_producer, scenario.producers);
 
-    let queue_handle = make_queue(queue);
+    let queue_handle = Q::new_queue();
 
-    let fill_elapsed = run_producers_only(&queue_handle, scenario.producers, items_per_producer);
+    let fill_elapsed =
+        run_producers_only_for(&queue_handle, scenario.producers, items_per_producer);
 
     for _ in 0..scenario.consumers {
-        send(&queue_handle, SENTINEL);
+        queue_handle.send_value(SENTINEL);
     }
 
-    let (drain_elapsed, consumed) = run_consumers_only(&queue_handle, scenario.consumers);
+    let (drain_elapsed, consumed) = run_consumers_only_for(&queue_handle, scenario.consumers);
 
     if consumed != total_items {
-        warn_mismatch(queue, scenario, total_items, consumed);
+        warn_mismatch(queue_name, scenario, total_items, consumed);
     }
 
     let elapsed_ns = (fill_elapsed + drain_elapsed).as_nanos() as u64;
 
     Record {
-        queue: queue.name().to_string(),
+        queue: queue_name.to_string(),
         scenario: scenario.name.clone(),
         mode: Mode::FillDrain.name().to_string(),
         producers: scenario.producers,
@@ -711,7 +1180,7 @@ fn bench_fill_drain(
         pop_elapsed_ns: None,
         fill_elapsed_ns: Some(fill_elapsed.as_nanos() as u64),
         drain_elapsed_ns: Some(drain_elapsed.as_nanos() as u64),
-        block_cap: BLOCK_LENGTH as usize,
+        block_cap,
     }
 }
 
@@ -840,7 +1309,11 @@ fn bench_fill_drain(
 //     }
 // }
 
-fn run_producers_only(queue_handle: &Queue, producers: usize, items_per_producer: u64) -> Duration {
+fn run_producers_only_for<Q: BenchQueue>(
+    queue_handle: &Arc<Q>,
+    producers: usize,
+    items_per_producer: u64,
+) -> Duration {
     let ready = Arc::new(Barrier::new(producers + 1));
     let start_gate = Arc::new(Barrier::new(producers + 1));
     let start = Arc::new(OnceLock::new());
@@ -862,7 +1335,7 @@ fn run_producers_only(queue_handle: &Queue, producers: usize, items_per_producer
                 .expect("item count overflow");
             for offset in 0..items_per_producer {
                 let value = base.checked_add(offset).expect("item count overflow");
-                send(&queue_handle, value);
+                queue_handle.send_value(value);
             }
             let end_ns = start.elapsed().as_nanos() as u64;
             max_end.fetch_max(end_ns, Ordering::Relaxed);
@@ -880,7 +1353,10 @@ fn run_producers_only(queue_handle: &Queue, producers: usize, items_per_producer
     Duration::from_nanos(max_end.load(Ordering::Relaxed))
 }
 
-fn run_consumers_only(queue_handle: &Queue, consumers: usize) -> (Duration, u64) {
+fn run_consumers_only_for<Q: BenchQueue>(
+    queue_handle: &Arc<Q>,
+    consumers: usize,
+) -> (Duration, u64) {
     let ready = Arc::new(Barrier::new(consumers + 1));
     let start_gate = Arc::new(Barrier::new(consumers + 1));
     let start = Arc::new(OnceLock::new());
@@ -900,7 +1376,7 @@ fn run_consumers_only(queue_handle: &Queue, consumers: usize) -> (Duration, u64)
             start_gate.wait();
             let start: Instant = *start.get().expect("start set");
             loop {
-                let value = recv(&queue_handle);
+                let value = queue_handle.recv_value();
                 if value == SENTINEL {
                     break;
                 }
@@ -957,10 +1433,10 @@ fn die(message: &str) -> ! {
     std::process::exit(1);
 }
 
-fn warn_mismatch(queue: QueueKind, scenario: &ScenarioConfig, expected: u64, got: u64) {
+fn warn_mismatch(queue_name: &str, scenario: &ScenarioConfig, expected: u64, got: u64) {
     eprintln!(
         "warning: {queue} {scenario} consumed count mismatch: expected {expected}, got {got}",
-        queue = queue.name(),
+        queue = queue_name,
         scenario = scenario.name.as_str()
     );
 }

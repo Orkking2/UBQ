@@ -10,14 +10,26 @@ pub const DEFAULT_SCENARIOS: &[&str] = &[
     "32p64c", "64p32c", "64p64c",
 ];
 
-const UBQ_VERSIONS: [u8; 5] = [3, 4, 5, 6, 7];
+const UBQ_PRESET_VALUES: [&str; 5] = [
+    "aggressive_prepare",
+    "balanced",
+    "pool_conservative",
+    "no_pool",
+    "consumer_pool_only",
+];
+const UBQ_POOLED_PRESET_VALUES: [&str; 4] = [
+    "aggressive_prepare",
+    "balanced",
+    "pool_conservative",
+    "consumer_pool_only",
+];
 const UBQ_POOL_VALUES: [u8; 7] = [1, 2, 4, 8, 16, 32, 64];
 const UBQ_BLOCK_VALUES: [u16; 8] = [31, 63, 127, 255, 511, 1023, 2047, 4095];
-const UBQ_BACKOFF_VALUES: [&str; 2] = ["", "b"];
+const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct UbqLabel {
-    pub version: u8,
+    pub preset: String,
     pub pool: u8,
     pub block: u16,
     pub backoff: String,
@@ -25,56 +37,29 @@ pub struct UbqLabel {
 
 impl UbqLabel {
     pub fn text(&self) -> String {
-        if self.backoff.is_empty() {
-            format!("v{},{},{}", self.version, self.pool, self.block)
-        } else {
-            format!(
-                "v{},{},{},{}",
-                self.version, self.pool, self.block, self.backoff
-            )
-        }
+        format!(
+            "{},{},{},{}",
+            self.preset, self.pool, self.block, self.backoff
+        )
     }
 
     pub fn safe(&self) -> String {
-        if self.backoff.is_empty() {
-            format!("v{}_{}_{}", self.version, self.pool, self.block)
-        } else {
-            format!(
-                "v{}_{}_{}_{}",
-                self.version, self.pool, self.block, self.backoff
-            )
-        }
-    }
-
-    pub fn feature_csv(&self) -> String {
-        let mut features = vec![format!("ubq_v{}", self.version)];
-        if self.version != 6 {
-            features.push(format!("ubq_pool_{}", self.pool));
-        }
-        features.push(format!("ubq_block_{}", self.block));
-        if self.backoff == "b" {
-            features.push("ubq_backoff_cq".to_string());
-        }
-        features.join(",")
+        format!(
+            "{}_{}_{}_{}",
+            self.preset, self.pool, self.block, self.backoff
+        )
     }
 }
 
 pub fn parse_ubq_label(token: &str, require_valid: bool) -> Result<UbqLabel, String> {
     let text = token.trim().to_ascii_lowercase();
-    let parts: Vec<&str> = text
-        .split([',', '_'])
-        .filter(|s| !s.trim().is_empty())
-        .collect();
+    let parts: Vec<&str> = text.split(',').filter(|s| !s.trim().is_empty()).collect();
 
-    if parts.len() < 3 || parts.len() > 4 {
+    if parts.len() != 4 {
         return Err(format!("invalid UBQ label '{token}'"));
     }
 
-    let version = parts[0]
-        .strip_prefix('v')
-        .ok_or_else(|| format!("invalid UBQ label '{token}'"))?
-        .parse::<u8>()
-        .map_err(|_| format!("invalid UBQ label '{token}'"))?;
+    let preset = parts[0].to_string();
     let pool = parts[1]
         .parse::<u8>()
         .map_err(|_| format!("invalid UBQ label '{token}'"))?;
@@ -84,7 +69,7 @@ pub fn parse_ubq_label(token: &str, require_valid: bool) -> Result<UbqLabel, Str
     let backoff = parts.get(3).copied().unwrap_or("").to_string();
 
     let label = UbqLabel {
-        version,
+        preset,
         pool,
         block,
         backoff,
@@ -102,7 +87,7 @@ pub fn normalize_ubq_label(token: &str, require_valid: bool) -> Option<String> {
 }
 
 pub fn is_valid_ubq_label(label: &UbqLabel) -> bool {
-    if !UBQ_VERSIONS.contains(&label.version) {
+    if !UBQ_PRESET_VALUES.contains(&label.preset.as_str()) {
         return false;
     }
     if !UBQ_BLOCK_VALUES.contains(&label.block) {
@@ -111,7 +96,7 @@ pub fn is_valid_ubq_label(label: &UbqLabel) -> bool {
     if !UBQ_BACKOFF_VALUES.contains(&label.backoff.as_str()) {
         return false;
     }
-    if label.version == 6 {
+    if label.preset == "no_pool" {
         return label.pool == 0;
     }
     UBQ_POOL_VALUES.contains(&label.pool)
@@ -120,9 +105,16 @@ pub fn is_valid_ubq_label(label: &UbqLabel) -> bool {
 pub fn bench_label_sort_key(label: &str) -> (u8, u8, u16, u8, String) {
     match parse_ubq_label(label, false) {
         Ok(parsed) => {
-            let backoff_idx = if parsed.backoff == "b" { 1 } else { 0 };
+            let preset_idx = UBQ_PRESET_VALUES
+                .iter()
+                .position(|preset| *preset == parsed.preset)
+                .unwrap_or(usize::MAX) as u8;
+            let backoff_idx = UBQ_BACKOFF_VALUES
+                .iter()
+                .position(|backoff| *backoff == parsed.backoff)
+                .unwrap_or(usize::MAX) as u8;
             (
-                parsed.version,
+                preset_idx,
                 parsed.pool,
                 parsed.block,
                 backoff_idx,
@@ -404,11 +396,10 @@ pub fn strict_immediate_winner_ubq_labels(
         }
     }
 
-    let pooled_versions = [3_u8, 4, 5, 7];
-    if pooled_versions.contains(&winner_params.version) {
-        for version in pooled_versions {
+    if UBQ_POOLED_PRESET_VALUES.contains(&winner_params.preset.as_str()) {
+        for preset in UBQ_POOLED_PRESET_VALUES {
             let candidate = UbqLabel {
-                version,
+                preset: preset.to_string(),
                 pool: winner_params.pool,
                 block: winner_params.block,
                 backoff: winner_params.backoff.clone(),
@@ -419,10 +410,10 @@ pub fn strict_immediate_winner_ubq_labels(
         }
     }
 
-    if winner_params.version == 6 {
-        for version in pooled_versions {
+    if winner_params.preset == "no_pool" {
+        for preset in UBQ_POOLED_PRESET_VALUES {
             let candidate = UbqLabel {
-                version,
+                preset: preset.to_string(),
                 pool: 1,
                 block: winner_params.block,
                 backoff: winner_params.backoff.clone(),
@@ -433,9 +424,11 @@ pub fn strict_immediate_winner_ubq_labels(
         }
     }
 
-    if winner_params.version == 6 || pooled_versions.contains(&winner_params.version) {
+    if winner_params.preset == "no_pool"
+        || UBQ_POOLED_PRESET_VALUES.contains(&winner_params.preset.as_str())
+    {
         let candidate = UbqLabel {
-            version: 6,
+            preset: "no_pool".to_string(),
             pool: 0,
             block: winner_params.block,
             backoff: winner_params.backoff.clone(),
@@ -452,9 +445,9 @@ fn immediate_neighbors(label: &UbqLabel, idx: usize) -> Vec<UbqLabel> {
     let mut out = Vec::new();
     match idx {
         0 => {
-            for neighbor in immediate_domain_neighbors_u8(label.version, &UBQ_VERSIONS) {
+            for neighbor in immediate_domain_neighbors_str(&label.preset, &UBQ_PRESET_VALUES) {
                 out.push(UbqLabel {
-                    version: neighbor,
+                    preset: neighbor.to_string(),
                     pool: label.pool,
                     block: label.block,
                     backoff: label.backoff.clone(),
@@ -465,7 +458,7 @@ fn immediate_neighbors(label: &UbqLabel, idx: usize) -> Vec<UbqLabel> {
             let pools = [0_u8, 1, 2, 4, 8, 16, 32, 64];
             for neighbor in immediate_domain_neighbors_u8(label.pool, &pools) {
                 out.push(UbqLabel {
-                    version: label.version,
+                    preset: label.preset.clone(),
                     pool: neighbor,
                     block: label.block,
                     backoff: label.backoff.clone(),
@@ -475,7 +468,7 @@ fn immediate_neighbors(label: &UbqLabel, idx: usize) -> Vec<UbqLabel> {
         2 => {
             for neighbor in immediate_domain_neighbors_u16(label.block, &UBQ_BLOCK_VALUES) {
                 out.push(UbqLabel {
-                    version: label.version,
+                    preset: label.preset.clone(),
                     pool: label.pool,
                     block: neighbor,
                     backoff: label.backoff.clone(),
@@ -485,7 +478,7 @@ fn immediate_neighbors(label: &UbqLabel, idx: usize) -> Vec<UbqLabel> {
         3 => {
             for neighbor in immediate_domain_neighbors_str(&label.backoff, &UBQ_BACKOFF_VALUES) {
                 out.push(UbqLabel {
-                    version: label.version,
+                    preset: label.preset.clone(),
                     pool: label.pool,
                     block: label.block,
                     backoff: neighbor.to_string(),
@@ -548,13 +541,13 @@ pub fn has_complete_immediate_winner_variants(entries: &BTreeMap<String, Stats>)
 
 pub fn total_valid_ubq_label_count() -> usize {
     let mut total = 0_usize;
-    for version in UBQ_VERSIONS {
+    for preset in UBQ_PRESET_VALUES {
         for block in UBQ_BLOCK_VALUES {
             for backoff in UBQ_BACKOFF_VALUES {
-                if version == 6 {
+                if preset == "no_pool" {
                     total += 1;
                     let _ = UbqLabel {
-                        version,
+                        preset: preset.to_string(),
                         pool: 0,
                         block,
                         backoff: backoff.to_string(),
@@ -564,7 +557,7 @@ pub fn total_valid_ubq_label_count() -> usize {
                 for pool in UBQ_POOL_VALUES {
                     total += 1;
                     let _ = UbqLabel {
-                        version,
+                        preset: preset.to_string(),
                         pool,
                         block,
                         backoff: backoff.to_string(),
@@ -636,122 +629,118 @@ mod tests {
 
     #[test]
     fn ubq_label_parse_and_normalize() {
-        let parsed = parse_ubq_label("v5,8,2047,b", true).expect("parse");
-        assert_eq!(parsed.version, 5);
+        let parsed = parse_ubq_label("pool_conservative,8,2047,yield", true).expect("parse");
+        assert_eq!(parsed.preset, "pool_conservative");
         assert_eq!(parsed.pool, 8);
         assert_eq!(parsed.block, 2047);
-        assert_eq!(parsed.backoff, "b");
-        assert_eq!(parsed.text(), "v5,8,2047,b");
-        assert_eq!(parsed.safe(), "v5_8_2047_b");
-        assert_eq!(
-            parsed.feature_csv(),
-            "ubq_v5,ubq_pool_8,ubq_block_2047,ubq_backoff_cq"
-        );
-        assert!(normalize_ubq_label("v6,0,1023", true).is_some());
-        assert!(normalize_ubq_label("v6,8,1023", true).is_none());
+        assert_eq!(parsed.backoff, "yield");
+        assert_eq!(parsed.text(), "pool_conservative,8,2047,yield");
+        assert_eq!(parsed.safe(), "pool_conservative_8_2047_yield");
+        assert!(normalize_ubq_label("no_pool,0,1023,crossbeam", true).is_some());
+        assert!(normalize_ubq_label("no_pool,8,1023,crossbeam", true).is_none());
     }
 
     #[test]
     fn immediate_neighbors_cover_v6_and_pooled_variants() {
         let mut entries = BTreeMap::new();
         entries.insert(
-            "ubq_v5,1,1023".to_string(),
+            "ubq_pool_conservative,1,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 120.0,
             },
         );
         entries.insert(
-            "ubq_v4,1,1023".to_string(),
+            "ubq_balanced,1,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 80.0,
             },
         );
         entries.insert(
-            "ubq_v6,0,1023".to_string(),
+            "ubq_no_pool,0,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 60.0,
             },
         );
         let (winner, required) = strict_immediate_winner_ubq_labels(&entries).expect("winner");
-        assert_eq!(winner, "ubq_v5,1,1023");
-        assert!(required.contains("ubq_v6,0,1023"));
-        assert!(required.contains("ubq_v4,1,1023"));
-        assert!(required.contains("ubq_v3,1,1023"));
-        assert!(required.contains("ubq_v7,1,1023"));
+        assert_eq!(winner, "ubq_pool_conservative,1,1023,crossbeam");
+        assert!(required.contains("ubq_no_pool,0,1023,crossbeam"));
+        assert!(required.contains("ubq_balanced,1,1023,crossbeam"));
+        assert!(required.contains("ubq_aggressive_prepare,1,1023,crossbeam"));
+        assert!(required.contains("ubq_consumer_pool_only,1,1023,crossbeam"));
     }
 
     #[test]
     fn pooled_winner_requires_v6_at_same_block_for_any_pool() {
         let mut entries = BTreeMap::new();
         entries.insert(
-            "ubq_v7,16,511".to_string(),
+            "ubq_consumer_pool_only,16,511,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 200.0,
             },
         );
         entries.insert(
-            "ubq_v5,16,511".to_string(),
+            "ubq_pool_conservative,16,511,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 150.0,
             },
         );
         let (_winner, required) = strict_immediate_winner_ubq_labels(&entries).expect("winner");
-        assert!(required.contains("ubq_v6,0,511"));
+        assert!(required.contains("ubq_no_pool,0,511,crossbeam"));
     }
 
     #[test]
     fn complete_variants_detection() {
         let mut entries = BTreeMap::new();
         entries.insert(
-            "ubq_v4,1,1023".to_string(),
+            "ubq_balanced,1,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 120.0,
             },
         );
         entries.insert(
-            "ubq_v3,1,1023".to_string(),
+            "ubq_aggressive_prepare,1,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 110.0,
             },
         );
         entries.insert(
-            "ubq_v5,1,1023".to_string(),
+            "ubq_pool_conservative,1,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 100.0,
             },
         );
         entries.insert(
-            "ubq_v7,1,1023".to_string(),
+            "ubq_consumer_pool_only,1,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 90.0,
             },
         );
         entries.insert(
-            "ubq_v6,0,1023".to_string(),
+            "ubq_no_pool,0,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 95.0,
             },
         );
         entries.insert(
-            "ubq_v4,2,1023".to_string(),
+            "ubq_balanced,2,1023,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 80.0,
             },
         );
         entries.insert(
-            "ubq_v4,1,511".to_string(),
+            "ubq_balanced,1,511,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 70.0,
             },
         );
         entries.insert(
-            "ubq_v4,1,2047".to_string(),
+            "ubq_balanced,1,2047,crossbeam".to_string(),
             Stats {
                 mean_ops_per_sec: 60.0,
             },
         );
         entries.insert(
-            "ubq_v4,1,1023,b".to_string(),
+            "ubq_balanced,1,1023,yield".to_string(),
             Stats {
                 mean_ops_per_sec: 50.0,
             },
@@ -775,7 +764,7 @@ mod tests {
         fs::create_dir_all(&run_dir).expect("mkdir");
         let payload = serde_json::json!({
             "meta": {
-                "ubq_label": "v4,8,127",
+                "ubq_label": "balanced,8,127,crossbeam",
                 "machine_label": "local"
             },
             "results": [
@@ -795,7 +784,7 @@ mod tests {
             .and_then(|m| m.get("throughput"))
             .and_then(|m| m.get("1p1c"))
             .expect("entries");
-        assert!(entries.contains_key("ubq_v4,8,127"));
+        assert!(entries.contains_key("ubq_balanced,8,127,crossbeam"));
         assert!(entries.contains_key("segqueue"));
 
         let _ = fs::remove_dir_all(&root);

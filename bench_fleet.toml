@@ -29,7 +29,7 @@ scenarios = [
   "64p32c",
   "64p64c",
 ]
-seed_label = "v4,8,127"
+seed_label = "balanced,8,127,crossbeam"
 
 [machines.local]
 local = true

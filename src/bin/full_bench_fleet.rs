@@ -809,7 +809,7 @@ mod tests {
             runs_dir: PathBuf::from("bench_results/runs"),
             plot_out_dir: PathBuf::from("bench_results/plots"),
             scenarios: vec!["1p1c".to_string(), "8p8c".to_string()],
-            seed_label: Some("v4,8,127".to_string()),
+            seed_label: Some("balanced,8,127,crossbeam".to_string()),
             sync_repo: true,
             strict_complete: false,
             dry_run: true,
@@ -900,14 +900,19 @@ mod tests {
     fn removed_complete_args_are_rejected() {
         let bad = vec!["--max-rounds=12".to_string()];
         assert!(validate_removed_complete_args(&bad).is_err());
-        let ok = vec!["--seed-label=v4,8,127".to_string()];
+        let ok = vec!["--seed-label=balanced,8,127,crossbeam".to_string()];
         assert!(validate_removed_complete_args(&ok).is_ok());
     }
 
     #[test]
     fn fixed_label_mode_args_are_rejected() {
-        let err = parse_args_from(["--machines", "local", "--ubq-label", "v7,16,511"])
-            .expect_err("expected removal error");
+        let err = parse_args_from([
+            "--machines",
+            "local",
+            "--ubq-label",
+            "consumer_pool_only,16,511,crossbeam",
+        ])
+        .expect_err("expected removal error");
         assert!(err.contains("fixed-label fleet mode was removed"));
     }
 
