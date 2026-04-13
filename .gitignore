@@ -1,6 +1,5 @@
 /target
 /bench_results
-.claude/
-.venv/
+.*/
 __pycache__/
 *.pyc

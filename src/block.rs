@@ -3,7 +3,7 @@ use std::{
     cell::UnsafeCell,
     mem::{MaybeUninit, align_of, size_of},
     ptr::null_mut,
-    sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize},
+    sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering},
 };
 
 /// Default number of element slots per block for [`crate::UBQ`].
@@ -13,8 +13,6 @@ pub const BLOCK_LENGTH: usize = DEFAULT_BLOCK_LENGTH;
 
 // Bits indicating the state of a slot:
 // * If a value has been written into the slot, `WRITE` is set.
-// * If a value has been read from the slot, `READ` is set.
-// * If the block is being destroyed, `DESTROY` is set.
 pub const WRITE: u8 = 1;
 
 /// A fixed-size ring-buffer segment.
@@ -71,19 +69,19 @@ impl<T, const BLOCK: usize, A> Block<T, BLOCK, A> {
         unsafe { Box::new_zeroed().assume_init() }
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub(crate) unsafe fn reset(this: *mut Self) {
         let () = Self::LAYOUT_CHECKS;
 
-        *self.next.get_mut() = null_mut();
-        *self.consumed.get_mut() = 0;
+        let block = unsafe { &*this };
 
-        self.slots
-            .iter_mut()
-            .filter_map(|Slot { state, .. }| {
-                let m = state.get_mut();
-                (*m != 0).then_some(m)
-            })
-            .for_each(|state| *state = 0);
+        block.next.store(null_mut(), Ordering::Relaxed);
+        block.consumed.store(0, Ordering::Relaxed);
+
+        for slot in &block.slots {
+            if slot.state.load(Ordering::Relaxed) != 0 {
+                slot.state.store(0, Ordering::Relaxed);
+            }
+        }
     }
 }
 

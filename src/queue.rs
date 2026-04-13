@@ -10,7 +10,7 @@ use std::{
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::DerefMut,
-    ptr::null_mut,
+    ptr::{null_mut, with_exposed_provenance_mut},
     sync::{
         Arc,
         atomic::{AtomicPtr, AtomicUsize, Ordering, fence},
@@ -93,7 +93,7 @@ impl<T, const BLOCK: usize, A> Head<T, BLOCK, A> {
     fn new(u: usize) -> Self {
         let mask = Self::mask();
         Self {
-            block: (u & !mask) as *mut Block<T, BLOCK, A>,
+            block: with_exposed_provenance_mut(u & !mask),
             index: u & mask,
         }
     }
@@ -103,7 +103,7 @@ impl<T, const BLOCK: usize, A> Head<T, BLOCK, A> {
     }
 
     fn pack(self) -> usize {
-        self.block.addr() | self.index
+        self.block.expose_provenance() | self.index
     }
 }
 
@@ -215,7 +215,7 @@ where
             phead: CachePadded::new(AtomicUsize::new(0)),
             chead: CachePadded::new(AtomicUsize::new(0)),
             pool: array::from_fn(|_| CachePadded::new(AtomicPtr::new(null_mut()))),
-            
+
             _variant: PhantomData,
             _backoff: PhantomData,
         }
@@ -262,12 +262,12 @@ where
 
             match self.phead.compare_exchange(
                 0,
-                ptr.addr() + 1,
+                ptr.expose_provenance() + 1,
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    self.chead.store(ptr.addr(), Ordering::Release);
+                    self.chead.store(ptr.expose_provenance(), Ordering::Release);
                     phead = Head {
                         index: 0,
                         block: ptr,
@@ -280,34 +280,55 @@ where
         if phead.is_zero() {
             phead = Head::new(self.phead.load(Ordering::Acquire));
 
-            loop {
-                if phead.index >= BLOCK {
-                    backoff.snooze();
+            if V::FAA {
+                loop {
+                    if phead.index >= BLOCK {
+                        backoff.snooze();
 
-                    phead = Head::new(self.phead.load(Ordering::Acquire));
-                    continue;
+                        phead = Head::new(self.phead.load(Ordering::Acquire));
+                        continue;
+                    }
+
+                    if next_block.is_none() && self.should_prepare_next_block(phead.index + 1) {
+                        next_block = Some(Block::<T, BLOCK, A>::new_zeroed());
+                    }
+
+                    phead = Head::new(self.phead.fetch_add(1, Ordering::SeqCst));
+
+                    if phead.index < BLOCK {
+                        break;
+                    };
                 }
+            } else {
+                loop {
+                    if phead.index >= BLOCK {
+                        backoff.snooze();
 
-                let new_phead = Head {
-                    block: phead.block,
-                    index: phead.index + 1,
-                };
+                        phead = Head::new(self.phead.load(Ordering::Acquire));
+                        continue;
+                    }
 
-                if next_block.is_none() && self.should_prepare_next_block(new_phead.index) {
-                    next_block = Some(Block::<T, BLOCK, A>::new_zeroed());
+                    let new_phead = Head {
+                        block: phead.block,
+                        index: phead.index + 1,
+                    };
+
+                    if next_block.is_none() && self.should_prepare_next_block(new_phead.index) {
+                        next_block = Some(Block::<T, BLOCK, A>::new_zeroed());
+                    }
+
+                    match self.phead.compare_exchange_weak(
+                        phead.pack(),
+                        new_phead.pack(),
+                        Ordering::SeqCst,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(head) => phead = Head::new(head),
+                    };
+
+                    backoff.spin();
                 }
-
-                match self.phead.compare_exchange_weak(
-                    phead.pack(),
-                    new_phead.pack(),
-                    Ordering::SeqCst,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(head) => phead = Head::new(head),
-                };
-
-                backoff.spin();
             }
         }
 
@@ -321,7 +342,7 @@ where
             };
 
             unsafe { (*phead.block).next.store(new, Ordering::Release) };
-            self.phead.store(new.addr(), Ordering::Release);
+            self.phead.store(new.expose_provenance(), Ordering::Release);
         }
 
         let slot = unsafe { (*phead.block).slots.get_unchecked(phead.index) };
@@ -362,7 +383,7 @@ where
                 fence(Ordering::SeqCst);
                 let phead = Head::<T, BLOCK, A>::new(self.phead.load(Ordering::Relaxed));
 
-                if phead.block.addr() == chead.block.addr() {
+                if phead.block == chead.block {
                     if chead.index >> 1 >= phead.index {
                         return None;
                     }
@@ -405,13 +426,12 @@ where
             let has_next = unsafe { !(*next).next.load(Ordering::Relaxed).is_null() };
 
             self.chead.store(
-                next.addr() + if has_next { 1 } else { 0 },
+                next.expose_provenance() + if has_next { 1 } else { 0 },
                 Ordering::Release,
             );
         }
 
-        let block = unsafe { &mut (*chead.block) };
-        let slot = unsafe { block.slots.get_unchecked(chead.index) };
+        let slot = unsafe { (*chead.block).slots.get_unchecked(chead.index) };
 
         while slot.state.load(Ordering::Acquire) & WRITE == 0 {
             backoff.snooze();
@@ -419,8 +439,8 @@ where
 
         let e = unsafe { slot.value.get().read().assume_init() };
 
-        if block.consumed.fetch_add(1, Ordering::Relaxed) + 1 == BLOCK {
-            block.reset();
+        if unsafe { (*chead.block).consumed.fetch_add(1, Ordering::Relaxed) } + 1 == BLOCK {
+            unsafe { Block::reset(chead.block) };
             self.release_consumed_block(chead.block);
         }
 

@@ -2,6 +2,7 @@
 name = "ubq"
 version = "3.0.0"
 edition = "2024"
+build = "build.rs"
 description = "Lock-free unbounded MPMC queue backed by a linked ring of fixed-size blocks."
 license = "MIT"
 readme = "README.md"
@@ -13,9 +14,14 @@ categories = ["concurrency", "data-structures"]
 bench = false
 
 [dependencies]
+concurrent-queue = "2"
+core_affinity = "0.8"
+crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
 serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt", "time"] }
 toml = "0.8"
 
 [features]
@@ -24,10 +30,9 @@ ubq_debug = []
 bench_small = []
 bench_medium = []
 bench_large = []
-
-[dev-dependencies]
-crossbeam-queue = "0.3"
-concurrent-queue = "2"
+# Compile the full static UBQ variant registry (928 monomorphizations).
+# Required for bench_frontier and bench_matrix to run in-process.
+bench_registry = []
 
 [[bench]]
 name = "ubq_bench"

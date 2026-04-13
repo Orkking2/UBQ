@@ -79,77 +79,90 @@ unbounded MPMC queue implementations (`segqueue` and `concurrent-queue`) in
 `1p1c`, `4p1c`, `1p4c`, `4p4c`, `8p1c`, `8p4c`, `8p8c`, `1p8c`, `4p8c`,
 `16p1c`, `1p16c`, `8p16c`, `16p8c`, `16p16c`, `32p1c`, `1p32c`, `16p32c`,
 `32p16c`, `32p32c`, `64p1c`, `1p64c`, `32p64c`, `64p32c`, and `64p64c`
-scenarios. By default it runs `throughput`, `fill_drain`, and
-`mutable_placeholder` modes.
-Scenarios are auto-skipped when `producers + consumers` exceeds
-`available_parallelism` on the host. Results are emitted as JSON; the plotting
-helper generates machine/mode/scenario bar plots.
+scenarios. The v2 harness has two layers:
 
-Run the default benchmark suite (release mode):
+- `bench_matrix`: direct matrix execution. It generates a temporary scheduler
+  crate under `target/bench_harness/`, compiles only the requested queue
+  monomorphizations, and writes v2 JSON files under `bench_results/runs`.
+- `bench_frontier`: higher-level frontier search. It inspects existing v2 runs,
+  expands the UBQ search graph scenario-by-scenario, and submits missing work to
+  `bench_matrix`.
+  A run is `frontier-complete` when no pending frontier bundles remain; the
+  frontier expands around baseline-beating UBQ labels and the best fully-covered
+  UBQ label per scenario/metric.
+
+UBQ labels are now 5-part identifiers:
+
+- `preset,pool,block,backoff,faa|cas`
+- Example: `balanced,8,127,crossbeam,cas`
+
+Run an explicit direct matrix:
 
 ```bash
-cargo bench --bench ubq_bench -- \
-  --ubq-label main \
+cargo run --release --bin bench_matrix -- \
   --machine-label local \
-  --out bench_results/ubq_default.json
+  --queues ubq,segqueue,concurrent-queue \
+  --ubq-label balanced,8,127,crossbeam,cas \
+  --scenarios 1p1c,8p8c \
+  --modes throughput,fill_drain \
+  --items-per-producer 1000000
 ```
 
-Limit to specific queues or scenarios:
+Run the frontier search on one machine:
 
 ```bash
-cargo bench --bench ubq_bench -- \
-  --queues=ubq,segqueue,concurrent-queue \
-  --scenarios=1p1c,8p8c
-```
-
-Run the nearest-neighbor search on a single machine:
-
-```bash
-cargo run --release --bin complete_benches -- \
-  --machine-label local
-
-# Repeat each direct benchmark 5 times to build sample size per bar.
-cargo run --release --bin complete_benches -- \
+cargo run --release --bin bench_frontier -- \
   --machine-label local \
-  --bench-arg --runs=5
+  --seed-label balanced,8,127,crossbeam,cas
 ```
 
-Run the full nearest-neighbor search across the machines configured in
-`bench_fleet.toml`, aggregate runs locally, and render plots once at the end:
+Run the configured fleet search:
 
 ```bash
 cargo run --release --bin full_bench_fleet -- \
-  --machines local,lab,hebrides
+  --machines local,lab,hebrides \
+  --repeats 3
 ```
 
-Search mode runs `complete_benches` once per machine (remote machines via SSH),
-pulls each machine's `bench_results/runs` back to local, and then refreshes the
-aggregated plots once. By default it allows incomplete per-machine scenario
-sweeps; pass `--strict-complete` to fail on any incomplete scenario. Default
-scenarios, remote paths, and seed fallback (`v4,8,127`) come from
-`bench_fleet.toml`. Use `--complete-arg=...` to forward additional
-`complete_benches` options. `complete_benches` runs its search rounds directly
-via `cargo bench`. Search outputs are written under
-`bench_results/runs/<machine>/<ubq>/<timestamp>.json`. Python is only needed for
-the plotting helpers.
+`full_bench_fleet` now runs `bench_frontier` per machine, syncs
+`bench_results/runs`, and refreshes plots under `bench_results/plots`.
+`--repeats` overrides the `defaults.repeats` value from `bench_fleet.toml`.
+Python is only needed for the plotting helpers.
 
-Generate plots manually (PNG + CSV):
+Set up a minimal plotting environment:
 
 ```bash
-python3 scripts/plot_bench.py --out-dir bench_results/plots bench_results/ubq_default.json
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements-plot.txt
+```
+
+Generate plots manually (PNG + CSV when `matplotlib` is installed, CSV-only otherwise):
+
+```bash
+./.venv/bin/python scripts/plot_bench.py --out-dir bench_results/plots path/to/run.json
 
 # Optional: choose error bars from repeated samples (default: sem).
-python3 scripts/plot_bench.py --error-bars stddev --out-dir bench_results/plots bench_results/ubq_default.json
+./.venv/bin/python scripts/plot_bench.py --error-bars stddev --out-dir bench_results/plots path/to/run.json
 
 # Render plots from all JSON files under bench_results/runs recursively.
-python3 scripts/plot_runs_folder.py --runs-dir bench_results/runs --out-dir bench_results/plots
+./.venv/bin/python scripts/plot_runs_folder.py --runs-dir bench_results/runs --out-dir bench_results/plots
+
+# Optional: cap how many configs appear in the per-machine scaling line chart.
+./.venv/bin/python scripts/plot_runs_folder.py --runs-dir bench_results/runs --out-dir bench_results/plots --max-line-series 10
 ```
 
 Outputs are grouped by `meta.machine_label` and mode, e.g.:
 
 - `bench_results/plots/local/throughput/1p1c_throughput.png`
+- `bench_results/plots/local/throughput/scenarios_line_throughput.png`
 - `bench_results/plots/lab/throughput/1p1c_throughput.png`
 - `bench_results/plots/hebrides/csv/throughput/1p1c_throughput.csv`
+- `bench_results/plots/hebrides/csv/throughput/scenarios_line_throughput.csv`
+
+Per-scenario UBQ outputs also emit a companion CSV named
+`<scenario>_immediate_variants_throughput.csv` that marks each strict
+immediate winner variant as `present` or `missing`.
 
 ### UBQ label variants
 

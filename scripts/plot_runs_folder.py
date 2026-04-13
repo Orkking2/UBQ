@@ -18,6 +18,24 @@ def collect_run_jsons(runs_dir: Path):
     return sorted(path for path in runs_dir.rglob("*.json") if path.is_file())
 
 
+def resolve_plot_python() -> str:
+    current_python = Path(sys.executable).resolve()
+    venv_candidates = (
+        REPO_ROOT / ".venv" / "bin" / "python",
+        REPO_ROOT / ".venv" / "Scripts" / "python.exe",
+    )
+
+    for candidate in venv_candidates:
+        if not candidate.is_file():
+            continue
+        resolved_candidate = candidate.resolve()
+        if resolved_candidate == current_python:
+            return str(candidate)
+        return str(candidate)
+
+    return sys.executable
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -28,7 +46,7 @@ def main() -> int:
     parser.add_argument(
         "--runs-dir",
         default="bench_results/runs",
-        help="Root directory containing machine/label run folders (default: bench_results/runs)",
+        help="Root directory containing machine/scenario/label run folders (default: bench_results/runs)",
     )
     parser.add_argument(
         "--out-dir",
@@ -51,24 +69,32 @@ def main() -> int:
         action="store_true",
         help="Pass through to plot_bench.py to keep pre-existing output files.",
     )
+    parser.add_argument(
+        "--max-line-series",
+        type=int,
+        default=10,
+        help="Maximum configs shown in per-machine scenario line charts; <=0 shows all (default: 10)",
+    )
     args = parser.parse_args()
 
     runs_dir = Path(args.runs_dir)
     out_dir = Path(args.out_dir)
-    files = collect_run_jsons(runs_dir)
-
-    if not files:
+    if not collect_run_jsons(runs_dir):
         print(f"No benchmark JSON files found under: {runs_dir}")
         return 1
 
+    plot_python = resolve_plot_python()
     cmd = [
-        sys.executable,
+        plot_python,
         str(REPO_ROOT / "scripts" / "plot_bench.py"),
+        "--runs-dir",
+        str(runs_dir),
         "--out-dir",
         str(out_dir),
         "--error-bars",
         args.error_bars,
-        *[str(path) for path in files],
+        "--max-line-series",
+        str(args.max_line_series),
     ]
     if args.no_clean:
         cmd.append("--no-clean")

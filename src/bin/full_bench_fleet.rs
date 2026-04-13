@@ -5,6 +5,7 @@ use bench_tooling::{
     collect_machine_labels, find_missing_machine_labels, format_cmd, join_remote_path,
     normalize_machine, normalize_machine_list, remote_cd_expr, validate_forwarded_args,
 };
+use clap::Parser;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,15 +18,44 @@ use std::thread;
 const REPO_SYNC_INCLUDE_PATTERNS: &[&str] = &[
     "/Cargo.toml",
     "/Cargo.lock",
+    "/build.rs",
     "/src/",
     "/src/**",
     "/benches/",
     "/benches/**",
 ];
 
-const FORBIDDEN_COMPLETE_ARGS: &[&str] = &["--machine-label", "--runs-dir", "--dry-run"];
-const REMOVED_COMPLETE_ARGS: &[&str] = &["--max-rounds"];
-const REMOVED_FLEET_ARGS: &[&str] = &["--bench-arg", "--ubq-label", "--ubq-labels"];
+const FORBIDDEN_FRONTIER_ARGS: &[&str] =
+    &["--machine-label", "--runs-dir", "--repeats", "--dry-run"];
+
+#[derive(Parser, Debug)]
+#[command(name = "full_bench_fleet")]
+struct Args {
+    /// Comma-separated list of machine names (from config)
+    #[arg(long, required = true, value_delimiter = ',')]
+    machines: Vec<String>,
+
+    #[arg(long, default_value = "bench_fleet.toml")]
+    config: PathBuf,
+
+    #[arg(long)]
+    repeats: Option<usize>,
+
+    #[arg(long)]
+    no_sync_repo: bool,
+
+    #[arg(long)]
+    skip_local_plot: bool,
+
+    #[arg(long)]
+    plot_partial: bool,
+
+    #[arg(long)]
+    dry_run: bool,
+
+    #[arg(long = "frontier-arg", alias = "complete-arg")]
+    frontier_args: Vec<String>,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct FleetConfig {
@@ -40,7 +70,11 @@ struct FleetDefaults {
     remote_repo_dir: Option<String>,
     remote_runs_dir: Option<String>,
     scenarios: Option<Vec<String>>,
-    seed_label: Option<String>,
+    queues: Option<Vec<String>>,
+    modes: Option<Vec<String>>,
+    items_per_producer: Option<Vec<u64>>,
+    repeats: Option<usize>,
+    ubq_labels: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -50,18 +84,6 @@ struct MachineConfig {
     machine_label: Option<String>,
     remote_repo_dir: Option<String>,
     remote_runs_dir: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct FleetArgs {
-    machines: Vec<String>,
-    config_path: PathBuf,
-    no_sync_repo: bool,
-    strict_complete: bool,
-    skip_local_plot: bool,
-    plot_partial: bool,
-    dry_run: bool,
-    complete_args: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,11 +102,14 @@ struct FleetRuntime {
     runs_dir: PathBuf,
     plot_out_dir: PathBuf,
     scenarios: Vec<String>,
-    seed_label: Option<String>,
+    queues: Vec<String>,
+    modes: Vec<String>,
+    items_per_producer: Vec<u64>,
+    repeats: usize,
+    ubq_labels: Vec<String>,
     sync_repo: bool,
-    strict_complete: bool,
     dry_run: bool,
-    complete_args: Vec<String>,
+    frontier_args: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,151 +118,6 @@ struct MachineRunResult {
     machine_label: String,
     ok: bool,
     error: Option<String>,
-}
-
-fn print_usage_and_exit(code: i32) -> ! {
-    eprintln!(
-        "Usage: cargo run --bin full_bench_fleet -- [options]\n\
-         \n\
-         Required:\n\
-           --machines CSV\n\
-         \n\
-         Options:\n\
-           --config PATH             (default: bench_fleet.toml)\n\
-           --no-sync-repo\n\
-           --strict-complete\n\
-           --skip-local-plot\n\
-           --plot-partial\n\
-           --dry-run\n\
-           --complete-arg ARG        (repeatable)\n\
-           -h, --help"
-    );
-    std::process::exit(code);
-}
-
-fn parse_args() -> Result<FleetArgs, String> {
-    parse_args_from(std::env::args().skip(1))
-}
-
-fn parse_args_from<I, S>(raw_args: I) -> Result<FleetArgs, String>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let mut machines_raw: Option<String> = None;
-    let mut config_path = PathBuf::from("bench_fleet.toml");
-    let mut no_sync_repo = false;
-    let mut strict_complete = false;
-    let mut skip_local_plot = false;
-    let mut plot_partial = false;
-    let mut dry_run = false;
-    let mut complete_args: Vec<String> = Vec::new();
-
-    let mut args = raw_args.into_iter().map(Into::into);
-    while let Some(arg) = args.next() {
-        if arg == "-h" || arg == "--help" {
-            print_usage_and_exit(0);
-        }
-        if arg == "--no-sync-repo" {
-            no_sync_repo = true;
-            continue;
-        }
-        if arg == "--strict-complete" {
-            strict_complete = true;
-            continue;
-        }
-        if arg == "--skip-local-plot" {
-            skip_local_plot = true;
-            continue;
-        }
-        if arg == "--plot-partial" {
-            plot_partial = true;
-            continue;
-        }
-        if arg == "--dry-run" {
-            dry_run = true;
-            continue;
-        }
-        if arg == "--machines" {
-            let value = args
-                .next()
-                .ok_or_else(|| "--machines requires a value".to_string())?;
-            machines_raw = Some(value);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--machines=") {
-            machines_raw = Some(value.to_string());
-            continue;
-        }
-        if arg == "--config" {
-            let value = args
-                .next()
-                .ok_or_else(|| "--config requires a value".to_string())?;
-            config_path = PathBuf::from(value);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--config=") {
-            config_path = PathBuf::from(value);
-            continue;
-        }
-        if arg == "--complete-arg" {
-            let value = args
-                .next()
-                .ok_or_else(|| "--complete-arg requires a value".to_string())?;
-            complete_args.push(value);
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--complete-arg=") {
-            complete_args.push(value.to_string());
-            continue;
-        }
-        if REMOVED_FLEET_ARGS
-            .iter()
-            .any(|key| arg == *key || arg.starts_with(&format!("{key}=")))
-        {
-            return Err(
-                "fixed-label fleet mode was removed; full_bench_fleet now only coordinates complete_benches and final plotting"
-                    .to_string(),
-            );
-        }
-        return Err(format!("unknown argument: {arg}"));
-    }
-
-    let machines = normalize_machine_list(
-        machines_raw
-            .as_deref()
-            .ok_or_else(|| "--machines is required".to_string())?,
-    );
-    if machines.is_empty() {
-        return Err("--machines produced no valid machine names".to_string());
-    }
-
-    validate_forwarded_args(&complete_args, FORBIDDEN_COMPLETE_ARGS)?;
-    validate_removed_complete_args(&complete_args)?;
-
-    Ok(FleetArgs {
-        machines,
-        config_path,
-        no_sync_repo,
-        strict_complete,
-        skip_local_plot,
-        plot_partial,
-        dry_run,
-        complete_args,
-    })
-}
-
-fn validate_removed_complete_args(args: &[String]) -> Result<(), String> {
-    for arg in args {
-        for key in REMOVED_COMPLETE_ARGS {
-            if arg == key || arg.starts_with(&format!("{key}=")) {
-                return Err(format!(
-                    "{key} was removed; the search now stops on completion, missing seed, or no-progress within a finite UBQ label space"
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn load_config(path: &Path) -> Result<FleetConfig, String> {
@@ -398,33 +278,51 @@ fn run_streaming_cmd(
     Ok(status.code().unwrap_or(1))
 }
 
-fn make_complete_base_args(
+fn make_frontier_base_args(
     runtime: &FleetRuntime,
     machine_label: &str,
     runs_dir: &str,
 ) -> Vec<String> {
-    let mut complete_args = vec![
+    let mut frontier_args = vec![
         "--machine-label".to_string(),
         machine_label.to_string(),
         "--runs-dir".to_string(),
         runs_dir.to_string(),
     ];
     if !runtime.scenarios.is_empty() {
-        complete_args.push("--scenarios".to_string());
-        complete_args.push(runtime.scenarios.join(","));
+        frontier_args.push("--scenarios".to_string());
+        frontier_args.push(runtime.scenarios.join(","));
     }
-    if let Some(seed_label) = &runtime.seed_label {
-        complete_args.push("--seed-label".to_string());
-        complete_args.push(seed_label.clone());
+    if !runtime.queues.is_empty() {
+        frontier_args.push("--queues".to_string());
+        frontier_args.push(runtime.queues.join(","));
     }
-    if !runtime.strict_complete {
-        complete_args.push("--allow-incomplete".to_string());
+    if !runtime.modes.is_empty() {
+        frontier_args.push("--modes".to_string());
+        frontier_args.push(runtime.modes.join(","));
     }
-    complete_args.extend(runtime.complete_args.clone());
+    if !runtime.items_per_producer.is_empty() {
+        frontier_args.push("--items-per-producer".to_string());
+        frontier_args.push(
+            runtime
+                .items_per_producer
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    frontier_args.push("--repeats".to_string());
+    frontier_args.push(runtime.repeats.to_string());
+    for seed_label in &runtime.ubq_labels {
+        frontier_args.push("--seed-label".to_string());
+        frontier_args.push(seed_label.clone());
+    }
+    frontier_args.extend(runtime.frontier_args.clone());
     if runtime.dry_run {
-        complete_args.push("--dry-run".to_string());
+        frontier_args.push("--dry-run".to_string());
     }
-    complete_args
+    frontier_args
 }
 
 fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -> Vec<String> {
@@ -434,11 +332,13 @@ fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -
         "run".to_string(),
         "--quiet".to_string(),
         "--release".to_string(),
+        "--features".to_string(),
+        "bench_registry".to_string(),
         "--bin".to_string(),
-        "complete_benches".to_string(),
+        "bench_frontier".to_string(),
         "--".to_string(),
     ];
-    cmd.extend(make_complete_base_args(
+    cmd.extend(make_frontier_base_args(
         runtime,
         &machine.machine_label,
         &runs_dir,
@@ -446,17 +346,20 @@ fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -
     cmd
 }
 
-fn build_remote_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -> Vec<String> {
+/// Build the shell payload (no SSH wrapper) for running bench_frontier on a remote machine.
+fn build_remote_bench_payload(runtime: &FleetRuntime, machine: &ResolvedMachine) -> String {
     let mut inner = vec![
         "cargo".to_string(),
         "run".to_string(),
         "--quiet".to_string(),
         "--release".to_string(),
+        "--features".to_string(),
+        "bench_registry".to_string(),
         "--bin".to_string(),
-        "complete_benches".to_string(),
+        "bench_frontier".to_string(),
         "--".to_string(),
     ];
-    inner.extend(make_complete_base_args(
+    inner.extend(make_frontier_base_args(
         runtime,
         &machine.machine_label,
         &machine.remote_runs_dir,
@@ -466,15 +369,264 @@ fn build_remote_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) 
         .map(|s| bench_tooling::shell_quote(s))
         .collect::<Vec<_>>()
         .join(" ");
-
-    let payload = format!(
+    format!(
         "if [ -f \"$HOME/.cargo/env\" ]; then . \"$HOME/.cargo/env\"; fi; \
          export PATH=\"$HOME/.cargo/bin:$PATH\"; \
          cd {} && {}",
         remote_cd_expr(&machine.remote_repo_dir),
         inner_quoted
-    );
+    )
+}
+
+#[cfg(test)]
+fn build_remote_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -> Vec<String> {
+    let payload = build_remote_bench_payload(runtime, machine);
     vec!["ssh".to_string(), machine.host.clone(), payload]
+}
+
+// ── tmux helpers ─────────────────────────────────────────────────────────────
+
+fn tmux_session_name(machine_label: &str) -> String {
+    let safe: String = machine_label
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("ubq_bench_{safe}")
+}
+
+/// Shell expression (double-quoted, `$HOME`-safe) for the remote bench log file.
+fn remote_bench_log_expr(machine: &ResolvedMachine) -> String {
+    let safe_label: String = machine
+        .machine_label
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let log_path = format!(
+        "{}/target/ubq_bench_{safe_label}.log",
+        machine.remote_repo_dir.trim_end_matches('/')
+    );
+    remote_cd_expr(&log_path)
+}
+
+/// Check whether a tmux session is alive on the remote host.
+/// Returns exit code 0 if the session exists, non-zero otherwise.
+fn build_remote_check_tmux_cmd(machine: &ResolvedMachine, session: &str) -> Vec<String> {
+    vec![
+        "ssh".to_string(),
+        machine.host.clone(),
+        format!(
+            "tmux has-session -t {} 2>/dev/null",
+            bench_tooling::shell_quote(session)
+        ),
+    ]
+}
+
+/// Count JSON result files already collected in the remote runs directory.
+fn build_remote_count_json_cmd(machine: &ResolvedMachine, remote_runs_root: &str) -> Vec<String> {
+    vec![
+        "ssh".to_string(),
+        machine.host.clone(),
+        format!(
+            "find {} -name '*.json' -type f 2>/dev/null | wc -l",
+            remote_cd_expr(remote_runs_root)
+        ),
+    ]
+}
+
+/// Launch a new detached tmux session that runs the bench payload and tees
+/// stdout+stderr to `log_expr`, appending `__BENCH_DONE__` when finished.
+fn build_remote_tmux_launch_cmd(
+    machine: &ResolvedMachine,
+    session: &str,
+    bench_payload: &str,
+    log_expr: &str,
+) -> Vec<String> {
+    let full_payload = format!(
+        "mkdir -p $(dirname {log_expr}) && {{ {bench_payload}; }} 2>&1 | tee {log_expr}; \
+         echo __BENCH_DONE__ >> {log_expr}"
+    );
+    let tmux_cmd = format!(
+        "tmux new-session -d -s {} {}",
+        bench_tooling::shell_quote(session),
+        bench_tooling::shell_quote(&full_payload),
+    );
+    vec!["ssh".to_string(), machine.host.clone(), tmux_cmd]
+}
+
+/// Stream the remote log file, replaying all existing content then following
+/// new writes.  Terminates when the `__BENCH_DONE__` sentinel appears.
+///
+/// The log file is created by `tee` when the tmux session's shell pipeline
+/// starts, but cargo may take several minutes to compile before any output
+/// appears.  We poll until the file exists before starting `tail -f` so that
+/// we don't race compilation startup.
+///
+/// `awk` is used with an explicit `fflush()` after every print to defeat the
+/// full-buffering that awk applies when its stdout is a pipe (non-TTY).
+/// Without `fflush()` output would only appear once awk's 4-8 KB internal
+/// buffer filled, giving the appearance of no output at all.
+fn build_remote_stream_log_cmd(
+    machine: &ResolvedMachine,
+    session: &str,
+    log_expr: &str,
+) -> Vec<String> {
+    let session_quoted = bench_tooling::shell_quote(session);
+    let stream_cmd = format!(
+        // Wait for the log file with periodic feedback (cargo compile can take
+        // several minutes on the first bench_registry build).
+        "attempt=0; \
+         while [ ! -f {log_expr} ]; do \
+             if ! tmux has-session -t {session_quoted} 2>/dev/null; then \
+                 echo \"bench: tmux session exited before log was created\" >&2; \
+                 exit 2; \
+             fi; \
+             sleep 2; attempt=$((attempt+1)); \
+             [ $((attempt % 15)) -eq 0 ] && \
+                 echo \"bench: still waiting for log ($((attempt*2))s elapsed)\"; \
+         done; \
+         (tail -n +1 -f {log_expr} | \
+             awk '/^__BENCH_DONE__$/ {{exit}} {{print; fflush()}}') & \
+         stream_pid=$!; \
+         while kill -0 \"$stream_pid\" 2>/dev/null; do \
+             if grep -q '^__BENCH_DONE__$' {log_expr}; then \
+                 wait \"$stream_pid\" 2>/dev/null || true; \
+                 exit 0; \
+             fi; \
+             if ! tmux has-session -t {session_quoted} 2>/dev/null; then \
+                 echo \"bench: tmux session exited before completion sentinel\" >&2; \
+                 kill \"$stream_pid\" 2>/dev/null || true; \
+                 wait \"$stream_pid\" 2>/dev/null || true; \
+                 exit 3; \
+             fi; \
+             sleep 2; \
+         done; \
+         wait \"$stream_pid\""
+    );
+    vec!["ssh".to_string(), machine.host.clone(), stream_cmd]
+}
+
+fn describe_remote_stream_failure(machine: &ResolvedMachine, code: i32) -> String {
+    match code {
+        2 => format!(
+            "remote tmux session on {} exited before its log file was created",
+            machine.host
+        ),
+        3 => format!(
+            "remote tmux session on {} exited before writing the completion sentinel",
+            machine.host
+        ),
+        _ => format!(
+            "remote log stream failed for {} with exit code {code}",
+            machine.name
+        ),
+    }
+}
+
+/// Run a remote command capturing its stdout as a trimmed string.
+fn run_capturing_stdout(args: &[String], cwd: &Path) -> Result<String, String> {
+    let output = std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .current_dir(cwd)
+        .output()
+        .map_err(|err| format!("failed to run '{}': {err}", args[0]))?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Run a remote machine via a tmux session so that bench progress survives
+/// SSH disconnections.  On reconnect the existing session is detected and
+/// its log is replayed from the beginning, giving a full progress report.
+fn run_remote_machine_via_tmux(
+    runtime: &FleetRuntime,
+    machine: &ResolvedMachine,
+) -> Result<(), String> {
+    // 1. Optionally sync the repo.
+    if runtime.sync_repo {
+        println!(
+            "  syncing repo to {}:{}",
+            machine.host, machine.remote_repo_dir
+        );
+        let cmd = build_sync_cmd(machine);
+        let code = run_cmd(&cmd, &runtime.repo_root, runtime.dry_run)?;
+        if code != 0 {
+            return Err(format!("repo sync failed with exit code {code}"));
+        }
+    }
+
+    let session = tmux_session_name(&machine.machine_label);
+    let log_expr = remote_bench_log_expr(machine);
+    let remote_runs_root = join_remote_path(&machine.remote_repo_dir, &machine.remote_runs_dir);
+
+    // 2. Check for a running session.
+    let check_cmd = build_remote_check_tmux_cmd(machine, &session);
+    let session_code = run_cmd(&check_cmd, &runtime.repo_root, runtime.dry_run)?;
+    let session_exists = session_code == 0;
+
+    if session_exists {
+        println!(
+            "  reconnecting to existing tmux session '{}' on {}",
+            session, machine.host
+        );
+        // Show how many result files are already on disk as a quick progress hint.
+        let count_cmd = build_remote_count_json_cmd(machine, &remote_runs_root);
+        if let Ok(count) = run_capturing_stdout(&count_cmd, &runtime.repo_root) {
+            println!(
+                "  progress: {} JSON result file(s) collected so far",
+                count.trim()
+            );
+        }
+        println!("  replaying log from start — all previous output follows:");
+    } else {
+        println!(
+            "  launching bench_frontier on {} via tmux session '{}'",
+            machine.host, session
+        );
+        let bench_payload = build_remote_bench_payload(runtime, machine);
+        let launch_cmd = build_remote_tmux_launch_cmd(machine, &session, &bench_payload, &log_expr);
+        let code = run_cmd(&launch_cmd, &runtime.repo_root, runtime.dry_run)?;
+        if code != 0 {
+            return Err(format!(
+                "failed to launch tmux session '{session}' on {}",
+                machine.host
+            ));
+        }
+    }
+
+    // 3. Stream the log until the bench completes (sentinel appears).
+    let stream_cmd = build_remote_stream_log_cmd(machine, &session, &log_expr);
+    let stream_code = run_streaming_cmd(
+        &stream_cmd,
+        &runtime.repo_root,
+        runtime.dry_run,
+        &machine.name,
+    )?;
+    if stream_code != 0 {
+        return Err(describe_remote_stream_failure(machine, stream_code));
+    }
+
+    // 4. Pull results back to the local runs directory.
+    println!("  pulling runs from {}:{}", machine.host, remote_runs_root);
+    let exists_cmd = build_remote_dir_exists_cmd(machine, &remote_runs_root);
+    let exists_code = run_cmd(&exists_cmd, &runtime.repo_root, runtime.dry_run)?;
+    if exists_code == 1 {
+        println!(
+            "WARNING: remote runs dir missing for {}: {}",
+            machine.name, remote_runs_root
+        );
+        return Ok(());
+    }
+    if exists_code != 0 {
+        return Err(format!(
+            "failed to probe remote runs dir (exit {exists_code}) for {}",
+            machine.name
+        ));
+    }
+
+    let pull_cmd = build_pull_runs_cmd(machine, &remote_runs_root, &runtime.runs_dir);
+    let code = run_cmd(&pull_cmd, &runtime.repo_root, runtime.dry_run)?;
+    if code != 0 {
+        return Err(format!("failed to pull remote runs with exit code {code}"));
+    }
+    Ok(())
 }
 
 fn build_sync_cmd(machine: &ResolvedMachine) -> Vec<String> {
@@ -532,75 +684,12 @@ fn run_machine(runtime: Arc<FleetRuntime>, machine: ResolvedMachine) -> MachineR
                 if code == 0 {
                     Ok(())
                 } else {
-                    Err(format!(
-                        "local complete_benches failed with exit code {code}"
-                    ))
+                    Err(format!("local bench_frontier failed with exit code {code}"))
                 }
             },
         )
     } else {
-        let outcome = if runtime.sync_repo {
-            println!(
-                "  syncing repo to {}:{}",
-                machine.host, machine.remote_repo_dir
-            );
-            let cmd = build_sync_cmd(&machine);
-            run_cmd(&cmd, &runtime.repo_root, runtime.dry_run).and_then(|code| {
-                if code == 0 {
-                    Ok(())
-                } else {
-                    Err(format!("repo sync failed with exit code {code}"))
-                }
-            })
-        } else {
-            Ok(())
-        };
-
-        let outcome = outcome.and_then(|_| {
-            println!("  starting remote search on {}", machine.host);
-            let cmd = build_remote_complete_cmd(&runtime, &machine);
-            run_streaming_cmd(&cmd, &runtime.repo_root, runtime.dry_run, &machine.name).and_then(
-                |code| {
-                    if code == 0 {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "remote complete_benches failed with exit code {code}"
-                        ))
-                    }
-                },
-            )
-        });
-
-        outcome.and_then(|_| {
-            let remote_runs_root =
-                join_remote_path(&machine.remote_repo_dir, &machine.remote_runs_dir);
-            println!("  pulling runs from {}:{}", machine.host, remote_runs_root);
-            let exists_cmd = build_remote_dir_exists_cmd(&machine, &remote_runs_root);
-            let exists_code = run_cmd(&exists_cmd, &runtime.repo_root, runtime.dry_run)?;
-            if exists_code == 1 {
-                println!(
-                    "WARNING: remote runs dir missing for {}: {}",
-                    machine.name, remote_runs_root
-                );
-                return Ok(());
-            }
-            if exists_code != 0 {
-                return Err(format!(
-                    "failed to probe remote runs dir (exit {exists_code}) for {}",
-                    machine.name
-                ));
-            }
-
-            let pull_cmd = build_pull_runs_cmd(&machine, &remote_runs_root, &runtime.runs_dir);
-            run_cmd(&pull_cmd, &runtime.repo_root, runtime.dry_run).and_then(|code| {
-                if code == 0 {
-                    Ok(())
-                } else {
-                    Err(format!("failed to pull remote runs with exit code {code}"))
-                }
-            })
-        })
+        run_remote_machine_via_tmux(&runtime, &machine)
     };
 
     let result = match result {
@@ -619,7 +708,7 @@ fn run_machine(runtime: Arc<FleetRuntime>, machine: ResolvedMachine) -> MachineR
     };
 
     if result.ok {
-        println!("  machine complete: {}", result.machine_name);
+        println!("  machine frontier-complete: {}", result.machine_name);
     }
 
     result
@@ -648,8 +737,15 @@ fn render_plots(runtime: &FleetRuntime, no_clean: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn run(args: FleetArgs) -> Result<i32, String> {
-    let config = load_config(&args.config_path)?;
+fn run(args: Args) -> Result<i32, String> {
+    validate_forwarded_args(&args.frontier_args, FORBIDDEN_FRONTIER_ARGS)?;
+
+    let machines = normalize_machine_list(&args.machines.join(","));
+    if machines.is_empty() {
+        return Err("--machines produced no valid machine names".to_string());
+    }
+
+    let config = load_config(&args.config)?;
     let defaults = config.defaults.clone();
 
     let runs_dir = PathBuf::from(
@@ -665,7 +761,25 @@ fn run(args: FleetArgs) -> Result<i32, String> {
             .unwrap_or_else(|| "bench_results/plots".to_string()),
     );
     let scenarios = defaults.scenarios.clone().unwrap_or_default();
-    let seed_label = defaults.seed_label.clone().map(|v| v.trim().to_string());
+    let queues = defaults.queues.clone().unwrap_or_else(|| {
+        vec![
+            "ubq".to_string(),
+            "segqueue".to_string(),
+            "concurrent-queue".to_string(),
+        ]
+    });
+    let modes = defaults
+        .modes
+        .clone()
+        .unwrap_or_else(|| vec!["throughput".to_string()]);
+    let items_per_producer = defaults
+        .items_per_producer
+        .clone()
+        .unwrap_or_else(|| vec![1_000_000]);
+    let repeats = args
+        .repeats
+        .unwrap_or_else(|| defaults.repeats.unwrap_or(1));
+    let ubq_labels = defaults.ubq_labels.clone().unwrap_or_default();
 
     let repo_root =
         std::env::current_dir().map_err(|err| format!("failed to read current dir: {err}"))?;
@@ -675,15 +789,18 @@ fn run(args: FleetArgs) -> Result<i32, String> {
         runs_dir,
         plot_out_dir,
         scenarios,
-        seed_label,
+        queues,
+        modes,
+        items_per_producer,
+        repeats,
+        ubq_labels,
         sync_repo: !args.no_sync_repo,
-        strict_complete: args.strict_complete,
         dry_run: args.dry_run,
-        complete_args: args.complete_args.clone(),
+        frontier_args: args.frontier_args.clone(),
     });
 
     let mut resolved = Vec::new();
-    for machine_name in &args.machines {
+    for machine_name in &machines {
         let machine_cfg = config
             .machines
             .get(machine_name)
@@ -701,11 +818,12 @@ fn run(args: FleetArgs) -> Result<i32, String> {
     );
     println!("Local runs dir: {}", runtime.runs_dir.display());
     println!("Plot out dir: {}", runtime.plot_out_dir.display());
-    println!("Mode: complete search");
-    if !runtime.complete_args.is_empty() {
+    println!("Mode: frontier search");
+    println!("Repeats: {}", runtime.repeats);
+    if !runtime.frontier_args.is_empty() {
         println!(
-            "Forwarded complete args: {}",
-            runtime.complete_args.join(" ")
+            "Forwarded frontier args: {}",
+            runtime.frontier_args.join(" ")
         );
     }
 
@@ -783,13 +901,7 @@ fn run(args: FleetArgs) -> Result<i32, String> {
 }
 
 fn main() {
-    let args = match parse_args() {
-        Ok(v) => v,
-        Err(err) => {
-            eprintln!("{err}");
-            std::process::exit(2);
-        }
-    };
+    let args = Args::parse();
     match run(args) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
@@ -809,11 +921,18 @@ mod tests {
             runs_dir: PathBuf::from("bench_results/runs"),
             plot_out_dir: PathBuf::from("bench_results/plots"),
             scenarios: vec!["1p1c".to_string(), "8p8c".to_string()],
-            seed_label: Some("balanced,8,127,crossbeam".to_string()),
+            queues: vec![
+                "ubq".to_string(),
+                "segqueue".to_string(),
+                "concurrent-queue".to_string(),
+            ],
+            modes: vec!["throughput".to_string()],
+            items_per_producer: vec![1_000],
+            repeats: 2,
+            ubq_labels: vec!["balanced,8,127,crossbeam,cas".to_string()],
             sync_repo: true,
-            strict_complete: false,
             dry_run: true,
-            complete_args: vec!["--bench-arg=--items-per-producer=1000".to_string()],
+            frontier_args: vec!["--parallelism=16".to_string()],
         }
     }
 
@@ -840,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn local_complete_command_contains_expected_args() {
+    fn local_frontier_command_contains_expected_args() {
         let runtime = runtime();
         let machine = machine_local();
         let cmd = build_local_complete_cmd(&runtime, &machine);
@@ -849,17 +968,19 @@ mod tests {
             "run".to_string(),
             "--quiet".to_string(),
             "--release".to_string(),
+            "--features".to_string(),
+            "bench_registry".to_string(),
             "--bin".to_string(),
-            "complete_benches".to_string(),
+            "bench_frontier".to_string(),
             "--".to_string(),
         ]));
         assert!(cmd.contains(&"--machine-label".to_string()));
         assert!(cmd.contains(&"local".to_string()));
-        assert!(cmd.contains(&"--allow-incomplete".to_string()));
+        assert!(cmd.contains(&"--seed-label".to_string()));
     }
 
     #[test]
-    fn remote_complete_command_uses_ssh_and_cargo() {
+    fn remote_frontier_command_uses_ssh_and_cargo() {
         let runtime = runtime();
         let machine = machine_remote();
         let cmd = build_remote_complete_cmd(&runtime, &machine);
@@ -867,7 +988,7 @@ mod tests {
         assert_eq!(cmd[1], "lab");
         assert!(cmd[2].contains("cargo"));
         assert!(cmd[2].contains("--quiet"));
-        assert!(cmd[2].contains("complete_benches"));
+        assert!(cmd[2].contains("bench_frontier"));
         assert!(cmd[2].contains("cd \"$HOME/UBQ\""));
     }
 
@@ -888,37 +1009,120 @@ mod tests {
     #[test]
     fn forwarded_arg_validation_blocks_protected_keys() {
         let bad = vec!["--machine-label=foo".to_string()];
-        assert!(validate_forwarded_args(&bad, FORBIDDEN_COMPLETE_ARGS).is_err());
+        assert!(validate_forwarded_args(&bad, FORBIDDEN_FRONTIER_ARGS).is_err());
         let ok = vec![
-            "--mode=throughput".to_string(),
-            "--bench-arg=--n=1".to_string(),
+            "--parallelism=16".to_string(),
+            "--seed-label=balanced,8,127,crossbeam,cas".to_string(),
         ];
-        assert!(validate_forwarded_args(&ok, FORBIDDEN_COMPLETE_ARGS).is_ok());
+        assert!(validate_forwarded_args(&ok, FORBIDDEN_FRONTIER_ARGS).is_ok());
     }
 
     #[test]
-    fn removed_complete_args_are_rejected() {
-        let bad = vec!["--max-rounds=12".to_string()];
-        assert!(validate_removed_complete_args(&bad).is_err());
-        let ok = vec!["--seed-label=balanced,8,127,crossbeam".to_string()];
-        assert!(validate_removed_complete_args(&ok).is_ok());
+    fn parse_args_accepts_top_level_repeats_override() {
+        let args = Args::try_parse_from(["prog", "--machines", "local,lab", "--repeats", "3"])
+            .expect("parse args");
+        let machines = normalize_machine_list(&args.machines.join(","));
+        assert_eq!(machines, vec!["local".to_string(), "lab".to_string()]);
+        assert_eq!(args.repeats, Some(3));
     }
 
     #[test]
-    fn fixed_label_mode_args_are_rejected() {
-        let err = parse_args_from([
-            "--machines",
-            "local",
-            "--ubq-label",
-            "consumer_pool_only,16,511,crossbeam",
-        ])
-        .expect_err("expected removal error");
-        assert!(err.contains("fixed-label fleet mode was removed"));
+    fn forwarded_arg_validation_blocks_repeats() {
+        let bad = vec!["--repeats=4".to_string()];
+        assert!(validate_forwarded_args(&bad, FORBIDDEN_FRONTIER_ARGS).is_err());
     }
 
     #[test]
     fn configured_python_is_used_when_present() {
         let resolved = resolve_python_bin_with_override(Some("python3")).expect("resolve python");
         assert_eq!(resolved, "python3");
+    }
+
+    #[test]
+    fn tmux_session_name_is_deterministic_and_safe() {
+        assert_eq!(tmux_session_name("lab"), "ubq_bench_lab");
+        assert_eq!(tmux_session_name("my-server"), "ubq_bench_my_server");
+        assert_eq!(tmux_session_name("box.local"), "ubq_bench_box_local");
+    }
+
+    #[test]
+    fn remote_bench_log_expr_expands_home() {
+        let machine = machine_remote();
+        let expr = remote_bench_log_expr(&machine);
+        assert!(expr.contains("$HOME"), "log expr should reference $HOME");
+        assert!(
+            expr.contains("ubq_bench_lab"),
+            "log expr should include machine label"
+        );
+        assert!(expr.ends_with(".log\""), "log expr should end with .log");
+    }
+
+    #[test]
+    fn tmux_launch_cmd_wraps_payload_and_sentinel() {
+        let machine = machine_remote();
+        let launch = build_remote_tmux_launch_cmd(
+            &machine,
+            "ubq_bench_lab",
+            "cd /repo && cargo run",
+            "\"$HOME/UBQ/target/ubq_bench_lab.log\"",
+        );
+        assert_eq!(launch[0], "ssh");
+        assert_eq!(launch[1], "lab");
+        assert!(launch[2].contains("tmux new-session"));
+        assert!(
+            launch[2].contains("__BENCH_DONE__"),
+            "sentinel must be written on completion"
+        );
+    }
+
+    #[test]
+    fn tmux_stream_cmd_tails_log_with_sentinel_exit() {
+        let machine = machine_remote();
+        let stream = build_remote_stream_log_cmd(
+            &machine,
+            "ubq_bench_lab",
+            "\"$HOME/UBQ/target/ubq_bench_lab.log\"",
+        );
+        assert_eq!(stream[0], "ssh");
+        assert!(
+            stream[2].contains("tail -n +1 -f"),
+            "must replay from beginning"
+        );
+        assert!(
+            stream[2].contains("__BENCH_DONE__"),
+            "must stop at sentinel"
+        );
+        assert!(
+            stream[2].contains("tmux has-session"),
+            "must detect dead tmux sessions"
+        );
+    }
+
+    #[test]
+    fn remote_stream_failures_are_descriptive() {
+        let machine = machine_remote();
+        assert!(
+            describe_remote_stream_failure(&machine, 2).contains("log file was created"),
+            "exit code 2 should explain the missing log case"
+        );
+        assert!(
+            describe_remote_stream_failure(&machine, 3).contains("completion sentinel"),
+            "exit code 3 should explain the missing sentinel case"
+        );
+    }
+
+    #[test]
+    fn remote_bench_payload_includes_features_flag() {
+        let runtime = runtime();
+        let machine = machine_remote();
+        let payload = build_remote_bench_payload(&runtime, &machine);
+        assert!(
+            payload.contains("--features"),
+            "payload must pass --features"
+        );
+        assert!(
+            payload.contains("bench_registry"),
+            "payload must enable bench_registry"
+        );
     }
 }

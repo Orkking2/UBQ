@@ -3,10 +3,10 @@
 macro_rules! define_alignment {
     ($name:ident, $bytes:literal) => {
         #[doc = concat!(
-                    "Zero-sized alignment marker for ",
-                    stringify!($bytes),
-                    "-byte block alignment."
-                )]
+                                                            "Zero-sized alignment marker for ",
+                                                            stringify!($bytes),
+                                                            "-byte block alignment."
+                                                        )]
         #[repr(align($bytes))]
         #[derive(Clone, Copy, Debug, Default)]
         pub struct $name;
