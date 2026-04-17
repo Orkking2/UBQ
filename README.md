@@ -88,8 +88,9 @@ scenarios. The v2 harness has two layers:
   expands the UBQ search graph scenario-by-scenario, and submits missing work to
   `bench_matrix`.
   A run is `frontier-complete` when no pending frontier bundles remain; the
-  frontier expands around baseline-beating UBQ labels and the best fully-covered
-  UBQ label per scenario/metric.
+  frontier expands around the best fully-covered UBQ label per
+  scenario/metric, while propagating baseline-beating fully-covered winners
+  across scenarios.
 
 UBQ labels are now 5-part identifiers:
 

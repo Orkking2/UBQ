@@ -2105,36 +2105,12 @@ pub fn compute_frontier_round_plan(
         let Some(labels) = desired.get_mut(&scenario.name) else {
             continue;
         };
-        let scenario_local_best_labels = local_best_labels.get(&scenario.name);
-        for label in &present_labels {
-            let Ok(parsed_label) = parse_ubq_label(label, true) else {
-                continue;
-            };
-            if !is_valid_ubq_label_for_scenario(&parsed_label, scenario) {
-                continue;
-            }
-            if is_complete_coverage(
-                index,
-                scenario,
-                label,
-                &config.baseline_queues,
-                &config.modes,
-                &config.items_per_producer_values,
-                config.repeats,
-            ) && (label_wins_any_metric(
-                index,
-                scenario,
-                label,
-                &config.baseline_queues,
-                &config.modes,
-                &config.items_per_producer_values,
-                config.repeats,
-            ) || scenario_local_best_labels
-                .is_some_and(|best_labels| best_labels.contains(label)))
-            {
-                for neighbor in immediate_search_labels_for_scenario(label, scenario)? {
-                    labels.insert(neighbor);
-                }
+        let Some(scenario_local_best_labels) = local_best_labels.get(&scenario.name) else {
+            continue;
+        };
+        for label in scenario_local_best_labels {
+            for neighbor in immediate_search_labels_for_scenario(label, scenario)? {
+                labels.insert(neighbor);
             }
         }
     }
@@ -2379,34 +2355,6 @@ fn is_complete_coverage(
             items_per_producer_values,
         )
     })
-}
-
-fn label_wins_any_metric(
-    index: &ExistingRunsIndex,
-    scenario: &ScenarioConfig,
-    label: &str,
-    baseline_queues: &[QueueKind],
-    modes: &[Mode],
-    items_per_producer_values: &[u64],
-    repeats: usize,
-) -> bool {
-    for mode in modes {
-        for &items in items_per_producer_values {
-            let ubq_mean = mean_ops(index, &scenario.name, label, *mode, items, repeats);
-            let best_baseline = baseline_queues
-                .iter()
-                .filter_map(|queue| {
-                    mean_ops(index, &scenario.name, queue.name(), *mode, items, repeats)
-                })
-                .max_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal));
-            if let (Some(ubq_mean), Some(best_baseline)) = (ubq_mean, best_baseline) {
-                if ubq_mean > best_baseline {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 fn mean_ops(
@@ -3274,6 +3222,132 @@ mod tests {
             plan.bundles
                 .iter()
                 .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,crossbeam,faa"))
+        );
+    }
+
+    #[test]
+    fn frontier_does_not_expand_nonbest_baseline_beater() {
+        let scenario = ScenarioConfig::new(1, 1);
+        let weaker_label = "balanced,8,127,crossbeam,cas";
+        let best_label = "balanced,16,127,crossbeam,cas";
+        let best_only_neighbor = "balanced,32,127,crossbeam,cas";
+        let weaker_only_neighbor = "balanced,4,127,crossbeam,cas";
+        let mut index = ExistingRunsIndex::default();
+
+        for repeat_index in 1..=2 {
+            index.records.insert(
+                SampleKey {
+                    scenario: scenario.name.clone(),
+                    repeat_index,
+                    mode: Mode::Throughput,
+                    items_per_producer: 1,
+                    queue_label: "segqueue".to_string(),
+                },
+                BenchRecord {
+                    queue: "segqueue".to_string(),
+                    mode: "throughput".to_string(),
+                    items_per_producer: 1,
+                    total_items: 1,
+                    consumed_items: 1,
+                    elapsed_ns: 10,
+                    ops_per_sec: Some(10.0),
+                    push_elapsed_ns: None,
+                    pop_elapsed_ns: None,
+                    fill_elapsed_ns: None,
+                    drain_elapsed_ns: None,
+                },
+            );
+            index.records.insert(
+                SampleKey {
+                    scenario: scenario.name.clone(),
+                    repeat_index,
+                    mode: Mode::Throughput,
+                    items_per_producer: 1,
+                    queue_label: "concurrent-queue".to_string(),
+                },
+                BenchRecord {
+                    queue: "concurrent-queue".to_string(),
+                    mode: "throughput".to_string(),
+                    items_per_producer: 1,
+                    total_items: 1,
+                    consumed_items: 1,
+                    elapsed_ns: 11,
+                    ops_per_sec: Some(9.0),
+                    push_elapsed_ns: None,
+                    pop_elapsed_ns: None,
+                    fill_elapsed_ns: None,
+                    drain_elapsed_ns: None,
+                },
+            );
+            index.records.insert(
+                SampleKey {
+                    scenario: scenario.name.clone(),
+                    repeat_index,
+                    mode: Mode::Throughput,
+                    items_per_producer: 1,
+                    queue_label: format!("ubq_{weaker_label}"),
+                },
+                BenchRecord {
+                    queue: "ubq".to_string(),
+                    mode: "throughput".to_string(),
+                    items_per_producer: 1,
+                    total_items: 1,
+                    consumed_items: 1,
+                    elapsed_ns: 20,
+                    ops_per_sec: Some(20.0),
+                    push_elapsed_ns: None,
+                    pop_elapsed_ns: None,
+                    fill_elapsed_ns: None,
+                    drain_elapsed_ns: None,
+                },
+            );
+            index.records.insert(
+                SampleKey {
+                    scenario: scenario.name.clone(),
+                    repeat_index,
+                    mode: Mode::Throughput,
+                    items_per_producer: 1,
+                    queue_label: format!("ubq_{best_label}"),
+                },
+                BenchRecord {
+                    queue: "ubq".to_string(),
+                    mode: "throughput".to_string(),
+                    items_per_producer: 1,
+                    total_items: 1,
+                    consumed_items: 1,
+                    elapsed_ns: 15,
+                    ops_per_sec: Some(25.0),
+                    push_elapsed_ns: None,
+                    pop_elapsed_ns: None,
+                    fill_elapsed_ns: None,
+                    drain_elapsed_ns: None,
+                },
+            );
+        }
+
+        let config = FrontierConfig {
+            machine_label: "local".to_string(),
+            runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
+            scenarios: vec![scenario.clone()],
+            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
+            seed_labels: vec![weaker_label.to_string()],
+            modes: vec![Mode::Throughput],
+            items_per_producer_values: vec![1],
+            repeats: 2,
+            available_parallelism: 8,
+        };
+        let plan = compute_frontier_round_plan(&config, &index, &BTreeSet::new()).expect("plan");
+
+        assert!(
+            plan.bundles
+                .iter()
+                .any(|bundle| bundle.ubq_label.as_deref() == Some(best_only_neighbor))
+        );
+        assert!(
+            !plan
+                .bundles
+                .iter()
+                .any(|bundle| bundle.ubq_label.as_deref() == Some(weaker_only_neighbor))
         );
     }
 
