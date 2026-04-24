@@ -10,13 +10,7 @@ use std::{
     usize,
 };
 
-use crate::{
-    BLOCK_LENGTH, ConfiguredUBQ, UBQ, align, backoff, ubq,
-    variant::{
-        AggressivePrepare, Balanced, ConsumerPoolOnly, NoPool, PoolConservative, PrepareMode,
-        Variant,
-    },
-};
+use crate::{BLOCK_LENGTH, ConfiguredUBQ, UBQ, align, backoff, ubq};
 
 #[test]
 fn drop_releases_all_enqueued_values() {
@@ -143,43 +137,8 @@ fn mpmc() {
 }
 
 #[test]
-fn variant_presets_match_legacy_feature_semantics() {
-    assert_eq!(
-        AggressivePrepare::PREPARE_MODE,
-        PrepareMode::BoundaryOrPoolHasVacancy
-    );
-    assert_eq!(AggressivePrepare::RECYCLE_PRODUCER_SPARE, true);
-    assert_eq!(AggressivePrepare::RECYCLE_CONSUMED, true);
-
-    assert_eq!(
-        Balanced::PREPARE_MODE,
-        PrepareMode::BoundaryIfPoolHasVacancy
-    );
-    assert_eq!(Balanced::RECYCLE_PRODUCER_SPARE, true);
-    assert_eq!(Balanced::RECYCLE_CONSUMED, true);
-
-    assert_eq!(
-        PoolConservative::PREPARE_MODE,
-        PrepareMode::BoundaryIfPoolEmpty
-    );
-    assert_eq!(PoolConservative::RECYCLE_PRODUCER_SPARE, true);
-    assert_eq!(PoolConservative::RECYCLE_CONSUMED, true);
-
-    assert_eq!(NoPool::PREPARE_MODE, PrepareMode::BoundaryOnly);
-    assert_eq!(NoPool::RECYCLE_PRODUCER_SPARE, false);
-    assert_eq!(NoPool::RECYCLE_CONSUMED, false);
-
-    assert_eq!(
-        ConsumerPoolOnly::PREPARE_MODE,
-        PrepareMode::BoundaryIfPoolEmpty
-    );
-    assert_eq!(ConsumerPoolOnly::RECYCLE_PRODUCER_SPARE, false);
-    assert_eq!(ConsumerPoolOnly::RECYCLE_CONSUMED, true);
-}
-
-#[test]
 fn configured_queue_supports_non_default_pool_and_preset_block() {
-    let q = ConfiguredUBQ::<u64, Balanced, backoff::Crossbeam, 8, 127, align::A256>::new();
+    let q = ConfiguredUBQ::<u64, backoff::Crossbeam, 8, 127, align::A256>::new();
 
     for i in 0..10_000 {
         q.push(i);
@@ -198,7 +157,7 @@ fn configured_queue_supports_arbitrary_block_with_explicit_alignment() {
     #[derive(Clone, Copy, Debug, Default)]
     struct A1024;
 
-    let q = ConfiguredUBQ::<u64, Balanced, backoff::Crossbeam, 2, 100, A1024>::new();
+    let q = ConfiguredUBQ::<u64, backoff::Crossbeam, 2, 100, A1024>::new();
 
     for i in 0..2_000 {
         q.push(i);
@@ -220,9 +179,8 @@ fn ubq_macro_defaults_to_public_alias() {
 
 #[test]
 fn ubq_macro_applies_explicit_overrides() {
-    let q: ConfiguredUBQ<u64, PoolConservative, backoff::Yield, 2, 127, align::A256> = ubq!(
+    let q: ConfiguredUBQ<u64, backoff::Yield, 2, 127, align::A256> = ubq!(
         type: u64,
-        variant: PoolConservative,
         backoff: backoff::Yield,
         pool: 2,
         block: 127,
@@ -238,7 +196,7 @@ fn ubq_macro_supports_custom_alignment_override() {
     #[derive(Clone, Copy, Debug, Default)]
     struct A1024;
 
-    let q: ConfiguredUBQ<u64, Balanced, backoff::Crossbeam, 4, 100, A1024> = ubq!(
+    let q: ConfiguredUBQ<u64, backoff::Crossbeam, 4, 100, A1024> = ubq!(
         type: u64,
         pool: 4,
         block: 100,

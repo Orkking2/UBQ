@@ -12,7 +12,7 @@ use std::{
     thread::{self, JoinHandle, available_parallelism},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use ubq::{ConfiguredUBQ, align, backoff, variant};
+use ubq::{ConfiguredUBQ, align, backoff};
 
 const SENTINEL: u64 = u64::MAX;
 #[cfg(test)]
@@ -56,10 +56,9 @@ trait BenchQueue: Send + Sync + 'static {
     fn recv_value(&self) -> u64;
 }
 
-impl<V, B, const POOL: usize, const BLOCK: usize, A> BenchQueue
-    for ConfiguredUBQ<u64, V, B, POOL, BLOCK, A>
+impl<B, const POOL: usize, const BLOCK: usize, A> BenchQueue
+    for ConfiguredUBQ<u64, B, POOL, BLOCK, A>
 where
-    V: variant::Variant + 'static,
     B: backoff::BackoffPolicy + 'static,
     A: Send + Sync + 'static,
 {
@@ -266,52 +265,46 @@ struct UbqBenchEntry {
 }
 
 macro_rules! ubq_bench_entry {
-    ($label:expr, $variant:path, $backoff:path, $pool:literal, $block:literal, $align:path) => {
+    ($label:expr, $backoff:path, $pool:literal, $block:literal, $align:path) => {
         UbqBenchEntry {
             label: $label,
             block_cap: $block,
             #[cfg(test)]
             throughput: |scenario, items_per_producer| {
-                bench_throughput_for::<ConfiguredUBQ<
-                    u64,
-                    $variant,
-                    $backoff,
-                    $pool,
+                bench_throughput_for::<ConfiguredUBQ<u64, $backoff, $pool, $block, $align>>(
+                    "ubq",
                     $block,
-                    $align,
-                >>("ubq", $block, scenario, items_per_producer)
+                    scenario,
+                    items_per_producer,
+                )
             },
             #[cfg(test)]
             fill_drain: |scenario, items_per_producer| {
-                bench_fill_drain_for::<ConfiguredUBQ<
-                    u64,
-                    $variant,
-                    $backoff,
-                    $pool,
+                bench_fill_drain_for::<ConfiguredUBQ<u64, $backoff, $pool, $block, $align>>(
+                    "ubq",
                     $block,
-                    $align,
-                >>("ubq", $block, scenario, items_per_producer)
+                    scenario,
+                    items_per_producer,
+                )
             },
             factory: |config, packed_indices, items_per_producer| {
-                bench_factory_typed::<ConfiguredUBQ<
-                    u64,
-                    $variant,
-                    $backoff,
-                    $pool,
+                bench_factory_typed::<ConfiguredUBQ<u64, $backoff, $pool, $block, $align>>(
+                    "ubq",
                     $block,
-                    $align,
-                >>("ubq", $block, config, packed_indices, items_per_producer)
+                    config,
+                    packed_indices,
+                    items_per_producer,
+                )
             },
         }
     };
 }
 
 macro_rules! ubq_block_entries {
-    ($preset_name:literal, $variant:path, $pool:literal, $backoff_name:literal, $backoff:path) => {
+    ($preset_name:literal, $pool:literal, $backoff_name:literal, $backoff:path) => {
         vec![
             ubq_bench_entry!(
                 concat!($preset_name, ",", stringify!($pool), ",31,", $backoff_name),
-                $variant,
                 $backoff,
                 $pool,
                 31,
@@ -319,7 +312,6 @@ macro_rules! ubq_block_entries {
             ),
             ubq_bench_entry!(
                 concat!($preset_name, ",", stringify!($pool), ",63,", $backoff_name),
-                $variant,
                 $backoff,
                 $pool,
                 63,
@@ -327,7 +319,6 @@ macro_rules! ubq_block_entries {
             ),
             ubq_bench_entry!(
                 concat!($preset_name, ",", stringify!($pool), ",127,", $backoff_name),
-                $variant,
                 $backoff,
                 $pool,
                 127,
@@ -335,7 +326,6 @@ macro_rules! ubq_block_entries {
             ),
             ubq_bench_entry!(
                 concat!($preset_name, ",", stringify!($pool), ",255,", $backoff_name),
-                $variant,
                 $backoff,
                 $pool,
                 255,
@@ -343,7 +333,6 @@ macro_rules! ubq_block_entries {
             ),
             ubq_bench_entry!(
                 concat!($preset_name, ",", stringify!($pool), ",511,", $backoff_name),
-                $variant,
                 $backoff,
                 $pool,
                 511,
@@ -357,7 +346,6 @@ macro_rules! ubq_block_entries {
                     ",1023,",
                     $backoff_name
                 ),
-                $variant,
                 $backoff,
                 $pool,
                 1023,
@@ -371,7 +359,6 @@ macro_rules! ubq_block_entries {
                     ",2047,",
                     $backoff_name
                 ),
-                $variant,
                 $backoff,
                 $pool,
                 2047,
@@ -385,7 +372,6 @@ macro_rules! ubq_block_entries {
                     ",4095,",
                     $backoff_name
                 ),
-                $variant,
                 $backoff,
                 $pool,
                 4095,
@@ -396,17 +382,10 @@ macro_rules! ubq_block_entries {
 }
 
 macro_rules! ubq_backoff_entries {
-    ($preset_name:literal, $variant:path, $pool:literal) => {{
-        let mut entries = ubq_block_entries!(
-            $preset_name,
-            $variant,
-            $pool,
-            "crossbeam",
-            backoff::Crossbeam
-        );
+    ($preset_name:literal, $pool:literal) => {{
+        let mut entries = ubq_block_entries!($preset_name, $pool, "crossbeam", backoff::Crossbeam);
         entries.extend(ubq_block_entries!(
             $preset_name,
-            $variant,
             $pool,
             "yield",
             backoff::Yield
@@ -421,132 +400,14 @@ fn ubq_bench_registry() -> &'static [UbqBenchEntry] {
     UBQ_BENCH_REGISTRY
         .get_or_init(|| {
             let mut entries = Vec::new();
-            entries.extend(ubq_backoff_entries!(
-                "aggressive_prepare",
-                variant::AggressivePrepare,
-                1
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "aggressive_prepare",
-                variant::AggressivePrepare,
-                2
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "aggressive_prepare",
-                variant::AggressivePrepare,
-                4
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "aggressive_prepare",
-                variant::AggressivePrepare,
-                8
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "aggressive_prepare",
-                variant::AggressivePrepare,
-                16
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "aggressive_prepare",
-                variant::AggressivePrepare,
-                32
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "aggressive_prepare",
-                variant::AggressivePrepare,
-                64
-            ));
-            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 1));
-            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 2));
-            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 4));
-            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 8));
-            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 16));
-            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 32));
-            entries.extend(ubq_backoff_entries!("balanced", variant::Balanced, 64));
-            entries.extend(ubq_backoff_entries!(
-                "pool_conservative",
-                variant::PoolConservative,
-                1
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "pool_conservative",
-                variant::PoolConservative,
-                2
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "pool_conservative",
-                variant::PoolConservative,
-                4
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "pool_conservative",
-                variant::PoolConservative,
-                8
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "pool_conservative",
-                variant::PoolConservative,
-                16
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "pool_conservative",
-                variant::PoolConservative,
-                32
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "pool_conservative",
-                variant::PoolConservative,
-                64
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "consumer_pool_only",
-                variant::ConsumerPoolOnly,
-                1
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "consumer_pool_only",
-                variant::ConsumerPoolOnly,
-                2
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "consumer_pool_only",
-                variant::ConsumerPoolOnly,
-                4
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "consumer_pool_only",
-                variant::ConsumerPoolOnly,
-                8
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "consumer_pool_only",
-                variant::ConsumerPoolOnly,
-                16
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "consumer_pool_only",
-                variant::ConsumerPoolOnly,
-                32
-            ));
-            entries.extend(ubq_backoff_entries!(
-                "consumer_pool_only",
-                variant::ConsumerPoolOnly,
-                64
-            ));
-            entries.extend(ubq_block_entries!(
-                "no_pool",
-                variant::NoPool,
-                0,
-                "crossbeam",
-                backoff::Crossbeam
-            ));
-            entries.extend(ubq_block_entries!(
-                "no_pool",
-                variant::NoPool,
-                0,
-                "yield",
-                backoff::Yield
-            ));
+            entries.extend(ubq_backoff_entries!("balanced", 0));
+            entries.extend(ubq_backoff_entries!("balanced", 1));
+            entries.extend(ubq_backoff_entries!("balanced", 2));
+            entries.extend(ubq_backoff_entries!("balanced", 4));
+            entries.extend(ubq_backoff_entries!("balanced", 8));
+            entries.extend(ubq_backoff_entries!("balanced", 16));
+            entries.extend(ubq_backoff_entries!("balanced", 32));
+            entries.extend(ubq_backoff_entries!("balanced", 64));
             entries
         })
         .as_slice()
@@ -1452,7 +1313,7 @@ Options:
   --queues LIST             Comma list: ubq,segqueue,concurrent-queue
   --modes LIST              Comma list: throughput,fill_drain
   --scenarios LIST          Comma list: 1p1c,4p1c,1p4c,4p4c,8p1c,8p4c,8p8c,1p8c,4p8c,16p1c,1p16c,8p16c,16p8c,16p16c,32p1c,1p32c,16p32c,32p16c,32p32c,64p1c,1p64c,32p64c,64p32c,64p64c
-  --ubq-label LABEL         UBQ variant label written to output metadata
+  --ubq-label LABEL         UBQ configuration label written to output metadata
   --machine-label LABEL     Machine label written to output metadata
   --out PATH                Write JSON output to PATH instead of stdout
   --only-ubq                Shortcut for --queues=ubq

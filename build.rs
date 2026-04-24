@@ -1,34 +1,10 @@
 use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
 
-// (preset, pool_values, cas_variant, faa_variant)
-const PRESET_INFO: &[(&str, &[u8], &str, &str)] = &[
-    (
-        "aggressive_prepare",
-        &[1, 2, 4, 8, 16, 32, 64],
-        "variant::AggressivePrepare",
-        "variant::AggressivePrepareFAA",
-    ),
-    (
-        "balanced",
-        &[1, 2, 4, 8, 16, 32, 64],
-        "variant::Balanced",
-        "variant::BalancedFAA",
-    ),
-    (
-        "pool_conservative",
-        &[1, 2, 4, 8, 16, 32, 64],
-        "variant::PoolConservative",
-        "variant::PoolConservativeFAA",
-    ),
-    // no_pool uses pool=0 exclusively
-    ("no_pool", &[0], "variant::NoPool", "variant::NoPoolFAA"),
-    (
-        "consumer_pool_only",
-        &[1, 2, 4, 8, 16, 32, 64],
-        "variant::ConsumerPoolOnly",
-        "variant::ConsumerPoolOnlyFAA",
-    ),
+// (preset, pool_values)
+const PRESET_INFO: &[(&str, &[u8])] = &[
+    // pool=0 gives no-pool behaviour; non-zero values enable block recycling.
+    ("balanced", &[0, 1, 2, 4, 8, 16, 32, 64]),
 ];
 
 const BLOCK_ALIGN: &[(u16, &str)] = &[
@@ -82,25 +58,19 @@ fn main() {
     writeln!(code, ") -> Option<JobFactory> {{").unwrap();
     writeln!(code, "    match label {{").unwrap();
 
-    for &(preset, pool_values, cas_variant, faa_variant) in PRESET_INFO {
+    for &(preset, pool_values) in PRESET_INFO {
         for &pool in pool_values {
             for &(block, align_ty) in BLOCK_ALIGN {
                 for &(backoff_name, backoff_ty) in BACKOFF_INFO {
-                    for &(sync_name, variant_ty) in &[("cas", cas_variant), ("faa", faa_variant)] {
-                        let label_str = format!(
-                            "{},{},{},{},{}",
-                            preset, pool, block, backoff_name, sync_name
-                        );
-                        let type_expr = format!(
-                            "ConfiguredUBQ<u64, {variant_ty}, {backoff_ty}, {pool}, {block}, {align_ty}>"
-                        );
-                        writeln!(
-                            code,
-                            "        {:?} => Some(make_ubq_job_factory::<{type_expr}>(label, scenario, repeat_index, mode, items_per_producer)),",
-                            label_str,
-                        )
-                        .unwrap();
-                    }
+                    let label_str = format!("{},{},{},{}", preset, pool, block, backoff_name);
+                    let type_expr =
+                        format!("ConfiguredUBQ<u64, {backoff_ty}, {pool}, {block}, {align_ty}>");
+                    writeln!(
+                        code,
+                        "        {:?} => Some(make_ubq_job_factory::<{type_expr}>(label, scenario, repeat_index, mode, items_per_producer)),",
+                        label_str,
+                    )
+                    .unwrap();
                 }
             }
         }

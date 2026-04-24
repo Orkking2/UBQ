@@ -2,7 +2,6 @@ use crate::{
     align::A4096,
     backoff::{BackoffPolicy, Crossbeam},
     block::{Block, DEFAULT_BLOCK_LENGTH, WRITE},
-    variant::{Balanced, PrepareMode, Variant},
 };
 use crossbeam_utils::CachePadded;
 use std::{
@@ -26,30 +25,29 @@ pub const DEFAULT_POOL_SIZE: usize = 1;
 /// [`crate::UBQ`] alias preserves the default configuration.
 ///
 /// ```rust
-/// use ubq::{ConfiguredUBQ, align, backoff, variant};
+/// use ubq::{ConfiguredUBQ, align, backoff};
 ///
-/// let q = ConfiguredUBQ::<u64, variant::Balanced, backoff::Crossbeam, 2, 127, align::A256>::new();
+/// let q = ConfiguredUBQ::<u64, backoff::Crossbeam, 2, 127, align::A256>::new();
 /// q.push(42);
 /// assert_eq!(q.pop(), Some(42));
 /// ```
 ///
 /// ```compile_fail
-/// use ubq::{ConfiguredUBQ, align, backoff, variant};
+/// use ubq::{ConfiguredUBQ, align, backoff};
 ///
-/// let _ = ConfiguredUBQ::<u64, variant::Balanced, backoff::Crossbeam, 1, 1024, align::A512>::new();
+/// let _ = ConfiguredUBQ::<u64, backoff::Crossbeam, 1, 1024, align::A512>::new();
 /// ```
 ///
 /// ```compile_fail
-/// use ubq::{ConfiguredUBQ, backoff, variant};
+/// use ubq::{ConfiguredUBQ, backoff};
 ///
 /// #[repr(align(64))]
 /// struct BadAlign([u8; 8]);
 ///
-/// let _ = ConfiguredUBQ::<u64, variant::Balanced, backoff::Crossbeam, 1, 31, BadAlign>::new();
+/// let _ = ConfiguredUBQ::<u64, backoff::Crossbeam, 1, 31, BadAlign>::new();
 /// ```
 pub struct ConfiguredUBQ<
     T,
-    V = Balanced,
     B = Crossbeam,
     const POOL: usize = DEFAULT_POOL_SIZE,
     const BLOCK: usize = DEFAULT_BLOCK_LENGTH,
@@ -62,7 +60,6 @@ pub struct ConfiguredUBQ<
     /// Recycled blocks used to avoid repeated allocations.
     pool: [CachePadded<AtomicPtr<Block<T, BLOCK, A>>>; POOL],
 
-    _variant: PhantomData<V>,
     _backoff: PhantomData<B>,
 }
 
@@ -109,26 +106,25 @@ impl<T, const BLOCK: usize, A> Head<T, BLOCK, A> {
 
 // SAFETY: Slot ownership is assigned with atomic counters, and producer/consumer
 // commits are synchronized with Release/Acquire ordering before cross-thread reads.
-unsafe impl<T: Sync, V, B, A: Sync, const POOL: usize, const BLOCK: usize> Sync
-    for ConfiguredUBQ<T, V, B, POOL, BLOCK, A>
+unsafe impl<T: Sync, B, A: Sync, const POOL: usize, const BLOCK: usize> Sync
+    for ConfiguredUBQ<T, B, POOL, BLOCK, A>
 {
 }
-unsafe impl<T: Send, V, B, A: Send, const POOL: usize, const BLOCK: usize> Send
-    for ConfiguredUBQ<T, V, B, POOL, BLOCK, A>
+unsafe impl<T: Send, B, A: Send, const POOL: usize, const BLOCK: usize> Send
+    for ConfiguredUBQ<T, B, POOL, BLOCK, A>
 {
 }
 
-impl<T, V, B, const POOL: usize, const BLOCK: usize, A> fmt::Debug
-    for ConfiguredUBQ<T, V, B, POOL, BLOCK, A>
+impl<T, B, const POOL: usize, const BLOCK: usize, A> fmt::Debug
+    for ConfiguredUBQ<T, B, POOL, BLOCK, A>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("ConfiguredUBQ { .. }")
     }
 }
 
-impl<T, V, B, const POOL: usize, const BLOCK: usize, A> ConfiguredUBQ<T, V, B, POOL, BLOCK, A>
+impl<T, B, const POOL: usize, const BLOCK: usize, A> ConfiguredUBQ<T, B, POOL, BLOCK, A>
 where
-    V: Variant,
     B: BackoffPolicy,
 {
     const LAYOUT_CHECKS: () = Block::<T, BLOCK, A>::LAYOUT_CHECKS;
@@ -146,22 +142,10 @@ where
     }
 
     #[inline]
-    fn pool_is_empty(&self) -> bool {
-        self.pool
-            .iter()
-            .all(|b| b.load(Ordering::Relaxed).is_null())
-    }
-
-    #[inline]
     fn should_prepare_next_block(&self, next_index: usize) -> bool {
         let () = Self::LAYOUT_CHECKS;
 
-        match V::PREPARE_MODE {
-            PrepareMode::BoundaryOnly => next_index == BLOCK,
-            PrepareMode::BoundaryIfPoolHasVacancy => next_index == BLOCK && self.pool_has_vacancy(),
-            PrepareMode::BoundaryIfPoolEmpty => next_index == BLOCK && self.pool_is_empty(),
-            PrepareMode::BoundaryOrPoolHasVacancy => next_index == BLOCK || self.pool_has_vacancy(),
-        }
+        next_index == BLOCK && self.pool_has_vacancy()
     }
 
     #[inline]
@@ -174,10 +158,6 @@ where
 
     #[inline]
     fn take_pooled_block(&self) -> Option<*mut Block<T, BLOCK, A>> {
-        if !(V::RECYCLE_PRODUCER_SPARE || V::RECYCLE_CONSUMED) {
-            return None;
-        }
-
         self.pool.iter().find_map(|slot| {
             let pooled = slot.swap(null_mut(), Ordering::AcqRel);
             (!pooled.is_null()).then_some(pooled)
@@ -188,7 +168,7 @@ where
     fn release_producer_spare_block(&self, block: Box<Block<T, BLOCK, A>>) {
         let new = Box::into_raw(block);
 
-        if V::RECYCLE_PRODUCER_SPARE && self.try_store_pooled_block(new) {
+        if self.try_store_pooled_block(new) {
             return;
         }
 
@@ -197,7 +177,7 @@ where
 
     #[inline]
     fn release_consumed_block(&self, block: *mut Block<T, BLOCK, A>) {
-        if V::RECYCLE_CONSUMED && self.try_store_pooled_block(block) {
+        if self.try_store_pooled_block(block) {
             return;
         }
 
@@ -216,7 +196,6 @@ where
             chead: CachePadded::new(AtomicUsize::new(0)),
             pool: array::from_fn(|_| CachePadded::new(AtomicPtr::new(null_mut()))),
 
-            _variant: PhantomData,
             _backoff: PhantomData,
         }
     }
@@ -280,55 +259,23 @@ where
         if phead.is_zero() {
             phead = Head::new(self.phead.load(Ordering::Acquire));
 
-            if V::FAA {
-                loop {
-                    if phead.index >= BLOCK {
-                        backoff.snooze();
+            loop {
+                if phead.index >= BLOCK {
+                    backoff.snooze();
 
-                        phead = Head::new(self.phead.load(Ordering::Acquire));
-                        continue;
-                    }
-
-                    if next_block.is_none() && self.should_prepare_next_block(phead.index + 1) {
-                        next_block = Some(Block::<T, BLOCK, A>::new_zeroed());
-                    }
-
-                    phead = Head::new(self.phead.fetch_add(1, Ordering::SeqCst));
-
-                    if phead.index < BLOCK {
-                        break;
-                    };
+                    phead = Head::new(self.phead.load(Ordering::Acquire));
+                    continue;
                 }
-            } else {
-                loop {
-                    if phead.index >= BLOCK {
-                        backoff.snooze();
 
-                        phead = Head::new(self.phead.load(Ordering::Acquire));
-                        continue;
-                    }
-
-                    let new_phead = Head {
-                        block: phead.block,
-                        index: phead.index + 1,
-                    };
-
-                    if next_block.is_none() && self.should_prepare_next_block(new_phead.index) {
-                        next_block = Some(Block::<T, BLOCK, A>::new_zeroed());
-                    }
-
-                    match self.phead.compare_exchange_weak(
-                        phead.pack(),
-                        new_phead.pack(),
-                        Ordering::SeqCst,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break,
-                        Err(head) => phead = Head::new(head),
-                    };
-
-                    backoff.spin();
+                if next_block.is_none() && self.should_prepare_next_block(phead.index + 1) {
+                    next_block = Some(Block::<T, BLOCK, A>::new_zeroed());
                 }
+
+                phead = Head::new(self.phead.fetch_add(1, Ordering::SeqCst));
+
+                if phead.index < BLOCK {
+                    break;
+                };
             }
         }
 
@@ -448,9 +395,7 @@ where
     }
 }
 
-impl<T, V, B, const POOL: usize, const BLOCK: usize, A> Drop
-    for ConfiguredUBQ<T, V, B, POOL, BLOCK, A>
-{
+impl<T, B, const POOL: usize, const BLOCK: usize, A> Drop for ConfiguredUBQ<T, B, POOL, BLOCK, A> {
     fn drop(&mut self) {
         let mut p = Head::<T, BLOCK, A>::new(*self.chead.get_mut()).block;
 

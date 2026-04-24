@@ -55,7 +55,6 @@ pub mod backoff;
 pub mod bench_harness;
 pub(crate) mod block;
 pub(crate) mod queue;
-pub mod variant;
 
 #[cfg(test)]
 mod tests;
@@ -107,7 +106,6 @@ macro_rules! __ubq_internal {
     (
         @parse
         type = $ty:ty,
-        variant = $variant:path,
         backoff = $backoff:path,
         pool = $pool:tt,
         block = $block:tt,
@@ -116,7 +114,6 @@ macro_rules! __ubq_internal {
     ) => {
         $crate::ConfiguredUBQ::<
             $ty,
-            $variant,
             $backoff,
             { $pool },
             { $block },
@@ -126,40 +123,17 @@ macro_rules! __ubq_internal {
     (
         @parse
         type = $ty:ty,
-        variant = $variant:path,
         backoff = $backoff:path,
         pool = $pool:tt,
         block = $block:tt,
         align = [$align:path];
         $(,)?
     ) => {
-        $crate::ConfiguredUBQ::<$ty, $variant, $backoff, { $pool }, { $block }, $align>::new()
+        $crate::ConfiguredUBQ::<$ty, $backoff, { $pool }, { $block }, $align>::new()
     };
     (
         @parse
         type = $ty:ty,
-        variant = $variant:path,
-        backoff = $backoff:path,
-        pool = $pool:tt,
-        block = $block:tt,
-        align = [$($align:tt)*];
-        variant: $new_variant:path $(, $($rest:tt)*)?
-    ) => {
-        $crate::__ubq_internal!(
-            @parse
-            type = $ty,
-            variant = $new_variant,
-            backoff = $backoff,
-            pool = $pool,
-            block = $block,
-            align = [$($align)*];
-            $($($rest)*)?
-        )
-    };
-    (
-        @parse
-        type = $ty:ty,
-        variant = $variant:path,
         backoff = $backoff:path,
         pool = $pool:tt,
         block = $block:tt,
@@ -169,7 +143,6 @@ macro_rules! __ubq_internal {
         $crate::__ubq_internal!(
             @parse
             type = $ty,
-            variant = $variant,
             backoff = $new_backoff,
             pool = $pool,
             block = $block,
@@ -180,7 +153,6 @@ macro_rules! __ubq_internal {
     (
         @parse
         type = $ty:ty,
-        variant = $variant:path,
         backoff = $backoff:path,
         pool = $pool:tt,
         block = $block:tt,
@@ -190,7 +162,6 @@ macro_rules! __ubq_internal {
         $crate::__ubq_internal!(
             @parse
             type = $ty,
-            variant = $variant,
             backoff = $backoff,
             pool = $new_pool,
             block = $block,
@@ -201,7 +172,6 @@ macro_rules! __ubq_internal {
     (
         @parse
         type = $ty:ty,
-        variant = $variant:path,
         backoff = $backoff:path,
         pool = $pool:tt,
         block = $block:tt,
@@ -211,7 +181,6 @@ macro_rules! __ubq_internal {
         $crate::__ubq_internal!(
             @parse
             type = $ty,
-            variant = $variant,
             backoff = $backoff,
             pool = $pool,
             block = $new_block,
@@ -222,7 +191,6 @@ macro_rules! __ubq_internal {
     (
         @parse
         type = $ty:ty,
-        variant = $variant:path,
         backoff = $backoff:path,
         pool = $pool:tt,
         block = $block:tt,
@@ -232,7 +200,6 @@ macro_rules! __ubq_internal {
         $crate::__ubq_internal!(
             @parse
             type = $ty,
-            variant = $variant,
             backoff = $backoff,
             pool = $pool,
             block = $block,
@@ -243,7 +210,6 @@ macro_rules! __ubq_internal {
     (
         @parse
         type = $ty:ty,
-        variant = $variant:path,
         backoff = $backoff:path,
         pool = $pool:tt,
         block = $block:tt,
@@ -271,7 +237,6 @@ macro_rules! ubq {
         $crate::__ubq_internal!(
             @parse
             type = $ty,
-            variant = $crate::variant::Balanced,
             backoff = $crate::backoff::Crossbeam,
             pool = 1,
             block = 2047,

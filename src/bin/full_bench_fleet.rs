@@ -7,10 +7,10 @@ use bench_tooling::{
 };
 use clap::Parser;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -120,6 +120,12 @@ struct MachineRunResult {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PathDependencySync {
+    local_dir: PathBuf,
+    remote_dir: String,
+}
+
 fn load_config(path: &Path) -> Result<FleetConfig, String> {
     let raw = fs::read_to_string(path)
         .map_err(|err| format!("failed to read config {}: {err}", path.display()))?;
@@ -216,6 +222,256 @@ fn resolve_python_bin_with_override(py_override: Option<&str>) -> Result<String,
 
 fn resolve_python_bin() -> Result<String, String> {
     resolve_python_bin_with_override(std::env::var("PYTHON").ok().as_deref())
+}
+
+fn read_manifest_path_dependencies(manifest_dir: &Path) -> Result<Vec<String>, String> {
+    let manifest_path = manifest_dir.join("Cargo.toml");
+    let raw = fs::read_to_string(&manifest_path)
+        .map_err(|err| format!("failed to read manifest {}: {err}", manifest_path.display()))?;
+    let parsed: toml::Value = toml::from_str(&raw)
+        .map_err(|err| format!("invalid manifest {}: {err}", manifest_path.display()))?;
+    let mut deps = BTreeSet::new();
+    collect_manifest_path_dependencies(&parsed, &mut deps);
+    Ok(deps.into_iter().collect())
+}
+
+fn collect_manifest_path_dependencies(value: &toml::Value, out: &mut BTreeSet<String>) {
+    let Some(table) = value.as_table() else {
+        if let Some(array) = value.as_array() {
+            for item in array {
+                collect_manifest_path_dependencies(item, out);
+            }
+        }
+        return;
+    };
+
+    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(dep_table) = table.get(key) {
+            collect_dep_table_paths(dep_table, out);
+        }
+    }
+
+    for child in table.values() {
+        collect_manifest_path_dependencies(child, out);
+    }
+}
+
+fn collect_dep_table_paths(value: &toml::Value, out: &mut BTreeSet<String>) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for dep_spec in table.values() {
+        let Some(dep_table) = dep_spec.as_table() else {
+            continue;
+        };
+        let Some(path) = dep_table.get("path").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            out.insert(trimmed.to_string());
+        }
+    }
+}
+
+fn resolve_local_dependency_dir(manifest_dir: &Path, dep_path: &str) -> Result<PathBuf, String> {
+    let resolved = manifest_dir.join(dep_path).canonicalize().map_err(|err| {
+        format!(
+            "failed to resolve local cargo path dependency '{}' from {}: {err}",
+            dep_path,
+            manifest_dir.display()
+        )
+    })?;
+    let dep_dir = if resolved.is_file() {
+        resolved
+            .parent()
+            .ok_or_else(|| {
+                format!(
+                    "local cargo path dependency '{}' resolved to file without parent: {}",
+                    dep_path,
+                    resolved.display()
+                )
+            })?
+            .to_path_buf()
+    } else {
+        resolved
+    };
+    let dep_manifest = dep_dir.join("Cargo.toml");
+    if !dep_manifest.is_file() {
+        return Err(format!(
+            "local cargo path dependency '{}' resolved to {} but {} is missing",
+            dep_path,
+            dep_dir.display(),
+            dep_manifest.display()
+        ));
+    }
+    Ok(dep_dir)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemotePathBase {
+    Home,
+    Absolute,
+    Relative,
+}
+
+fn resolve_remote_dependency_dir(base: &str, dep_path: &str) -> Result<String, String> {
+    let dep_path = dep_path.trim();
+    if dep_path.is_empty() {
+        return Err("cargo path dependency cannot be empty".to_string());
+    }
+
+    let base = base.trim();
+    let (base_kind, mut segments) = if base == "~" {
+        (RemotePathBase::Home, Vec::new())
+    } else if let Some(tail) = base.strip_prefix("~/") {
+        (
+            RemotePathBase::Home,
+            tail.split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+    } else if let Some(tail) = base.strip_prefix('/') {
+        (
+            RemotePathBase::Absolute,
+            tail.split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (
+            RemotePathBase::Relative,
+            base.split('/')
+                .filter(|part| !part.is_empty() && *part != ".")
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    let mut leading_parents = 0usize;
+    for component in Path::new(dep_path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => segments.push(part.to_string_lossy().into_owned()),
+            Component::ParentDir => {
+                if segments.pop().is_none() && base_kind != RemotePathBase::Absolute {
+                    leading_parents += 1;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "absolute cargo path dependency '{}' is unsupported for remote sync",
+                    dep_path
+                ));
+            }
+        }
+    }
+
+    let mut rendered_components = Vec::with_capacity(leading_parents + segments.len());
+    for _ in 0..leading_parents {
+        rendered_components.push("..".to_string());
+    }
+    rendered_components.extend(segments);
+
+    let rendered = match base_kind {
+        RemotePathBase::Home => {
+            if rendered_components.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", rendered_components.join("/"))
+            }
+        }
+        RemotePathBase::Absolute => {
+            if rendered_components.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", rendered_components.join("/"))
+            }
+        }
+        RemotePathBase::Relative => {
+            if rendered_components.is_empty() {
+                ".".to_string()
+            } else {
+                rendered_components.join("/")
+            }
+        }
+    };
+
+    Ok(rendered)
+}
+
+fn record_path_dependency_sync(
+    syncs: &mut Vec<PathDependencySync>,
+    candidate: PathDependencySync,
+) -> Result<(), String> {
+    if let Some(existing) = syncs
+        .iter()
+        .find(|existing| existing.local_dir == candidate.local_dir)
+    {
+        if existing.remote_dir != candidate.remote_dir {
+            return Err(format!(
+                "local cargo path dependency {} mapped to conflicting remote paths '{}' and '{}'",
+                candidate.local_dir.display(),
+                existing.remote_dir,
+                candidate.remote_dir
+            ));
+        }
+        return Ok(());
+    }
+
+    if syncs
+        .iter()
+        .any(|existing| candidate.local_dir.starts_with(&existing.local_dir))
+    {
+        return Ok(());
+    }
+
+    syncs.retain(|existing| !existing.local_dir.starts_with(&candidate.local_dir));
+    syncs.push(candidate);
+    Ok(())
+}
+
+fn discover_path_dependency_syncs(
+    repo_root: &Path,
+    remote_repo_dir: &str,
+) -> Result<Vec<PathDependencySync>, String> {
+    let repo_root = repo_root.canonicalize().map_err(|err| {
+        format!(
+            "failed to canonicalize repo root {}: {err}",
+            repo_root.display()
+        )
+    })?;
+    let mut pending = VecDeque::from([(repo_root.clone(), remote_repo_dir.to_string())]);
+    let mut visited = BTreeSet::new();
+    let mut syncs = Vec::new();
+
+    while let Some((manifest_dir, remote_manifest_dir)) = pending.pop_front() {
+        if !visited.insert(manifest_dir.clone()) {
+            continue;
+        }
+
+        for dep_path in read_manifest_path_dependencies(&manifest_dir)? {
+            let local_dir = resolve_local_dependency_dir(&manifest_dir, &dep_path)?;
+            let remote_dir = resolve_remote_dependency_dir(&remote_manifest_dir, &dep_path)?;
+            record_path_dependency_sync(
+                &mut syncs,
+                PathDependencySync {
+                    local_dir: local_dir.clone(),
+                    remote_dir: remote_dir.clone(),
+                },
+            )?;
+            pending.push_back((local_dir, remote_dir));
+        }
+    }
+
+    syncs.sort_by(|a, b| {
+        a.remote_dir
+            .cmp(&b.remote_dir)
+            .then_with(|| a.local_dir.cmp(&b.local_dir))
+    });
+    Ok(syncs)
 }
 
 fn spawn_prefixed_reader<R>(reader: R, prefix: String, to_stderr: bool) -> thread::JoinHandle<()>
@@ -541,6 +797,8 @@ fn run_remote_machine_via_tmux(
 ) -> Result<(), String> {
     // 1. Optionally sync the repo.
     if runtime.sync_repo {
+        let path_dep_syncs =
+            discover_path_dependency_syncs(&runtime.repo_root, &machine.remote_repo_dir)?;
         println!(
             "  syncing repo to {}:{}",
             machine.host, machine.remote_repo_dir
@@ -549,6 +807,25 @@ fn run_remote_machine_via_tmux(
         let code = run_cmd(&cmd, &runtime.repo_root, runtime.dry_run)?;
         if code != 0 {
             return Err(format!("repo sync failed with exit code {code}"));
+        }
+        for sync in &path_dep_syncs {
+            let label = sync
+                .local_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<unknown>");
+            println!(
+                "  syncing cargo path dependency {} to {}:{}",
+                label, machine.host, sync.remote_dir
+            );
+            let cmd = build_path_dep_sync_cmd(machine, sync);
+            let code = run_cmd(&cmd, &runtime.repo_root, runtime.dry_run)?;
+            if code != 0 {
+                return Err(format!(
+                    "cargo path dependency sync failed for {} with exit code {code}",
+                    sync.local_dir.display()
+                ));
+            }
         }
     }
 
@@ -647,6 +924,22 @@ fn build_sync_cmd(machine: &ResolvedMachine) -> Vec<String> {
         machine.remote_repo_dir.trim_end_matches('/')
     ));
     cmd
+}
+
+fn build_path_dep_sync_cmd(machine: &ResolvedMachine, sync: &PathDependencySync) -> Vec<String> {
+    vec![
+        "rsync".to_string(),
+        "-avz".to_string(),
+        "--delete".to_string(),
+        "--exclude=.git/".to_string(),
+        "--exclude=target/".to_string(),
+        format!("{}/", sync.local_dir.display()),
+        format!(
+            "{}:{}/",
+            machine.host,
+            sync.remote_dir.trim_end_matches('/')
+        ),
+    ]
 }
 
 fn build_remote_dir_exists_cmd(machine: &ResolvedMachine, remote_runs_root: &str) -> Vec<String> {
@@ -914,6 +1207,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn runtime() -> FleetRuntime {
         FleetRuntime {
@@ -956,6 +1250,14 @@ mod tests {
             remote_repo_dir: "~/UBQ".to_string(),
             remote_runs_dir: "bench_results/runs".to_string(),
         }
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ubq_full_bench_fleet_{name}_{stamp}"))
     }
 
     #[test]
@@ -1004,6 +1306,110 @@ mod tests {
             build_pull_runs_cmd(&machine, &remote_runs_root, Path::new("bench_results/runs"));
         assert_eq!(pull[0], "rsync");
         assert!(pull[2].starts_with("lab:"));
+    }
+
+    #[test]
+    fn remote_dependency_paths_preserve_relative_layout() {
+        assert_eq!(
+            resolve_remote_dependency_dir("~/UBQ", "../FastFifo").expect("resolve"),
+            "~/FastFifo"
+        );
+        assert_eq!(
+            resolve_remote_dependency_dir("/srv/bench/UBQ", "../FastFifo").expect("resolve"),
+            "/srv/bench/FastFifo"
+        );
+        assert_eq!(
+            resolve_remote_dependency_dir("UBQ", "../FastFifo").expect("resolve"),
+            "FastFifo"
+        );
+    }
+
+    #[test]
+    fn discover_path_dependency_syncs_follow_recursive_manifests() {
+        let root = temp_root("path_syncs");
+        let repo = root.join("UBQ");
+        let dep_a = root.join("FastFifo");
+        let dep_b = dep_a.join("fastfifoprocmacro");
+        let dep_c = root.join("AtomicList");
+
+        fs::create_dir_all(repo.join("src")).expect("mkdir repo");
+        fs::create_dir_all(dep_a.join("src")).expect("mkdir dep_a");
+        fs::create_dir_all(dep_b.join("src")).expect("mkdir dep_b");
+        fs::create_dir_all(dep_c.join("src")).expect("mkdir dep_c");
+
+        fs::write(
+            repo.join("Cargo.toml"),
+            r#"[package]
+name = "ubq"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fastfifo = { path = "../FastFifo", optional = true }
+"#,
+        )
+        .expect("write repo manifest");
+        fs::write(repo.join("src/lib.rs"), "").expect("write repo lib");
+
+        fs::write(
+            dep_a.join("Cargo.toml"),
+            r#"[package]
+name = "fastfifo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fastfifoprocmacro = { path = "./fastfifoprocmacro" }
+atomic_list = { path = "../AtomicList" }
+"#,
+        )
+        .expect("write dep_a manifest");
+        fs::write(dep_a.join("src/lib.rs"), "").expect("write dep_a lib");
+
+        fs::write(
+            dep_b.join("Cargo.toml"),
+            r#"[package]
+name = "fastfifoprocmacro"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write dep_b manifest");
+        fs::write(dep_b.join("src/lib.rs"), "").expect("write dep_b lib");
+
+        fs::write(
+            dep_c.join("Cargo.toml"),
+            r#"[package]
+name = "atomic_list"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write dep_c manifest");
+        fs::write(dep_c.join("src/lib.rs"), "").expect("write dep_c lib");
+
+        let syncs = discover_path_dependency_syncs(&repo, "~/UBQ").expect("discover syncs");
+        assert_eq!(
+            syncs.len(),
+            2,
+            "nested deps inside FastFifo should be covered"
+        );
+        assert!(syncs.iter().any(|sync| {
+            sync.local_dir == dep_a.canonicalize().expect("canon dep_a")
+                && sync.remote_dir == "~/FastFifo"
+        }));
+        assert!(syncs.iter().any(|sync| {
+            sync.local_dir == dep_c.canonicalize().expect("canon dep_c")
+                && sync.remote_dir == "~/AtomicList"
+        }));
+        assert!(
+            !syncs
+                .iter()
+                .any(|sync| sync.local_dir == dep_b.canonicalize().expect("canon dep_b")),
+            "FastFifo sync should already include fastfifoprocmacro"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

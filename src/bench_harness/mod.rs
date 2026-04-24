@@ -2,7 +2,7 @@
 
 #[cfg(feature = "bench_registry")]
 use crate::align;
-use crate::{ConfiguredUBQ, backoff, variant};
+use crate::{ConfiguredUBQ, backoff};
 use concurrent_queue::{ConcurrentQueue, PopError};
 use crossbeam_queue::SegQueue;
 use crossbeam_utils::Backoff;
@@ -43,23 +43,9 @@ pub const DEFAULT_SCENARIOS: &[&str] = &[
 ];
 
 const SENTINEL: u64 = u64::MAX;
-const UBQ_PRESET_VALUES: [&str; 5] = [
-    "aggressive_prepare",
-    "balanced",
-    "pool_conservative",
-    "no_pool",
-    "consumer_pool_only",
-];
-const UBQ_POOLED_PRESET_VALUES: [&str; 4] = [
-    "aggressive_prepare",
-    "balanced",
-    "pool_conservative",
-    "consumer_pool_only",
-];
-const UBQ_POOL_VALUES: [u8; 7] = [1, 2, 4, 8, 16, 32, 64];
+const UBQ_POOL_VALUES: [u8; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
 const UBQ_BLOCK_VALUES: [u16; 8] = [31, 63, 127, 255, 511, 1023, 2047, 4095];
 const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
-const UBQ_SYNC_VALUES: [&str; 2] = ["cas", "faa"];
 
 pub trait BenchQueue: Send + Sync + 'static {
     fn new_queue() -> Arc<Self>
@@ -70,10 +56,9 @@ pub trait BenchQueue: Send + Sync + 'static {
     fn recv_value(&self) -> u64;
 }
 
-impl<V, B, const POOL: usize, const BLOCK: usize, A> BenchQueue
-    for ConfiguredUBQ<u64, V, B, POOL, BLOCK, A>
+impl<B, const POOL: usize, const BLOCK: usize, A> BenchQueue
+    for ConfiguredUBQ<u64, B, POOL, BLOCK, A>
 where
-    V: variant::Variant + 'static,
     B: backoff::BackoffPolicy + 'static,
     A: Send + Sync + 'static,
 {
@@ -191,9 +176,6 @@ impl QueueKind {
         !matches!(self, QueueKind::Ubq)
     }
 
-    pub fn is_process_exclusive(self) -> bool {
-        matches!(self, QueueKind::Ubq)
-    }
 }
 
 impl Serialize for QueueKind {
@@ -213,30 +195,6 @@ impl<'de> Deserialize<'de> for QueueKind {
         let value = String::deserialize(deserializer)?;
         QueueKind::parse(&value)
             .ok_or_else(|| serde::de::Error::custom(format!("invalid queue kind: {value}")))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SyncMode {
-    Cas,
-    Faa,
-}
-
-impl SyncMode {
-    pub fn parse(input: &str) -> Option<Self> {
-        match input.trim().to_ascii_lowercase().as_str() {
-            "cas" => Some(Self::Cas),
-            "faa" => Some(Self::Faa),
-            _ => None,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            SyncMode::Cas => "cas",
-            SyncMode::Faa => "faa",
-        }
     }
 }
 
@@ -269,29 +227,20 @@ pub struct UbqLabel {
     pub pool: u8,
     pub block: u16,
     pub backoff: String,
-    pub sync: SyncMode,
 }
 
 impl UbqLabel {
     pub fn text(&self) -> String {
         format!(
-            "{},{},{},{},{}",
-            self.preset,
-            self.pool,
-            self.block,
-            self.backoff,
-            self.sync.name()
+            "{},{},{},{}",
+            self.preset, self.pool, self.block, self.backoff
         )
     }
 
     pub fn safe(&self) -> String {
         format!(
-            "{}_{}_{}_{}_{}",
-            self.preset,
-            self.pool,
-            self.block,
-            self.backoff,
-            self.sync.name()
+            "{}_{}_{}_{}",
+            self.preset, self.pool, self.block, self.backoff
         )
     }
 }
@@ -796,7 +745,7 @@ pub fn parse_ubq_label(token: &str, require_valid: bool) -> Result<UbqLabel, Str
         .split(',')
         .filter(|part| !part.trim().is_empty())
         .collect();
-    if parts.len() != 5 {
+    if parts.len() != 4 {
         return Err(format!("invalid UBQ label '{token}'"));
     }
     let label = UbqLabel {
@@ -808,7 +757,6 @@ pub fn parse_ubq_label(token: &str, require_valid: bool) -> Result<UbqLabel, Str
             .parse::<u16>()
             .map_err(|_| format!("invalid UBQ label '{token}'"))?,
         backoff: parts[3].to_string(),
-        sync: SyncMode::parse(parts[4]).ok_or_else(|| format!("invalid UBQ label '{token}'"))?,
     };
     if require_valid && !is_valid_ubq_label(&label) {
         return Err(format!("invalid UBQ label '{token}'"));
@@ -817,7 +765,7 @@ pub fn parse_ubq_label(token: &str, require_valid: bool) -> Result<UbqLabel, Str
 }
 
 pub fn is_valid_ubq_label(label: &UbqLabel) -> bool {
-    if !UBQ_PRESET_VALUES.contains(&label.preset.as_str()) {
+    if label.preset != "balanced" {
         return false;
     }
     if !UBQ_BLOCK_VALUES.contains(&label.block) {
@@ -826,12 +774,6 @@ pub fn is_valid_ubq_label(label: &UbqLabel) -> bool {
     if !UBQ_BACKOFF_VALUES.contains(&label.backoff.as_str()) {
         return false;
     }
-    if !matches!(label.sync, SyncMode::Cas | SyncMode::Faa) {
-        return false;
-    }
-    if label.preset == "no_pool" {
-        return label.pool == 0;
-    }
     UBQ_POOL_VALUES.contains(&label.pool)
 }
 
@@ -839,7 +781,7 @@ pub fn is_valid_ubq_label_for_scenario(label: &UbqLabel, scenario: &ScenarioConf
     if !is_valid_ubq_label(label) {
         return false;
     }
-    if matches!(label.sync, SyncMode::Faa) && usize::from(label.block) < scenario.producers {
+    if usize::from(label.block) < scenario.producers {
         return false;
     }
     true
@@ -853,7 +795,7 @@ fn validate_ubq_label_for_scenario(
         return Ok(());
     }
     Err(format!(
-        "invalid UBQ label '{}' for scenario {}: FAA block size {} is smaller than producer count {}",
+        "invalid UBQ label '{}' for scenario {}: block size {} is smaller than producer count {}",
         label.text(),
         scenario.name,
         label.block,
@@ -913,58 +855,32 @@ fn immediate_neighbors(label: &UbqLabel, idx: usize) -> Vec<UbqLabel> {
     let mut out = Vec::new();
     match idx {
         0 => {
-            for preset in immediate_domain_neighbors_str(&label.preset, &UBQ_PRESET_VALUES) {
-                out.push(UbqLabel {
-                    preset: preset.to_string(),
-                    pool: label.pool,
-                    block: label.block,
-                    backoff: label.backoff.clone(),
-                    sync: label.sync,
-                });
-            }
-        }
-        1 => {
-            let pools = [0_u8, 1, 2, 4, 8, 16, 32, 64];
-            for pool in immediate_domain_neighbors_u8(label.pool, &pools) {
+            for pool in immediate_domain_neighbors_u8(label.pool, &UBQ_POOL_VALUES) {
                 out.push(UbqLabel {
                     preset: label.preset.clone(),
                     pool,
                     block: label.block,
                     backoff: label.backoff.clone(),
-                    sync: label.sync,
                 });
             }
         }
-        2 => {
+        1 => {
             for block in immediate_domain_neighbors_u16(label.block, &UBQ_BLOCK_VALUES) {
                 out.push(UbqLabel {
                     preset: label.preset.clone(),
                     pool: label.pool,
                     block,
                     backoff: label.backoff.clone(),
-                    sync: label.sync,
                 });
             }
         }
-        3 => {
+        2 => {
             for backoff in immediate_domain_neighbors_str(&label.backoff, &UBQ_BACKOFF_VALUES) {
                 out.push(UbqLabel {
                     preset: label.preset.clone(),
                     pool: label.pool,
                     block: label.block,
                     backoff: backoff.to_string(),
-                    sync: label.sync,
-                });
-            }
-        }
-        4 => {
-            for sync in immediate_domain_neighbors_str(label.sync.name(), &UBQ_SYNC_VALUES) {
-                out.push(UbqLabel {
-                    preset: label.preset.clone(),
-                    pool: label.pool,
-                    block: label.block,
-                    backoff: label.backoff.clone(),
-                    sync: SyncMode::parse(sync).expect("valid sync mode"),
                 });
             }
         }
@@ -977,54 +893,11 @@ fn required_ubq_labels_for_center(label: &UbqLabel) -> BTreeSet<UbqLabel> {
     let mut required = BTreeSet::new();
     required.insert(label.clone());
 
-    for idx in 0..5 {
+    for idx in 0..3 {
         for candidate in immediate_neighbors(label, idx) {
             if is_valid_ubq_label(&candidate) {
                 required.insert(candidate);
             }
-        }
-    }
-
-    if UBQ_POOLED_PRESET_VALUES.contains(&label.preset.as_str()) {
-        for preset in UBQ_POOLED_PRESET_VALUES {
-            let candidate = UbqLabel {
-                preset: preset.to_string(),
-                pool: label.pool,
-                block: label.block,
-                backoff: label.backoff.clone(),
-                sync: label.sync,
-            };
-            if is_valid_ubq_label(&candidate) {
-                required.insert(candidate);
-            }
-        }
-    }
-
-    if label.preset == "no_pool" {
-        for preset in UBQ_POOLED_PRESET_VALUES {
-            let candidate = UbqLabel {
-                preset: preset.to_string(),
-                pool: 1,
-                block: label.block,
-                backoff: label.backoff.clone(),
-                sync: label.sync,
-            };
-            if is_valid_ubq_label(&candidate) {
-                required.insert(candidate);
-            }
-        }
-    }
-
-    if label.preset == "no_pool" || UBQ_POOLED_PRESET_VALUES.contains(&label.preset.as_str()) {
-        let candidate = UbqLabel {
-            preset: "no_pool".to_string(),
-            pool: 0,
-            block: label.block,
-            backoff: label.backoff.clone(),
-            sync: label.sync,
-        };
-        if is_valid_ubq_label(&candidate) {
-            required.insert(candidate);
         }
     }
 
@@ -1441,18 +1314,15 @@ fn execute_job_factories(
         .build()
         .map_err(|err| format!("failed to build scheduler runtime: {err}"))?;
 
-    // Each task returns (key, Option<record>, budget, is_exclusive).
+    // Each task returns (key, Option<record>, budget).
     // A None record means the spawn_blocking closure panicked.
     let execution_result: Result<(BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>), String> =
         runtime.block_on(async {
             let mut results = BTreeMap::new();
-            let mut running: JoinSet<
-                Result<(SampleKey, Option<BenchRecord>, usize, bool), String>,
-            > = JoinSet::new();
+            let mut running: JoinSet<Result<(SampleKey, Option<BenchRecord>, usize), String>> =
+                JoinSet::new();
             let mut used_threads = 0_usize;
             let mut completed = 0_usize;
-            let mut running_jobs = 0_usize;
-            let mut running_exclusive_jobs = 0_usize;
             let mut crashed_job: Option<(String, String)> = None;
             let mut stop_scheduling = false;
 
@@ -1461,28 +1331,17 @@ fn execute_job_factories(
                 if !stop_scheduling {
                     loop {
                         let Some(index) = pending.iter().position(|job| {
-                            can_start_job(
-                                &job.spec,
-                                used_threads,
-                                available_parallelism,
-                                running_jobs,
-                                running_exclusive_jobs,
-                            )
+                            can_start_job(&job.spec, used_threads, available_parallelism)
                         }) else {
                             break;
                         };
                         let job = pending.remove(index);
                         let key = SampleKey::from_job(&job.spec);
                         let budget = job.spec.thread_budget();
-                        let is_exclusive = job.spec.queue.is_process_exclusive();
                         used_threads += budget;
                         started = true;
-                        running_jobs += 1;
-                        if is_exclusive {
-                            running_exclusive_jobs += 1;
-                        }
                         progress_line(format!(
-                            "scheduler: start {} scenario={} repeat={} mode={} items={} threads={} active={}/{} pending={} exclusive={}",
+                            "scheduler: start {} scenario={} repeat={} mode={} items={} threads={} active={}/{} pending={}",
                             job.spec.queue_label(),
                             job.spec.scenario.name.as_str(),
                             job.spec.repeat_index,
@@ -1491,16 +1350,15 @@ fn execute_job_factories(
                             budget,
                             used_threads,
                             available_parallelism,
-                            pending.len(),
-                            if is_exclusive { "yes" } else { "no" }
+                            pending.len()
                         ));
                         let core_offset = used_threads - budget;
                         running.spawn(async move {
                             let handle = tokio::task::spawn_blocking(move || (job.run)(core_offset));
                             match handle.await {
-                                Ok(record) => Ok((key, Some(record), budget, is_exclusive)),
+                                Ok(record) => Ok((key, Some(record), budget)),
                                 Err(err) if err.is_panic() => {
-                                    Ok((key, None, budget, is_exclusive))
+                                    Ok((key, None, budget))
                                 }
                                 Err(err) => {
                                     Err(format!("benchmark task join failed: {err}"))
@@ -1516,13 +1374,9 @@ fn execute_job_factories(
 
                 if !started || pending.is_empty() || stop_scheduling {
                     if let Some(joined) = running.join_next().await {
-                        let (key, maybe_record, budget, was_exclusive) =
+                        let (key, maybe_record, budget) =
                             joined.map_err(|err| format!("scheduler task failed: {err}"))??;
                         used_threads = used_threads.saturating_sub(budget);
-                        running_jobs = running_jobs.saturating_sub(1);
-                        if was_exclusive {
-                            running_exclusive_jobs = running_exclusive_jobs.saturating_sub(1);
-                        }
                         if let Some(record) = maybe_record {
                             completed += 1;
                             progress_line(format!(
@@ -1576,16 +1430,8 @@ fn can_start_job(
     spec: &JobSpec,
     used_threads: usize,
     available_parallelism: usize,
-    running_jobs: usize,
-    running_exclusive_jobs: usize,
 ) -> bool {
-    if used_threads + spec.thread_budget() > available_parallelism {
-        return false;
-    }
-    if spec.queue.is_process_exclusive() {
-        return running_jobs == 0;
-    }
-    running_exclusive_jobs == 0
+    used_threads + spec.thread_budget() <= available_parallelism
 }
 
 fn result_key_sort(lhs: &SampleKey, rhs: &SampleKey) -> Ordering {
@@ -1875,7 +1721,7 @@ fn generated_cargo_toml(repo_root: &Path) -> String {
 fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
     let mut out = String::new();
     out.push_str("use ubq::bench_harness;\n");
-    out.push_str("use ubq::{ConfiguredUBQ, align, backoff, variant};\n\n");
+    out.push_str("use ubq::{ConfiguredUBQ, align, backoff};\n\n");
     out.push_str("fn main() {\n");
     out.push_str(
         "    let plan = bench_harness::parse_embedded_plan(PLAN_JSON).expect(\"plan\");\n",
@@ -1936,19 +1782,6 @@ fn progress_line(message: impl AsRef<str>) {
 }
 
 fn ubq_type_expr(label: &UbqLabel) -> String {
-    let variant_ty = match (label.preset.as_str(), label.sync) {
-        ("aggressive_prepare", SyncMode::Cas) => "variant::AggressivePrepare",
-        ("aggressive_prepare", SyncMode::Faa) => "variant::AggressivePrepareFAA",
-        ("balanced", SyncMode::Cas) => "variant::Balanced",
-        ("balanced", SyncMode::Faa) => "variant::BalancedFAA",
-        ("pool_conservative", SyncMode::Cas) => "variant::PoolConservative",
-        ("pool_conservative", SyncMode::Faa) => "variant::PoolConservativeFAA",
-        ("no_pool", SyncMode::Cas) => "variant::NoPool",
-        ("no_pool", SyncMode::Faa) => "variant::NoPoolFAA",
-        ("consumer_pool_only", SyncMode::Cas) => "variant::ConsumerPoolOnly",
-        ("consumer_pool_only", SyncMode::Faa) => "variant::ConsumerPoolOnlyFAA",
-        _ => panic!("unsupported UBQ label {:?}", label),
-    };
     let backoff_ty = match label.backoff.as_str() {
         "crossbeam" => "backoff::Crossbeam",
         "yield" => "backoff::Yield",
@@ -1966,7 +1799,7 @@ fn ubq_type_expr(label: &UbqLabel) -> String {
         _ => panic!("unsupported block size {}", label.block),
     };
     format!(
-        "ConfiguredUBQ<u64, {variant_ty}, {backoff_ty}, {}, {}, {align_ty}>",
+        "ConfiguredUBQ<u64, {backoff_ty}, {}, {}, {align_ty}>",
         label.pool, label.block
     )
 }
@@ -2688,12 +2521,12 @@ pub fn detect_available_parallelism() -> Result<usize, String> {
         .ok_or_else(|| "unable to determine available_parallelism".to_string())
 }
 
-/// Run a [`MatrixPlan`] fully in-process using the static variant registry compiled
+/// Run a [`MatrixPlan`] fully in-process using the static UBQ registry compiled
 /// by the build script (requires the `bench_registry` feature).
 ///
 /// This replaces the old two-process approach (`build_and_run_matrix_plan`) that
 /// generated a temporary Cargo project and compiled it at runtime.  All UBQ
-/// variants are now monomorphised once at build time; each frontier-search round
+/// configurations are now monomorphised once at build time; each frontier-search round
 /// dispatches directly into the pre-compiled functions with no subprocess overhead.
 ///
 /// Panics inside individual benchmark jobs are caught via
@@ -2748,7 +2581,7 @@ pub fn run_matrix_plan_in_process(
                 )
                 .ok_or_else(|| {
                     format!(
-                        "no compiled variant for UBQ label '{label}'; \
+                        "no compiled UBQ configuration for label '{label}'; \
                          rebuild with --features bench_registry"
                     )
                 })?
@@ -2786,7 +2619,7 @@ pub fn run_matrix_plan_in_process(
     })
 }
 
-// Static variant registry — generated by build.rs.
+// Static UBQ registry — generated by build.rs.
 // Defines: fn lookup_ubq_job_factory(label, scenario, repeat_index, mode, items_per_producer)
 //          -> Option<JobFactory>
 include!(concat!(env!("OUT_DIR"), "/bench_registry.rs"));
@@ -2812,30 +2645,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_five_part_ubq_labels() {
-        let parsed = parse_ubq_label("balanced,8,127,crossbeam,faa", true).expect("label");
+    fn parses_four_part_ubq_labels() {
+        let parsed = parse_ubq_label("balanced,8,127,crossbeam", true).expect("label");
         assert_eq!(parsed.preset, "balanced");
         assert_eq!(parsed.pool, 8);
         assert_eq!(parsed.block, 127);
         assert_eq!(parsed.backoff, "crossbeam");
-        assert_eq!(parsed.sync, SyncMode::Faa);
     }
 
     #[test]
-    fn immediate_search_includes_faa_axis() {
-        let labels =
-            immediate_search_labels("balanced,8,127,crossbeam,cas").expect("immediate labels");
-        assert!(labels.contains("balanced,8,127,crossbeam,cas"));
-        assert!(labels.contains("balanced,8,127,crossbeam,faa"));
-    }
-
-    #[test]
-    fn scenario_search_excludes_faa_blocks_below_producer_count() {
+    fn scenario_search_excludes_small_blocks_for_high_producer_count() {
         let scenario = ScenarioConfig::new(64, 1);
-        let labels = immediate_search_labels_for_scenario("balanced,8,63,crossbeam,cas", &scenario)
+        let labels = immediate_search_labels_for_scenario("balanced,8,127,crossbeam", &scenario)
             .expect("scenario labels");
-        assert!(labels.contains("balanced,8,63,crossbeam,cas"));
-        assert!(!labels.contains("balanced,8,63,crossbeam,faa"));
+        assert!(labels.contains("balanced,8,127,crossbeam"));
+        assert!(!labels.contains("balanced,8,63,crossbeam"));
     }
 
     #[test]
@@ -2857,13 +2681,13 @@ mod tests {
     }
 
     #[test]
-    fn direct_plan_rejects_faa_blocks_below_producer_count() {
+    fn direct_plan_rejects_blocks_below_producer_count() {
         let err = build_direct_matrix_plan(
             "local",
             PathBuf::from(DEFAULT_RUNS_DIR),
             128,
             &[QueueKind::Ubq],
-            &["balanced,8,63,crossbeam,faa".to_string()],
+            &["balanced,8,63,crossbeam".to_string()],
             &[ScenarioConfig::new(64, 1)],
             &[Mode::Throughput],
             &[1],
@@ -2872,7 +2696,7 @@ mod tests {
         )
         .expect_err("expected validation error");
         assert!(err.contains("64p1c"));
-        assert!(err.contains("FAA block size 63"));
+        assert!(err.contains("block size 63"));
     }
 
     #[test]
@@ -2926,7 +2750,7 @@ mod tests {
             bundles: vec![PlanBundle {
                 scenario: ScenarioConfig::new(1, 1),
                 repeat_index: 1,
-                ubq_label: Some("balanced,1,31,crossbeam,cas".to_string()),
+                ubq_label: Some("balanced,1,31,crossbeam".to_string()),
                 modes: vec![Mode::Throughput],
                 items_per_producer_values: vec![1],
             }],
@@ -3023,13 +2847,104 @@ mod tests {
     }
 
     #[test]
+    fn execute_job_factories_can_run_multiple_ubq_jobs_concurrently() {
+        let root =
+            std::env::temp_dir().join(format!("ubq_parallel_ubq_test_{}", now_unix_nanos()));
+        let runs_dir = root.join("runs");
+        fs::create_dir_all(&runs_dir).expect("mkdir");
+
+        let scenario = ScenarioConfig::new(1, 1);
+        let ubq_label = "balanced,1,31,crossbeam".to_string();
+        let plan = MatrixPlan {
+            plan_schema_version: PLAN_SCHEMA_VERSION,
+            machine_label: "local".to_string(),
+            runs_dir: runs_dir.clone(),
+            available_parallelism: 4,
+            baseline_queues: Vec::new(),
+            bundles: vec![
+                PlanBundle {
+                    scenario: scenario.clone(),
+                    repeat_index: 1,
+                    ubq_label: Some(ubq_label.clone()),
+                    modes: vec![Mode::Throughput],
+                    items_per_producer_values: vec![1],
+                },
+                PlanBundle {
+                    scenario: scenario.clone(),
+                    repeat_index: 2,
+                    ubq_label: Some(ubq_label.clone()),
+                    modes: vec![Mode::Throughput],
+                    items_per_producer_values: vec![1],
+                },
+            ],
+            reuse_existing: false,
+        };
+
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let start_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make_job = |repeat_index| {
+            let active = std::sync::Arc::clone(&active);
+            let max_active = std::sync::Arc::clone(&max_active);
+            let start_count = std::sync::Arc::clone(&start_count);
+            JobFactory {
+                spec: JobSpec {
+                    scenario: scenario.clone(),
+                    repeat_index,
+                    mode: Mode::Throughput,
+                    items_per_producer: 1,
+                    queue: QueueKind::Ubq,
+                    ubq_label: Some(ubq_label.clone()),
+                },
+                run: std::sync::Arc::new(move |_| {
+                    start_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let now_active =
+                        active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now_active, std::sync::atomic::Ordering::SeqCst);
+
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(200);
+                    while start_count.load(std::sync::atomic::Ordering::SeqCst) < 2
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    test_record("ubq", Mode::Throughput, 1)
+                }),
+            }
+        };
+
+        let pending = vec![make_job(1), make_job(2)];
+        let (executed, crashed) = execute_job_factories(
+            &plan,
+            &ExistingRunsIndex::default(),
+            pending,
+            plan.available_parallelism,
+        )
+        .expect("execute");
+
+        assert!(crashed.is_none());
+        assert_eq!(executed.len(), 2);
+        assert_eq!(start_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            max_active.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "expected overlapping UBQ execution when thread budget allows it"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn frontier_bootstraps_seed_across_all_scenarios() {
         let config = FrontierConfig {
             machine_label: "local".to_string(),
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![ScenarioConfig::new(1, 1), ScenarioConfig::new(1, 4)],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            seed_labels: vec!["balanced,8,127,crossbeam,cas".to_string()],
+            seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 2,
@@ -3096,7 +3011,7 @@ mod tests {
                     repeat_index,
                     mode: Mode::Throughput,
                     items_per_producer: 1,
-                    queue_label: "ubq_balanced,8,127,crossbeam,cas".to_string(),
+                    queue_label: "ubq,8,127,crossbeam".to_string(),
                 },
                 BenchRecord {
                     queue: "ubq".to_string(),
@@ -3119,7 +3034,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            seed_labels: vec!["balanced,8,127,crossbeam,cas".to_string()],
+            seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 2,
@@ -3129,7 +3044,7 @@ mod tests {
         assert!(
             plan.bundles
                 .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,crossbeam,faa"))
+                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,yield"))
         );
     }
 
@@ -3188,7 +3103,7 @@ mod tests {
                     repeat_index,
                     mode: Mode::Throughput,
                     items_per_producer: 1,
-                    queue_label: "ubq_balanced,8,127,crossbeam,cas".to_string(),
+                    queue_label: "ubq,8,127,crossbeam".to_string(),
                 },
                 BenchRecord {
                     queue: "ubq".to_string(),
@@ -3211,7 +3126,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            seed_labels: vec!["balanced,8,127,crossbeam,cas".to_string()],
+            seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 2,
@@ -3221,17 +3136,17 @@ mod tests {
         assert!(
             plan.bundles
                 .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,crossbeam,faa"))
+                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,yield"))
         );
     }
 
     #[test]
     fn frontier_does_not_expand_nonbest_baseline_beater() {
         let scenario = ScenarioConfig::new(1, 1);
-        let weaker_label = "balanced,8,127,crossbeam,cas";
-        let best_label = "balanced,16,127,crossbeam,cas";
-        let best_only_neighbor = "balanced,32,127,crossbeam,cas";
-        let weaker_only_neighbor = "balanced,4,127,crossbeam,cas";
+        let weaker_label = "balanced,8,127,crossbeam";
+        let best_label = "balanced,16,127,crossbeam";
+        let best_only_neighbor = "balanced,32,127,crossbeam";
+        let weaker_only_neighbor = "balanced,4,127,crossbeam";
         let mut index = ExistingRunsIndex::default();
 
         for repeat_index in 1..=2 {
@@ -3358,7 +3273,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![ScenarioConfig::new(64, 1)],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            seed_labels: vec!["balanced,8,63,crossbeam,faa".to_string()],
+            seed_labels: vec!["balanced,8,63,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 1,
@@ -3375,7 +3290,7 @@ mod tests {
     fn frontier_runs_local_winner_across_all_scenarios() {
         let winner_scenario = ScenarioConfig::new(1, 1);
         let other_scenario = ScenarioConfig::new(1, 4);
-        let winning_label = "balanced,8,127,crossbeam,cas";
+        let winning_label = "balanced,8,127,crossbeam";
         let mut index = ExistingRunsIndex::default();
 
         for repeat_index in 1..=2 {
@@ -3452,7 +3367,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![winner_scenario.clone(), other_scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            seed_labels: vec!["balanced,1,31,crossbeam,cas".to_string()],
+            seed_labels: vec!["balanced,1,31,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 2,
@@ -3474,10 +3389,10 @@ mod tests {
     }
 
     #[test]
-    fn frontier_does_not_propagate_invalid_faa_global_winner() {
+    fn frontier_does_not_propagate_winner_invalid_for_scenario() {
         let winner_scenario = ScenarioConfig::new(1, 1);
         let constrained_scenario = ScenarioConfig::new(64, 1);
-        let winning_label = "balanced,8,31,crossbeam,faa";
+        let winning_label = "balanced,8,31,crossbeam";
         let mut index = ExistingRunsIndex::default();
 
         for repeat_index in 1..=2 {
@@ -3554,7 +3469,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![winner_scenario, constrained_scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            seed_labels: vec!["balanced,8,127,crossbeam,cas".to_string()],
+            seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 2,
@@ -3568,7 +3483,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_treats_ubq_jobs_as_process_exclusive() {
+    fn scheduler_allows_jobs_until_thread_budget_is_exhausted() {
         let baseline = JobSpec {
             scenario: ScenarioConfig::new(1, 1),
             repeat_index: 1,
@@ -3583,14 +3498,13 @@ mod tests {
             mode: Mode::Throughput,
             items_per_producer: 1,
             queue: QueueKind::Ubq,
-            ubq_label: Some("balanced,1,31,crossbeam,cas".to_string()),
+            ubq_label: Some("balanced,1,31,crossbeam".to_string()),
         };
 
-        assert!(can_start_job(&baseline, 0, 8, 0, 0));
-        assert!(can_start_job(&ubq, 0, 8, 0, 0));
-        assert!(can_start_job(&baseline, 2, 8, 1, 0));
-        assert!(!can_start_job(&ubq, 2, 8, 1, 0));
-        assert!(!can_start_job(&baseline, 2, 8, 1, 1));
-        assert!(!can_start_job(&ubq, 2, 8, 1, 1));
+        assert!(can_start_job(&baseline, 0, 8));
+        assert!(can_start_job(&ubq, 0, 8));
+        assert!(can_start_job(&baseline, 2, 8));
+        assert!(can_start_job(&ubq, 2, 8));
+        assert!(!can_start_job(&ubq, 7, 8));
     }
 }
