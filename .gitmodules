@@ -1,0 +1,3 @@
+[submodule "vendor/FastFifo"]
+	path = vendor/FastFifo
+	url = https://github.com/Orkking2/FastFifo.git
