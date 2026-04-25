@@ -3,10 +3,11 @@ runs_dir = "bench_results/runs"
 plot_out_dir = "bench_results/plots"
 remote_repo_dir = "~/UBQ"
 remote_runs_dir = "bench_results/runs"
-queues = ["ubq", "segqueue", "concurrent-queue"]
+queues = ["ubq", "segqueue", "concurrent-queue", "fastfifo"]
 modes = ["throughput"]
 items_per_producer = [1000000]
 repeats = 1
+fastfifo_block_sizes = [64, 256, 1024, 4096]
 scenarios = [
   "1p1c",
   "4p1c",

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::thread;
 
 const REPO_SYNC_INCLUDE_PATTERNS: &[&str] = &[
+    "/.gitmodules",
     "/Cargo.toml",
     "/Cargo.lock",
     "/build.rs",
@@ -75,6 +76,7 @@ struct FleetDefaults {
     items_per_producer: Option<Vec<u64>>,
     repeats: Option<usize>,
     ubq_labels: Option<Vec<String>>,
+    fastfifo_block_sizes: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -107,6 +109,7 @@ struct FleetRuntime {
     items_per_producer: Vec<u64>,
     repeats: usize,
     ubq_labels: Vec<String>,
+    fastfifo_block_sizes: Vec<usize>,
     sync_repo: bool,
     dry_run: bool,
     frontier_args: Vec<String>,
@@ -574,6 +577,17 @@ fn make_frontier_base_args(
         frontier_args.push("--seed-label".to_string());
         frontier_args.push(seed_label.clone());
     }
+    if !runtime.fastfifo_block_sizes.is_empty() {
+        frontier_args.push("--fastfifo-block-sizes".to_string());
+        frontier_args.push(
+            runtime
+                .fastfifo_block_sizes
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     frontier_args.extend(runtime.frontier_args.clone());
     if runtime.dry_run {
         frontier_args.push("--dry-run".to_string());
@@ -581,15 +595,33 @@ fn make_frontier_base_args(
     frontier_args
 }
 
+fn queue_list_includes_fastfifo(queues: &[String]) -> bool {
+    queues.iter().any(|queue| {
+        matches!(
+            queue.trim().to_ascii_lowercase().as_str(),
+            "fastfifo" | "fast-fifo" | "bbq"
+        )
+    })
+}
+
+fn cargo_feature_arg(runtime: &FleetRuntime) -> String {
+    if queue_list_includes_fastfifo(&runtime.queues) {
+        "bench_registry,bench_fastfifo".to_string()
+    } else {
+        "bench_registry".to_string()
+    }
+}
+
 fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -> Vec<String> {
     let runs_dir = runtime.runs_dir.display().to_string();
+    let features = cargo_feature_arg(runtime);
     let mut cmd = vec![
         "cargo".to_string(),
         "run".to_string(),
         "--quiet".to_string(),
         "--release".to_string(),
         "--features".to_string(),
-        "bench_registry".to_string(),
+        features,
         "--bin".to_string(),
         "bench_frontier".to_string(),
         "--".to_string(),
@@ -604,13 +636,14 @@ fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -
 
 /// Build the shell payload (no SSH wrapper) for running bench_frontier on a remote machine.
 fn build_remote_bench_payload(runtime: &FleetRuntime, machine: &ResolvedMachine) -> String {
+    let features = cargo_feature_arg(runtime);
     let mut inner = vec![
         "cargo".to_string(),
         "run".to_string(),
         "--quiet".to_string(),
         "--release".to_string(),
         "--features".to_string(),
-        "bench_registry".to_string(),
+        features,
         "--bin".to_string(),
         "bench_frontier".to_string(),
         "--".to_string(),
@@ -927,12 +960,15 @@ fn build_sync_cmd(machine: &ResolvedMachine) -> Vec<String> {
 }
 
 fn build_path_dep_sync_cmd(machine: &ResolvedMachine, sync: &PathDependencySync) -> Vec<String> {
+    let remote_parent = remote_parent_dir(&sync.remote_dir);
     vec![
         "rsync".to_string(),
         "-avz".to_string(),
         "--delete".to_string(),
         "--exclude=.git/".to_string(),
         "--exclude=target/".to_string(),
+        "--rsync-path".to_string(),
+        format!("mkdir -p {} && rsync", remote_cd_expr(&remote_parent)),
         format!("{}/", sync.local_dir.display()),
         format!(
             "{}:{}/",
@@ -940,6 +976,18 @@ fn build_path_dep_sync_cmd(machine: &ResolvedMachine, sync: &PathDependencySync)
             sync.remote_dir.trim_end_matches('/')
         ),
     ]
+}
+
+fn remote_parent_dir(path: &str) -> String {
+    let trimmed = path.trim().trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "~" || trimmed == "/" {
+        return trimmed.to_string();
+    }
+    match trimmed.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(idx) => trimmed[..idx].to_string(),
+        None => ".".to_string(),
+    }
 }
 
 fn build_remote_dir_exists_cmd(machine: &ResolvedMachine, remote_runs_root: &str) -> Vec<String> {
@@ -1073,6 +1121,10 @@ fn run(args: Args) -> Result<i32, String> {
         .repeats
         .unwrap_or_else(|| defaults.repeats.unwrap_or(1));
     let ubq_labels = defaults.ubq_labels.clone().unwrap_or_default();
+    let fastfifo_block_sizes = defaults
+        .fastfifo_block_sizes
+        .clone()
+        .unwrap_or_else(|| vec![64, 256, 1024, 4096]);
 
     let repo_root =
         std::env::current_dir().map_err(|err| format!("failed to read current dir: {err}"))?;
@@ -1087,6 +1139,7 @@ fn run(args: Args) -> Result<i32, String> {
         items_per_producer,
         repeats,
         ubq_labels,
+        fastfifo_block_sizes,
         sync_repo: !args.no_sync_repo,
         dry_run: args.dry_run,
         frontier_args: args.frontier_args.clone(),
@@ -1224,6 +1277,7 @@ mod tests {
             items_per_producer: vec![1_000],
             repeats: 2,
             ubq_labels: vec!["balanced,8,127,crossbeam,cas".to_string()],
+            fastfifo_block_sizes: vec![64, 256, 1024, 4096],
             sync_repo: true,
             dry_run: true,
             frontier_args: vec!["--parallelism=16".to_string()],
@@ -1282,6 +1336,17 @@ mod tests {
     }
 
     #[test]
+    fn local_frontier_command_enables_fastfifo_feature_when_selected() {
+        let mut runtime = runtime();
+        runtime.queues.push("fastfifo".to_string());
+        let machine = machine_local();
+        let cmd = build_local_complete_cmd(&runtime, &machine);
+        assert!(cmd.contains(&"bench_registry,bench_fastfifo".to_string()));
+        assert!(cmd.contains(&"--fastfifo-block-sizes".to_string()));
+        assert!(cmd.contains(&"64,256,1024,4096".to_string()));
+    }
+
+    #[test]
     fn remote_frontier_command_uses_ssh_and_cargo() {
         let runtime = runtime();
         let machine = machine_remote();
@@ -1309,6 +1374,30 @@ mod tests {
     }
 
     #[test]
+    fn path_dependency_sync_creates_remote_parent() {
+        let machine = machine_remote();
+        let cmd = build_path_dep_sync_cmd(
+            &machine,
+            &PathDependencySync {
+                local_dir: PathBuf::from("/tmp/FastFifo"),
+                remote_dir: "~/UBQ/vendor/FastFifo".to_string(),
+            },
+        );
+        assert!(cmd.contains(&"--rsync-path".to_string()));
+        assert!(cmd.contains(&"mkdir -p \"$HOME/UBQ/vendor\" && rsync".to_string()));
+    }
+
+    #[test]
+    fn remote_parent_dir_handles_common_forms() {
+        assert_eq!(remote_parent_dir("~/UBQ/vendor/FastFifo"), "~/UBQ/vendor");
+        assert_eq!(
+            remote_parent_dir("/srv/bench/UBQ/vendor/FastFifo"),
+            "/srv/bench/UBQ/vendor"
+        );
+        assert_eq!(remote_parent_dir("FastFifo"), ".");
+    }
+
+    #[test]
     fn remote_dependency_paths_preserve_relative_layout() {
         assert_eq!(
             resolve_remote_dependency_dir("~/UBQ", "../FastFifo").expect("resolve"),
@@ -1328,9 +1417,9 @@ mod tests {
     fn discover_path_dependency_syncs_follow_recursive_manifests() {
         let root = temp_root("path_syncs");
         let repo = root.join("UBQ");
-        let dep_a = root.join("FastFifo");
+        let dep_a = repo.join("vendor").join("FastFifo");
         let dep_b = dep_a.join("fastfifoprocmacro");
-        let dep_c = root.join("AtomicList");
+        let dep_c = repo.join("vendor").join("AtomicList");
 
         fs::create_dir_all(repo.join("src")).expect("mkdir repo");
         fs::create_dir_all(dep_a.join("src")).expect("mkdir dep_a");
@@ -1345,7 +1434,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fastfifo = { path = "../FastFifo", optional = true }
+fastfifo = { path = "vendor/FastFifo", optional = true }
 "#,
         )
         .expect("write repo manifest");
@@ -1396,11 +1485,11 @@ edition = "2024"
         );
         assert!(syncs.iter().any(|sync| {
             sync.local_dir == dep_a.canonicalize().expect("canon dep_a")
-                && sync.remote_dir == "~/FastFifo"
+                && sync.remote_dir == "~/UBQ/vendor/FastFifo"
         }));
         assert!(syncs.iter().any(|sync| {
             sync.local_dir == dep_c.canonicalize().expect("canon dep_c")
-                && sync.remote_dir == "~/AtomicList"
+                && sync.remote_dir == "~/UBQ/vendor/AtomicList"
         }));
         assert!(
             !syncs

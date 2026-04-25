@@ -75,35 +75,48 @@ TODO
 ## Benchmarks
 
 This repo includes a benchmark harness that compares UBQ against established
-unbounded MPMC queue implementations (`segqueue` and `concurrent-queue`) in
+MPMC queue implementations (`segqueue`, `concurrent-queue`, and optional
+FastFifo/BBQ variants) in
 `1p1c`, `4p1c`, `1p4c`, `4p4c`, `8p1c`, `8p4c`, `8p8c`, `1p8c`, `4p8c`,
 `16p1c`, `1p16c`, `8p16c`, `16p8c`, `16p16c`, `32p1c`, `1p32c`, `16p32c`,
 `32p16c`, `32p32c`, `64p1c`, `1p64c`, `32p64c`, `64p32c`, and `64p64c`
 scenarios. The v2 harness has two layers:
 
-- `bench_matrix`: direct matrix execution. It generates a temporary scheduler
-  crate under `target/bench_harness/`, compiles only the requested queue
-  monomorphizations, and writes v2 JSON files under `bench_results/runs`.
+- `bench_matrix`: direct matrix execution. It dispatches through the
+  precompiled benchmark registry and writes v2 JSON files under
+  `bench_results/runs`.
 - `bench_frontier`: higher-level frontier search. It inspects existing v2 runs,
   expands the UBQ search graph scenario-by-scenario, and submits missing work to
-  `bench_matrix`.
+  `bench_matrix`. FastFifo/BBQ uses a fixed block-size grid rather than adaptive
+  frontier expansion.
   A run is `frontier-complete` when no pending frontier bundles remain; the
   frontier expands around the best fully-covered UBQ label per
   scenario/metric, while propagating baseline-beating fully-covered winners
   across scenarios.
 
-UBQ labels are now 5-part identifiers:
+UBQ labels are 4-part identifiers:
 
-- `preset,pool,block,backoff,faa|cas`
-- Example: `balanced,8,127,crossbeam,cas`
+- `preset,pool,block,backoff`
+- Example: `balanced,8,127,crossbeam`
+
+FastFifo/BBQ labels are emitted as `fastfifo_<block_size>`, for example
+`fastfifo_256`. When FastFifo is selected, the default block-size grid is
+`64,256,1024,4096`.
+
+Initialize benchmark submodules after cloning:
+
+```bash
+git submodule update --init --recursive
+```
 
 Run an explicit direct matrix:
 
 ```bash
-cargo run --release --bin bench_matrix -- \
+cargo run --release --features bench_registry,bench_fastfifo --bin bench_matrix -- \
   --machine-label local \
-  --queues ubq,segqueue,concurrent-queue \
-  --ubq-label balanced,8,127,crossbeam,cas \
+  --queues ubq,segqueue,concurrent-queue,fastfifo \
+  --ubq-label balanced,8,127,crossbeam \
+  --fastfifo-block-sizes 64,256,1024,4096 \
   --scenarios 1p1c,8p8c \
   --modes throughput,fill_drain \
   --items-per-producer 1000000
@@ -112,9 +125,11 @@ cargo run --release --bin bench_matrix -- \
 Run the frontier search on one machine:
 
 ```bash
-cargo run --release --bin bench_frontier -- \
+cargo run --release --features bench_registry,bench_fastfifo --bin bench_frontier -- \
   --machine-label local \
-  --seed-label balanced,8,127,crossbeam,cas
+  --queues ubq,segqueue,concurrent-queue,fastfifo \
+  --seed-label balanced,8,127,crossbeam \
+  --fastfifo-block-sizes 64,256,1024,4096
 ```
 
 Run the configured fleet search:

@@ -6,6 +6,8 @@ use crate::{ConfiguredUBQ, backoff};
 use concurrent_queue::{ConcurrentQueue, PopError};
 use crossbeam_queue::SegQueue;
 use crossbeam_utils::Backoff;
+#[cfg(feature = "bench_fastfifo")]
+use fastfifo::mpmc::FastFifo;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,17 +45,43 @@ pub const DEFAULT_SCENARIOS: &[&str] = &[
 ];
 
 const SENTINEL: u64 = u64::MAX;
+const DEFAULT_FASTFIFO_BLOCK_SIZES: [usize; 4] = [64, 256, 1024, 4096];
+#[cfg(feature = "bench_fastfifo")]
+const FASTFIFO_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const UBQ_POOL_VALUES: [u8; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
 const UBQ_BLOCK_VALUES: [u16; 8] = [31, 63, 127, 255, 511, 1023, 2047, 4095];
 const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
 
-pub trait BenchQueue: Send + Sync + 'static {
+pub trait BenchQueueOps: Send + Sync + 'static {
+    fn send_value(&self, value: u64);
+    fn recv_value(&self) -> u64;
+}
+
+pub trait BenchQueue: BenchQueueOps {
     fn new_queue() -> Arc<Self>
     where
         Self: Sized;
+}
 
-    fn send_value(&self, value: u64);
-    fn recv_value(&self) -> u64;
+impl<B, const POOL: usize, const BLOCK: usize, A> BenchQueueOps
+    for ConfiguredUBQ<u64, B, POOL, BLOCK, A>
+where
+    B: backoff::BackoffPolicy + 'static,
+    A: Send + Sync + 'static,
+{
+    fn send_value(&self, value: u64) {
+        self.push(value);
+    }
+
+    fn recv_value(&self) -> u64 {
+        let backoff = Backoff::new();
+        loop {
+            if let Some(value) = self.pop() {
+                return value;
+            }
+            backoff.snooze();
+        }
+    }
 }
 
 impl<B, const POOL: usize, const BLOCK: usize, A> BenchQueue
@@ -65,7 +93,9 @@ where
     fn new_queue() -> Arc<Self> {
         Arc::new(Self::new())
     }
+}
 
+impl BenchQueueOps for SegQueue<u64> {
     fn send_value(&self, value: u64) {
         self.push(value);
     }
@@ -85,27 +115,9 @@ impl BenchQueue for SegQueue<u64> {
     fn new_queue() -> Arc<Self> {
         Arc::new(Self::new())
     }
-
-    fn send_value(&self, value: u64) {
-        self.push(value);
-    }
-
-    fn recv_value(&self) -> u64 {
-        let backoff = Backoff::new();
-        loop {
-            if let Some(value) = self.pop() {
-                return value;
-            }
-            backoff.snooze();
-        }
-    }
 }
 
-impl BenchQueue for ConcurrentQueue<u64> {
-    fn new_queue() -> Arc<Self> {
-        Arc::new(Self::unbounded())
-    }
-
+impl BenchQueueOps for ConcurrentQueue<u64> {
     fn send_value(&self, value: u64) {
         self.push(value).expect("send failed");
     }
@@ -118,6 +130,64 @@ impl BenchQueue for ConcurrentQueue<u64> {
                 Err(PopError::Empty) => {}
                 Err(PopError::Closed) => panic!("recv failed: queue closed"),
             }
+            backoff.snooze();
+        }
+    }
+}
+
+impl BenchQueue for ConcurrentQueue<u64> {
+    fn new_queue() -> Arc<Self> {
+        Arc::new(Self::unbounded())
+    }
+}
+
+#[cfg(feature = "bench_fastfifo")]
+struct FastFifoBenchQueue {
+    inner: FastFifo<u64>,
+}
+
+#[cfg(feature = "bench_fastfifo")]
+impl FastFifoBenchQueue {
+    fn new(scenario: &ScenarioConfig, items_per_producer: u64, block_size: usize) -> Arc<Self> {
+        let total_items = usize::try_from(total_items(items_per_producer, scenario.producers))
+            .expect("total items must fit usize for FastFifo capacity");
+        let required_capacity = total_items
+            .checked_add(scenario.consumers)
+            .and_then(|value| value.checked_add(block_size))
+            .expect("FastFifo required capacity overflow");
+        let num_blocks = required_capacity
+            .div_ceil(block_size)
+            .checked_add(2)
+            .expect("FastFifo block count overflow")
+            .max(2);
+        Arc::new(Self {
+            inner: FastFifo::new(num_blocks, block_size),
+        })
+    }
+}
+
+#[cfg(feature = "bench_fastfifo")]
+impl BenchQueueOps for FastFifoBenchQueue {
+    fn send_value(&self, value: u64) {
+        let deadline = Instant::now() + FASTFIFO_WAIT_TIMEOUT;
+        let backoff = Backoff::new();
+        loop {
+            if self.inner.push(value).is_ok() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out pushing to FastFifo");
+            backoff.snooze();
+        }
+    }
+
+    fn recv_value(&self) -> u64 {
+        let deadline = Instant::now() + FASTFIFO_WAIT_TIMEOUT;
+        let backoff = Backoff::new();
+        loop {
+            if let Ok(value) = self.inner.pop() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "timed out popping from FastFifo");
             backoff.snooze();
         }
     }
@@ -152,6 +222,7 @@ pub enum QueueKind {
     Ubq,
     SegQueue,
     ConcurrentQueue,
+    FastFifo,
 }
 
 impl QueueKind {
@@ -160,6 +231,7 @@ impl QueueKind {
             QueueKind::Ubq => "ubq",
             QueueKind::SegQueue => "segqueue",
             QueueKind::ConcurrentQueue => "concurrent-queue",
+            QueueKind::FastFifo => "fastfifo",
         }
     }
 
@@ -168,6 +240,7 @@ impl QueueKind {
             "ubq" => Some(Self::Ubq),
             "segqueue" | "crossbeam" | "crossbeam-segqueue" => Some(Self::SegQueue),
             "concurrent-queue" | "concurrent" => Some(Self::ConcurrentQueue),
+            "fastfifo" | "fast-fifo" | "bbq" => Some(Self::FastFifo),
             _ => None,
         }
     }
@@ -175,7 +248,6 @@ impl QueueKind {
     pub fn is_baseline(self) -> bool {
         !matches!(self, QueueKind::Ubq)
     }
-
 }
 
 impl Serialize for QueueKind {
@@ -253,12 +325,14 @@ pub struct JobSpec {
     pub items_per_producer: u64,
     pub queue: QueueKind,
     pub ubq_label: Option<String>,
+    pub fastfifo_block_size: Option<usize>,
 }
 
 impl JobSpec {
     pub fn queue_label(&self) -> String {
-        match (&self.queue, &self.ubq_label) {
-            (QueueKind::Ubq, Some(label)) => format!("ubq_{label}"),
+        match (&self.queue, &self.ubq_label, self.fastfifo_block_size) {
+            (QueueKind::Ubq, Some(label), _) => format!("ubq_{label}"),
+            (QueueKind::FastFifo, _, Some(block_size)) => fastfifo_queue_label(block_size),
             _ => self.queue.name().to_string(),
         }
     }
@@ -316,6 +390,8 @@ pub struct MatrixPlan {
     pub runs_dir: PathBuf,
     pub available_parallelism: usize,
     pub baseline_queues: Vec<QueueKind>,
+    #[serde(default)]
+    pub fastfifo_block_sizes: Vec<usize>,
     pub bundles: Vec<PlanBundle>,
     pub reuse_existing: bool,
 }
@@ -326,6 +402,7 @@ pub struct FrontierConfig {
     pub runs_dir: PathBuf,
     pub scenarios: Vec<ScenarioConfig>,
     pub baseline_queues: Vec<QueueKind>,
+    pub fastfifo_block_sizes: Vec<usize>,
     pub seed_labels: Vec<String>,
     pub modes: Vec<Mode>,
     pub items_per_producer_values: Vec<u64>,
@@ -723,6 +800,57 @@ pub fn parse_items_per_producer(raw: Option<&str>) -> Result<Vec<u64>, String> {
     Ok(out)
 }
 
+pub fn parse_fastfifo_block_sizes(raw: Option<&str>) -> Result<Vec<usize>, String> {
+    let source = raw.map(parse_csv_list).unwrap_or_else(|| {
+        DEFAULT_FASTFIFO_BLOCK_SIZES
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    });
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for token in source {
+        let parsed = token
+            .parse::<usize>()
+            .map_err(|_| format!("invalid FastFifo block size '{token}'"))?;
+        if parsed == 0 {
+            return Err("FastFifo block sizes must be > 0".to_string());
+        }
+        if seen.insert(parsed) {
+            out.push(parsed);
+        }
+    }
+    if out.is_empty() {
+        return Err("at least one FastFifo block size is required".to_string());
+    }
+    Ok(out)
+}
+
+fn fastfifo_queue_label(block_size: usize) -> String {
+    format!("fastfifo_{block_size}")
+}
+
+fn baseline_queue_labels(
+    baseline_queues: &[QueueKind],
+    fastfifo_block_sizes: &[usize],
+) -> Vec<String> {
+    let mut labels = Vec::new();
+    for queue in baseline_queues {
+        match queue {
+            QueueKind::FastFifo => {
+                labels.extend(
+                    fastfifo_block_sizes
+                        .iter()
+                        .copied()
+                        .map(fastfifo_queue_label),
+                );
+            }
+            _ => labels.push(queue.name().to_string()),
+        }
+    }
+    labels
+}
+
 pub fn parse_queue_kinds(raw: &str) -> Result<Vec<QueueKind>, String> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -931,6 +1059,7 @@ pub fn build_direct_matrix_plan(
     available_parallelism: usize,
     selected_queues: &[QueueKind],
     ubq_labels: &[String],
+    fastfifo_block_sizes: &[usize],
     scenarios: &[ScenarioConfig],
     modes: &[Mode],
     items_per_producer_values: &[u64],
@@ -949,9 +1078,35 @@ pub fn build_direct_matrix_plan(
         .filter(|queue| queue.is_baseline())
         .collect();
     let include_ubq = selected_queues.iter().any(|queue| *queue == QueueKind::Ubq);
+    let include_fastfifo = selected_queues
+        .iter()
+        .any(|queue| *queue == QueueKind::FastFifo);
     if include_ubq && ubq_labels.is_empty() {
         return Err("at least one --ubq-label is required when queue set includes ubq".to_string());
     }
+    if include_fastfifo && fastfifo_block_sizes.is_empty() {
+        return Err(
+            "at least one --fastfifo-block-sizes value is required when queue set includes fastfifo"
+                .to_string(),
+        );
+    }
+    for &block_size in fastfifo_block_sizes {
+        if block_size == 0 {
+            return Err("FastFifo block sizes must be > 0".to_string());
+        }
+    }
+    let normalized_fastfifo_block_sizes = if include_fastfifo {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for &block_size in fastfifo_block_sizes {
+            if seen.insert(block_size) {
+                out.push(block_size);
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
     let normalized_ubq_labels = if include_ubq {
         let mut parsed_labels = Vec::with_capacity(ubq_labels.len());
         for label in ubq_labels {
@@ -1014,6 +1169,7 @@ pub fn build_direct_matrix_plan(
         runs_dir,
         available_parallelism,
         baseline_queues,
+        fastfifo_block_sizes: normalized_fastfifo_block_sizes,
         bundles,
         reuse_existing,
     })
@@ -1105,14 +1261,32 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
         for mode in &bundle.modes {
             for &items_per_producer in &bundle.items_per_producer_values {
                 for &baseline_queue in &plan.baseline_queues {
-                    out.insert(JobSpec {
-                        scenario: bundle.scenario.clone(),
-                        repeat_index: bundle.repeat_index,
-                        mode: *mode,
-                        items_per_producer,
-                        queue: baseline_queue,
-                        ubq_label: None,
-                    });
+                    match baseline_queue {
+                        QueueKind::FastFifo => {
+                            for &block_size in &plan.fastfifo_block_sizes {
+                                out.insert(JobSpec {
+                                    scenario: bundle.scenario.clone(),
+                                    repeat_index: bundle.repeat_index,
+                                    mode: *mode,
+                                    items_per_producer,
+                                    queue: baseline_queue,
+                                    ubq_label: None,
+                                    fastfifo_block_size: Some(block_size),
+                                });
+                            }
+                        }
+                        _ => {
+                            out.insert(JobSpec {
+                                scenario: bundle.scenario.clone(),
+                                repeat_index: bundle.repeat_index,
+                                mode: *mode,
+                                items_per_producer,
+                                queue: baseline_queue,
+                                ubq_label: None,
+                                fastfifo_block_size: None,
+                            });
+                        }
+                    }
                 }
                 if let Some(label) = bundle.ubq_label.as_ref() {
                     out.insert(JobSpec {
@@ -1122,6 +1296,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                         items_per_producer,
                         queue: QueueKind::Ubq,
                         ubq_label: Some(label.clone()),
+                        fastfifo_block_size: None,
                     });
                 }
             }
@@ -1147,6 +1322,7 @@ pub fn make_ubq_job_factory<Q: BenchQueue>(
         items_per_producer,
         queue: QueueKind::Ubq,
         ubq_label: Some(normalized),
+        fastfifo_block_size: None,
     };
     let queue_name = "ubq".to_string();
     let run_scenario = scenario.clone();
@@ -1174,6 +1350,7 @@ pub fn make_segqueue_job_factory(
         items_per_producer,
         queue: QueueKind::SegQueue,
         ubq_label: None,
+        fastfifo_block_size: None,
     };
     let queue_name = QueueKind::SegQueue.name().to_string();
     let run_scenario = scenario.clone();
@@ -1207,6 +1384,7 @@ pub fn make_concurrent_queue_job_factory(
         items_per_producer,
         queue: QueueKind::ConcurrentQueue,
         ubq_label: None,
+        fastfifo_block_size: None,
     };
     let queue_name = QueueKind::ConcurrentQueue.name().to_string();
     let run_scenario = scenario.clone();
@@ -1223,6 +1401,48 @@ pub fn make_concurrent_queue_job_factory(
             items_per_producer,
             core_offset,
         ),
+    });
+    JobFactory { spec, run }
+}
+
+#[cfg(feature = "bench_fastfifo")]
+pub fn make_fastfifo_job_factory(
+    block_size: usize,
+    scenario: ScenarioConfig,
+    repeat_index: usize,
+    mode: Mode,
+    items_per_producer: u64,
+) -> JobFactory {
+    assert!(block_size > 0, "FastFifo block size must be > 0");
+    let spec = JobSpec {
+        scenario: scenario.clone(),
+        repeat_index,
+        mode,
+        items_per_producer,
+        queue: QueueKind::FastFifo,
+        ubq_label: None,
+        fastfifo_block_size: Some(block_size),
+    };
+    let queue_name = fastfifo_queue_label(block_size);
+    let run_scenario = scenario.clone();
+    let run = Arc::new(move |core_offset: usize| {
+        let queue_handle = FastFifoBenchQueue::new(&run_scenario, items_per_producer, block_size);
+        match mode {
+            Mode::Throughput => bench_throughput_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::FillDrain => bench_fill_drain_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+        }
     });
     JobFactory { spec, run }
 }
@@ -1426,11 +1646,7 @@ fn execute_job_factories(
     }
 }
 
-fn can_start_job(
-    spec: &JobSpec,
-    used_threads: usize,
-    available_parallelism: usize,
-) -> bool {
+fn can_start_job(spec: &JobSpec, used_threads: usize, available_parallelism: usize) -> bool {
     used_threads + spec.thread_budget() <= available_parallelism
 }
 
@@ -1439,18 +1655,27 @@ fn result_key_sort(lhs: &SampleKey, rhs: &SampleKey) -> Ordering {
         value if value.starts_with("ubq_") => 0_u8,
         "segqueue" => 1,
         "concurrent-queue" => 2,
+        value if value.starts_with("fastfifo_") => 3,
         _ => 99,
+    };
+    let queue_variant = |label: &str| {
+        label
+            .strip_prefix("fastfifo_")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
     };
     (
         lhs.mode.name().to_string(),
         lhs.items_per_producer,
         queue_order(&lhs.queue_label),
+        queue_variant(&lhs.queue_label),
         lhs.queue_label.clone(),
     )
         .cmp(&(
             rhs.mode.name().to_string(),
             rhs.items_per_producer,
             queue_order(&rhs.queue_label),
+            queue_variant(&rhs.queue_label),
             rhs.queue_label.clone(),
         ))
 }
@@ -1460,15 +1685,34 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
     for mode in &bundle.modes {
         for &items_per_producer in &bundle.items_per_producer_values {
             for baseline_queue in &plan.baseline_queues {
-                let spec = JobSpec {
-                    scenario: bundle.scenario.clone(),
-                    repeat_index: bundle.repeat_index,
-                    mode: *mode,
-                    items_per_producer,
-                    queue: *baseline_queue,
-                    ubq_label: None,
-                };
-                keys.push(SampleKey::from_job(&spec));
+                match baseline_queue {
+                    QueueKind::FastFifo => {
+                        for &block_size in &plan.fastfifo_block_sizes {
+                            let spec = JobSpec {
+                                scenario: bundle.scenario.clone(),
+                                repeat_index: bundle.repeat_index,
+                                mode: *mode,
+                                items_per_producer,
+                                queue: *baseline_queue,
+                                ubq_label: None,
+                                fastfifo_block_size: Some(block_size),
+                            };
+                            keys.push(SampleKey::from_job(&spec));
+                        }
+                    }
+                    _ => {
+                        let spec = JobSpec {
+                            scenario: bundle.scenario.clone(),
+                            repeat_index: bundle.repeat_index,
+                            mode: *mode,
+                            items_per_producer,
+                            queue: *baseline_queue,
+                            ubq_label: None,
+                            fastfifo_block_size: None,
+                        };
+                        keys.push(SampleKey::from_job(&spec));
+                    }
+                }
             }
             if let Some(label) = bundle.ubq_label.as_ref() {
                 let spec = JobSpec {
@@ -1478,6 +1722,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                     items_per_producer,
                     queue: QueueKind::Ubq,
                     ubq_label: Some(label.clone()),
+                    fastfifo_block_size: None,
                 };
                 keys.push(SampleKey::from_job(&spec));
             }
@@ -1713,7 +1958,7 @@ pub fn build_and_run_matrix_plan(
 
 fn generated_cargo_toml(repo_root: &Path) -> String {
     format!(
-        "[package]\nname = \"ubq_generated_scheduler\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nubq = {{ path = {:?} }}\n",
+        "[package]\nname = \"ubq_generated_scheduler\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nubq = {{ path = {:?}, features = [\"bench_fastfifo\"] }}\n",
         repo_root.display().to_string()
     )
 }
@@ -1744,6 +1989,15 @@ fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
                 out.push_str(&format!(
                     "    jobs.push(bench_harness::make_concurrent_queue_job_factory({scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
                     spec.repeat_index, spec.mode, spec.items_per_producer
+                ));
+            }
+            QueueKind::FastFifo => {
+                let block_size = spec
+                    .fastfifo_block_size
+                    .expect("FastFifo block size must be present");
+                out.push_str(&format!(
+                    "    jobs.push(bench_harness::make_fastfifo_job_factory({}, {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
+                    block_size, spec.repeat_index, spec.mode, spec.items_per_producer
                 ));
             }
             QueueKind::Ubq => {
@@ -1903,11 +2157,13 @@ pub fn compute_frontier_round_plan(
     }
 
     let present_labels = collect_present_ubq_labels(index);
+    let baseline_labels =
+        baseline_queue_labels(&config.baseline_queues, &config.fastfifo_block_sizes);
     let globally_desired_winners = collect_global_winner_labels(
         index,
         &config.scenarios,
         &present_labels,
-        &config.baseline_queues,
+        &baseline_labels,
         &config.modes,
         &config.items_per_producer_values,
         config.repeats,
@@ -1929,7 +2185,7 @@ pub fn compute_frontier_round_plan(
         index,
         &config.scenarios,
         &present_labels,
-        &config.baseline_queues,
+        &baseline_labels,
         &config.modes,
         &config.items_per_producer_values,
         config.repeats,
@@ -1963,6 +2219,7 @@ pub fn compute_frontier_round_plan(
                     repeat_index,
                     Some(label.as_str()),
                     &config.baseline_queues,
+                    &config.fastfifo_block_sizes,
                     &config.modes,
                     &config.items_per_producer_values,
                 ) {
@@ -1985,6 +2242,7 @@ pub fn compute_frontier_round_plan(
         runs_dir: config.runs_dir.clone(),
         available_parallelism: config.available_parallelism,
         baseline_queues: config.baseline_queues.clone(),
+        fastfifo_block_sizes: config.fastfifo_block_sizes.clone(),
         bundles,
         reuse_existing: true,
     })
@@ -2006,7 +2264,7 @@ fn collect_global_winner_labels(
     index: &ExistingRunsIndex,
     scenarios: &[ScenarioConfig],
     present_labels: &BTreeSet<String>,
-    baseline_queues: &[QueueKind],
+    baseline_labels: &[String],
     modes: &[Mode],
     items_per_producer_values: &[u64],
     repeats: usize,
@@ -2015,13 +2273,13 @@ fn collect_global_winner_labels(
     for scenario in scenarios {
         for mode in modes {
             for &items_per_producer in items_per_producer_values {
-                let best_baseline = baseline_queues
+                let best_baseline = baseline_labels
                     .iter()
-                    .filter_map(|queue| {
+                    .filter_map(|queue_label| {
                         mean_ops(
                             index,
                             &scenario.name,
-                            queue.name(),
+                            queue_label,
                             *mode,
                             items_per_producer,
                             repeats,
@@ -2043,7 +2301,7 @@ fn collect_global_winner_labels(
                             index,
                             scenario,
                             label,
-                            baseline_queues,
+                            baseline_labels,
                             modes,
                             items_per_producer_values,
                             repeats,
@@ -2077,7 +2335,7 @@ fn collect_local_best_ubq_labels(
     index: &ExistingRunsIndex,
     scenarios: &[ScenarioConfig],
     present_labels: &BTreeSet<String>,
-    baseline_queues: &[QueueKind],
+    baseline_labels: &[String],
     modes: &[Mode],
     items_per_producer_values: &[u64],
     repeats: usize,
@@ -2098,7 +2356,7 @@ fn collect_local_best_ubq_labels(
                             index,
                             scenario,
                             label,
-                            baseline_queues,
+                            baseline_labels,
                             modes,
                             items_per_producer_values,
                             repeats,
@@ -2134,18 +2392,20 @@ fn bundle_complete(
     repeat_index: usize,
     label: Option<&str>,
     baseline_queues: &[QueueKind],
+    fastfifo_block_sizes: &[usize],
     modes: &[Mode],
     items_per_producer_values: &[u64],
 ) -> bool {
+    let baseline_labels = baseline_queue_labels(baseline_queues, fastfifo_block_sizes);
     for mode in modes {
         for &items in items_per_producer_values {
-            for baseline in baseline_queues {
+            for baseline_label in &baseline_labels {
                 let key = SampleKey {
                     scenario: scenario.name.clone(),
                     repeat_index,
                     mode: *mode,
                     items_per_producer: items,
-                    queue_label: baseline.name().to_string(),
+                    queue_label: baseline_label.clone(),
                 };
                 if !index.records.contains_key(&key) {
                     return false;
@@ -2172,21 +2432,39 @@ fn is_complete_coverage(
     index: &ExistingRunsIndex,
     scenario: &ScenarioConfig,
     label: &str,
-    baseline_queues: &[QueueKind],
+    baseline_labels: &[String],
     modes: &[Mode],
     items_per_producer_values: &[u64],
     repeats: usize,
 ) -> bool {
     (1..=repeats).all(|repeat_index| {
-        bundle_complete(
-            index,
-            scenario,
-            repeat_index,
-            Some(label),
-            baseline_queues,
-            modes,
-            items_per_producer_values,
-        )
+        for mode in modes {
+            for &items in items_per_producer_values {
+                for baseline_label in baseline_labels {
+                    let key = SampleKey {
+                        scenario: scenario.name.clone(),
+                        repeat_index,
+                        mode: *mode,
+                        items_per_producer: items,
+                        queue_label: baseline_label.clone(),
+                    };
+                    if !index.records.contains_key(&key) {
+                        return false;
+                    }
+                }
+                let key = SampleKey {
+                    scenario: scenario.name.clone(),
+                    repeat_index,
+                    mode: *mode,
+                    items_per_producer: items,
+                    queue_label: format!("ubq_{label}"),
+                };
+                if !index.records.contains_key(&key) {
+                    return false;
+                }
+            }
+        }
+        true
     })
 }
 
@@ -2202,6 +2480,7 @@ fn mean_ops(
     let lookup_label = if queue_label.starts_with("ubq_")
         || queue_label == "segqueue"
         || queue_label == "concurrent-queue"
+        || queue_label.starts_with("fastfifo_")
     {
         queue_label.to_string()
     } else {
@@ -2227,8 +2506,23 @@ fn bench_throughput_for<Q: BenchQueue>(
     items_per_producer: u64,
     core_offset: usize,
 ) -> BenchRecord {
+    bench_throughput_with_queue(
+        Q::new_queue(),
+        queue_name,
+        scenario,
+        items_per_producer,
+        core_offset,
+    )
+}
+
+fn bench_throughput_with_queue<Q: BenchQueueOps>(
+    queue_handle: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
     let total_items = total_items(items_per_producer, scenario.producers);
-    let queue_handle = Q::new_queue();
     let total_threads = scenario.total_threads();
     let ready = Arc::new(Barrier::new(total_threads + 1));
     let start_gate = Arc::new(Barrier::new(total_threads + 1));
@@ -2333,8 +2627,23 @@ fn bench_fill_drain_for<Q: BenchQueue>(
     items_per_producer: u64,
     core_offset: usize,
 ) -> BenchRecord {
+    bench_fill_drain_with_queue(
+        Q::new_queue(),
+        queue_name,
+        scenario,
+        items_per_producer,
+        core_offset,
+    )
+}
+
+fn bench_fill_drain_with_queue<Q: BenchQueueOps>(
+    queue_handle: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
     let total_items = total_items(items_per_producer, scenario.producers);
-    let queue_handle = Q::new_queue();
     let fill_elapsed = run_producers_only_for(
         &queue_handle,
         scenario.producers,
@@ -2371,7 +2680,7 @@ fn throughput_ops(consumed: u64, elapsed_ns: u64) -> Option<f64> {
     }
 }
 
-fn run_producers_only_for<Q: BenchQueue>(
+fn run_producers_only_for<Q: BenchQueueOps>(
     queue_handle: &Arc<Q>,
     producers: usize,
     items_per_producer: u64,
@@ -2418,7 +2727,7 @@ fn run_producers_only_for<Q: BenchQueue>(
     Duration::from_nanos(max_end.load(AtomicOrdering::Relaxed))
 }
 
-fn run_consumers_only_for<Q: BenchQueue>(
+fn run_consumers_only_for<Q: BenchQueueOps>(
     queue_handle: &Arc<Q>,
     consumers: usize,
     core_offset: usize,
@@ -2567,6 +2876,30 @@ pub fn run_matrix_plan_in_process(
                 spec.mode,
                 spec.items_per_producer,
             ),
+            QueueKind::FastFifo => {
+                let block_size = spec
+                    .fastfifo_block_size
+                    .ok_or_else(|| "FastFifo job spec is missing block size".to_string())?;
+                #[cfg(feature = "bench_fastfifo")]
+                {
+                    make_fastfifo_job_factory(
+                        block_size,
+                        spec.scenario.clone(),
+                        spec.repeat_index,
+                        spec.mode,
+                        spec.items_per_producer,
+                    )
+                }
+                #[cfg(not(feature = "bench_fastfifo"))]
+                {
+                    let _ = block_size;
+                    return Err(
+                        "FastFifo selected but the bench_fastfifo feature is not enabled; \
+                         rebuild with --features bench_registry,bench_fastfifo"
+                            .to_string(),
+                    );
+                }
+            }
             QueueKind::Ubq => {
                 let label = spec
                     .ubq_label
@@ -2663,12 +2996,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_fastfifo_aliases_and_block_sizes() {
+        assert_eq!(QueueKind::parse("fastfifo"), Some(QueueKind::FastFifo));
+        assert_eq!(QueueKind::parse("bbq"), Some(QueueKind::FastFifo));
+        assert_eq!(
+            parse_fastfifo_block_sizes(Some("64,256,64")).expect("block sizes"),
+            vec![64, 256]
+        );
+        assert_eq!(
+            parse_fastfifo_block_sizes(None).expect("default block sizes"),
+            vec![64, 256, 1024, 4096]
+        );
+    }
+
+    #[test]
+    fn direct_plan_expands_fastfifo_block_variants() {
+        let plan = build_direct_matrix_plan(
+            "local",
+            PathBuf::from(DEFAULT_RUNS_DIR),
+            16,
+            &[QueueKind::FastFifo],
+            &[],
+            &[64, 256],
+            &[ScenarioConfig::new(1, 1)],
+            &[Mode::Throughput],
+            &[1],
+            1,
+            false,
+        )
+        .expect("plan");
+        assert_eq!(plan.fastfifo_block_sizes, vec![64, 256]);
+        let keys = expected_keys_for_bundle(&plan, &plan.bundles[0]);
+        let labels = keys
+            .into_iter()
+            .map(|key| key.queue_label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["fastfifo_64", "fastfifo_256"]);
+    }
+
+    #[test]
     fn direct_plan_requires_ubq_labels_if_ubq_selected() {
         let err = build_direct_matrix_plan(
             "local",
             PathBuf::from(DEFAULT_RUNS_DIR),
             16,
             &[QueueKind::Ubq, QueueKind::SegQueue],
+            &[],
             &[],
             &[ScenarioConfig::new(1, 1)],
             &[Mode::Throughput],
@@ -2688,6 +3061,7 @@ mod tests {
             128,
             &[QueueKind::Ubq],
             &["balanced,8,63,crossbeam".to_string()],
+            &[],
             &[ScenarioConfig::new(64, 1)],
             &[Mode::Throughput],
             &[1],
@@ -2747,6 +3121,7 @@ mod tests {
             runs_dir: runs_dir.clone(),
             available_parallelism: 2,
             baseline_queues: vec![QueueKind::SegQueue],
+            fastfifo_block_sizes: Vec::new(),
             bundles: vec![PlanBundle {
                 scenario: ScenarioConfig::new(1, 1),
                 repeat_index: 1,
@@ -2800,6 +3175,7 @@ mod tests {
             runs_dir: runs_dir.clone(),
             available_parallelism: 2,
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
+            fastfifo_block_sizes: Vec::new(),
             bundles: vec![PlanBundle {
                 scenario: scenario.clone(),
                 repeat_index: 1,
@@ -2848,8 +3224,7 @@ mod tests {
 
     #[test]
     fn execute_job_factories_can_run_multiple_ubq_jobs_concurrently() {
-        let root =
-            std::env::temp_dir().join(format!("ubq_parallel_ubq_test_{}", now_unix_nanos()));
+        let root = std::env::temp_dir().join(format!("ubq_parallel_ubq_test_{}", now_unix_nanos()));
         let runs_dir = root.join("runs");
         fs::create_dir_all(&runs_dir).expect("mkdir");
 
@@ -2861,6 +3236,7 @@ mod tests {
             runs_dir: runs_dir.clone(),
             available_parallelism: 4,
             baseline_queues: Vec::new(),
+            fastfifo_block_sizes: Vec::new(),
             bundles: vec![
                 PlanBundle {
                     scenario: scenario.clone(),
@@ -2895,11 +3271,11 @@ mod tests {
                     items_per_producer: 1,
                     queue: QueueKind::Ubq,
                     ubq_label: Some(ubq_label.clone()),
+                    fastfifo_block_size: None,
                 },
                 run: std::sync::Arc::new(move |_| {
                     start_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let now_active =
-                        active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let now_active = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     max_active.fetch_max(now_active, std::sync::atomic::Ordering::SeqCst);
 
                     let deadline =
@@ -2944,6 +3320,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![ScenarioConfig::new(1, 1), ScenarioConfig::new(1, 4)],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
+            fastfifo_block_sizes: Vec::new(),
             seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3011,7 +3388,7 @@ mod tests {
                     repeat_index,
                     mode: Mode::Throughput,
                     items_per_producer: 1,
-                    queue_label: "ubq,8,127,crossbeam".to_string(),
+                    queue_label: "ubq_balanced,8,127,crossbeam".to_string(),
                 },
                 BenchRecord {
                     queue: "ubq".to_string(),
@@ -3034,6 +3411,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
+            fastfifo_block_sizes: Vec::new(),
             seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3103,7 +3481,7 @@ mod tests {
                     repeat_index,
                     mode: Mode::Throughput,
                     items_per_producer: 1,
-                    queue_label: "ubq,8,127,crossbeam".to_string(),
+                    queue_label: "ubq_balanced,8,127,crossbeam".to_string(),
                 },
                 BenchRecord {
                     queue: "ubq".to_string(),
@@ -3126,6 +3504,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
+            fastfifo_block_sizes: Vec::new(),
             seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3245,6 +3624,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
+            fastfifo_block_sizes: Vec::new(),
             seed_labels: vec![weaker_label.to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3273,6 +3653,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![ScenarioConfig::new(64, 1)],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
+            fastfifo_block_sizes: Vec::new(),
             seed_labels: vec!["balanced,8,63,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3367,6 +3748,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![winner_scenario.clone(), other_scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
+            fastfifo_block_sizes: Vec::new(),
             seed_labels: vec!["balanced,1,31,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3469,6 +3851,7 @@ mod tests {
             runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
             scenarios: vec![winner_scenario, constrained_scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
+            fastfifo_block_sizes: Vec::new(),
             seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3491,6 +3874,7 @@ mod tests {
             items_per_producer: 1,
             queue: QueueKind::SegQueue,
             ubq_label: None,
+            fastfifo_block_size: None,
         };
         let ubq = JobSpec {
             scenario: ScenarioConfig::new(1, 1),
@@ -3499,6 +3883,7 @@ mod tests {
             items_per_producer: 1,
             queue: QueueKind::Ubq,
             ubq_label: Some("balanced,1,31,crossbeam".to_string()),
+            fastfifo_block_size: None,
         };
 
         assert!(can_start_job(&baseline, 0, 8));

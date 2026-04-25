@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use ubq::bench_harness::{
     DEFAULT_RUNS_DIR, FrontierConfig, QueueKind, build_direct_matrix_plan,
-    detect_available_parallelism, frontier_search, parse_items_per_producer, parse_modes,
-    parse_queue_kinds, parse_scenarios,
+    detect_available_parallelism, frontier_search, parse_fastfifo_block_sizes,
+    parse_items_per_producer, parse_modes, parse_queue_kinds, parse_scenarios,
 };
 
 #[derive(Parser, Debug)]
@@ -38,6 +38,9 @@ struct Args {
     seed_labels: Vec<String>,
 
     #[arg(long)]
+    fastfifo_block_sizes: Option<String>,
+
+    #[arg(long)]
     dry_run: bool,
 }
 
@@ -67,6 +70,8 @@ fn main() {
         let scenarios = parse_scenarios(args.scenarios.as_deref())?;
         let modes = parse_modes(args.modes.as_deref())?;
         let items = parse_items_per_producer(args.items_per_producer.as_deref())?;
+        let fastfifo_block_sizes =
+            parse_fastfifo_block_sizes(args.fastfifo_block_sizes.as_deref())?;
         let available_parallelism = match args.parallelism {
             Some(value) => value,
             None => detect_available_parallelism()?,
@@ -99,6 +104,7 @@ fn main() {
             available_parallelism,
             &queues,
             &args.seed_labels,
+            &fastfifo_block_sizes,
             &runnable_scenarios,
             &modes,
             &items,
@@ -111,6 +117,7 @@ fn main() {
             runs_dir: args.runs_dir.clone(),
             scenarios: runnable_scenarios,
             baseline_queues,
+            fastfifo_block_sizes,
             seed_labels: args.seed_labels.clone(),
             modes,
             items_per_producer_values: items,

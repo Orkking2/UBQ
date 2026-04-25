@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use ubq::bench_harness::{
     DEFAULT_RUNS_DIR, MatrixPlan, build_direct_matrix_plan, detect_available_parallelism,
-    parse_items_per_producer, parse_modes, parse_queue_kinds, parse_scenarios,
-    run_matrix_plan_in_process,
+    parse_fastfifo_block_sizes, parse_items_per_producer, parse_modes, parse_queue_kinds,
+    parse_scenarios, run_matrix_plan_in_process,
 };
 
 #[derive(Parser, Debug)]
@@ -42,6 +42,9 @@ struct Args {
     ubq_labels: Vec<String>,
 
     #[arg(long)]
+    fastfifo_block_sizes: Option<String>,
+
+    #[arg(long)]
     reuse_existing: bool,
 
     #[arg(long)]
@@ -72,6 +75,8 @@ fn main() {
                 let scenarios = parse_scenarios(args.scenarios.as_deref())?;
                 let modes = parse_modes(args.modes.as_deref())?;
                 let items = parse_items_per_producer(args.items_per_producer.as_deref())?;
+                let fastfifo_block_sizes =
+                    parse_fastfifo_block_sizes(args.fastfifo_block_sizes.as_deref())?;
                 let available_parallelism = match args.parallelism {
                     Some(value) => value,
                     None => detect_available_parallelism()?,
@@ -82,6 +87,7 @@ fn main() {
                     available_parallelism,
                     &selected_queues,
                     &args.ubq_labels,
+                    &fastfifo_block_sizes,
                     &scenarios,
                     &modes,
                     &items,

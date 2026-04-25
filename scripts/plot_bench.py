@@ -118,8 +118,20 @@ def label_sort_key(label: str):
         return (0, bench_label_sort_key(label[len("ubq_") :]))
     if label.startswith("ubq:"):
         return (0, bench_label_sort_key(label[len("ubq:") :]))
+    if label.startswith("fastfifo_"):
+        try:
+            block_size = int(label[len("fastfifo_") :])
+        except ValueError:
+            block_size = 2**31
+        return (1, 2, block_size, label)
     order = {"segqueue": 1, "concurrent-queue": 2}
     return (1, order.get(label, 99), label)
+
+
+def baseline_queue_priority(label: str):
+    if label.startswith("fastfifo_"):
+        return 2
+    return BASELINE_QUEUE_PRIORITY.get(label, 99)
 
 
 def labels_by_ops_desc(entries):
@@ -471,7 +483,7 @@ def scenario_line_labels(entries_by_scenario, max_series: int):
     labels = sorted(
         label_samples.keys(),
         key=lambda label: (
-            BASELINE_QUEUE_PRIORITY.get(label, 99),
+            baseline_queue_priority(label),
             -label_coverage[label],
             -average_ops_per_sec(label_samples[label]),
             label_sort_key(label),
