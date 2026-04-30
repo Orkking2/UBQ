@@ -6,6 +6,7 @@ use std::{
     marker::PhantomData,
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
 };
+use tokio::sync::Notify;
 
 /// Nonblocking queue operations required by [`SleepQ`].
 ///
@@ -78,10 +79,11 @@ impl<T> NonBlockingQueue<T> for crossbeam_queue::SegQueue<T> {
 ///
 /// `SleepQ` preserves nonblocking [`try_pop`](Self::try_pop) access while adding
 /// a blocking [`pop`](Self::pop) that parks the caller on a condition variable
-/// when the wrapped queue is empty. Each [`push`](Self::push) wakes one blocked
-/// caller. Producers must push through `SleepQ` to wake blocked callers; pushing
-/// through another handle to the wrapped queue cannot notify this condition
-/// variable.
+/// when the wrapped queue is empty and an async [`pop_async`](Self::pop_async)
+/// for Tokio tasks. Each [`push`](Self::push) wakes one blocked thread and one
+/// waiting Tokio task. Producers must push through `SleepQ` to wake blocked
+/// callers; pushing through another handle to the wrapped queue cannot notify
+/// these wait primitives.
 ///
 /// ```rust
 /// use std::thread;
@@ -102,6 +104,7 @@ pub struct SleepQ<T, Q = ConfiguredUBQ<T>> {
     // responsible for its own producer/consumer synchronization.
     sleep: Mutex<()>,
     not_empty: Condvar,
+    async_not_empty: Notify,
     _item: PhantomData<fn() -> T>,
 }
 
@@ -128,6 +131,7 @@ where
             queue,
             sleep: Mutex::new(()),
             not_empty: Condvar::new(),
+            async_not_empty: Notify::new(),
             _item: PhantomData,
         }
     }
@@ -172,6 +176,30 @@ where
         }
     }
 
+    /// Removes and returns the front element, asynchronously waiting while the
+    /// queue is empty.
+    ///
+    /// This method is intended for Tokio tasks. It does not park or block a
+    /// runtime worker thread while waiting for a pushed value.
+    #[doc(alias = "recv_async")]
+    pub async fn pop_async(&self) -> T {
+        loop {
+            if let Some(val) = self.queue.pop() {
+                return val;
+            }
+
+            let notified = self.async_not_empty.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Some(val) = self.queue.pop() {
+                return val;
+            }
+
+            notified.await;
+        }
+    }
+
     /// Pushes `val` onto the back of the queue and wakes one blocked caller.
     #[inline]
     #[doc(alias = "send")]
@@ -182,6 +210,7 @@ where
         }
 
         self.not_empty.notify_one();
+        self.async_not_empty.notify_one();
     }
 }
 

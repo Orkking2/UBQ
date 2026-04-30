@@ -22,7 +22,7 @@ fastfifo = { path = "vendor/FastFifo", optional = true }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 toml = "0.8"
 
 [features]

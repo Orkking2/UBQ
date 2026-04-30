@@ -252,6 +252,41 @@ fn sleepq_pop_blocks_until_push_wakes_it() {
 }
 
 #[test]
+fn sleepq_pop_async_waits_until_push_wakes_it() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let q = SleepQ::<u64>::new_arc();
+        let mut consumer = {
+            let q = q.clone();
+
+            tokio::spawn(async move { q.pop_async().await })
+        };
+
+        tokio::task::yield_now().await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut consumer)
+                .await
+                .is_err()
+        );
+
+        q.push(77);
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), consumer)
+                .await
+                .unwrap()
+                .unwrap(),
+            77
+        );
+    });
+}
+
+#[test]
 fn sleepq_supports_other_nonblocking_queue_implementations() {
     let q = SleepQ::<u64, crossbeam_queue::SegQueue<u64>>::new_arc();
     let consumer = {
