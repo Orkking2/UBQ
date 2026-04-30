@@ -56,8 +56,8 @@ trait BenchQueue: Send + Sync + 'static {
     fn recv_value(&self) -> u64;
 }
 
-impl<B, const POOL: usize, const BLOCK: usize, A> BenchQueue
-    for ConfiguredUBQ<u64, B, POOL, BLOCK, A>
+impl<B, const POOL: usize, const BLOCK_SIZE: usize, A> BenchQueue
+    for ConfiguredUBQ<u64, B, POOL, BLOCK_SIZE, A>
 where
     B: backoff::BackoffPolicy + 'static,
     A: Send + Sync + 'static,

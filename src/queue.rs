@@ -1,7 +1,7 @@
 use crate::{
     align::A4096,
     backoff::{BackoffPolicy, Crossbeam},
-    block::{Block, DEFAULT_BLOCK_LENGTH, WRITE},
+    block::{Block, DEFAULT_BLOCK_SIZE, WRITE},
 };
 use crossbeam_utils::CachePadded;
 use std::{
@@ -50,7 +50,7 @@ pub struct ConfiguredUBQ<
     T,
     B = Crossbeam,
     const POOL: usize = DEFAULT_POOL_SIZE,
-    const BLOCK: usize = DEFAULT_BLOCK_LENGTH,
+    const BLOCK_SIZE: usize = DEFAULT_BLOCK_SIZE,
     A = A4096,
 > {
     /// Atomic pointer to phead: the block currently accepting producer pushes.
@@ -58,19 +58,19 @@ pub struct ConfiguredUBQ<
     /// Atomic pointer to chead: the block currently being drained by consumers.
     chead: CachePadded<AtomicUsize>,
     /// Recycled blocks used to avoid repeated allocations.
-    pool: [CachePadded<AtomicPtr<Block<T, BLOCK, A>>>; POOL],
+    pool: [CachePadded<AtomicPtr<Block<T, BLOCK_SIZE, A>>>; POOL],
 
     _backoff: PhantomData<B>,
 }
 
-struct Head<T, const BLOCK: usize, A> {
-    block: *mut Block<T, BLOCK, A>,
+struct Head<T, const BLOCK_SIZE: usize, A> {
+    block: *mut Block<T, BLOCK_SIZE, A>,
     index: usize,
 }
 
 #[inline]
-fn drop_spare_block<T, const BLOCK: usize, A>(block: *mut Block<T, BLOCK, A>) {
-    let _ = unsafe { Box::from_raw(block.cast::<ManuallyDrop<Block<T, BLOCK, A>>>()) };
+fn drop_spare_block<T, const BLOCK_SIZE: usize, A>(block: *mut Block<T, BLOCK_SIZE, A>) {
+    let _ = unsafe { Box::from_raw(block.cast::<ManuallyDrop<Block<T, BLOCK_SIZE, A>>>()) };
 }
 
 impl<T, const BLOCK: usize, A> Copy for Head<T, BLOCK, A> {}
@@ -81,14 +81,15 @@ impl<T, const BLOCK: usize, A> Clone for Head<T, BLOCK, A> {
     }
 }
 
-impl<T, const BLOCK: usize, A> Head<T, BLOCK, A> {
+impl<T, const BLOCK_SIZE: usize, A> Head<T, BLOCK_SIZE, A> {
     #[inline]
     fn mask() -> usize {
-        Block::<T, BLOCK, A>::block_mask()
+        Block::<T, BLOCK_SIZE, A>::block_mask()
     }
 
     fn new(u: usize) -> Self {
         let mask = Self::mask();
+
         Self {
             block: with_exposed_provenance_mut(u & !mask),
             index: u & mask,
@@ -106,82 +107,42 @@ impl<T, const BLOCK: usize, A> Head<T, BLOCK, A> {
 
 // SAFETY: Slot ownership is assigned with atomic counters, and producer/consumer
 // commits are synchronized with Release/Acquire ordering before cross-thread reads.
-unsafe impl<T: Sync, B, A: Sync, const POOL: usize, const BLOCK: usize> Sync
-    for ConfiguredUBQ<T, B, POOL, BLOCK, A>
+unsafe impl<T: Sync, B, A: Sync, const POOL: usize, const BLOCK_SIZE: usize> Sync
+    for ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>
 {
 }
-unsafe impl<T: Send, B, A: Send, const POOL: usize, const BLOCK: usize> Send
-    for ConfiguredUBQ<T, B, POOL, BLOCK, A>
+unsafe impl<T: Send, B, A: Send, const POOL: usize, const BLOCK_SIZE: usize> Send
+    for ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>
 {
 }
 
-impl<T, B, const POOL: usize, const BLOCK: usize, A> fmt::Debug
-    for ConfiguredUBQ<T, B, POOL, BLOCK, A>
+impl<T, B, const POOL: usize, const BLOCK_SIZE: usize, A> fmt::Debug
+    for ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("ConfiguredUBQ { .. }")
     }
 }
 
-impl<T, B, const POOL: usize, const BLOCK: usize, A> ConfiguredUBQ<T, B, POOL, BLOCK, A>
+impl<T, B, const POOL: usize, const BLOCK_SIZE: usize, A> ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>
 where
     B: BackoffPolicy,
 {
-    const LAYOUT_CHECKS: () = Block::<T, BLOCK, A>::LAYOUT_CHECKS;
+    const LAYOUT_CHECKS: () = Block::<T, BLOCK_SIZE, A>::LAYOUT_CHECKS;
 
     /// Number of retained pooled blocks.
     pub const POOL_SIZE: usize = POOL;
     /// Number of slots in each block for this queue type.
-    pub const BLOCK_LENGTH: usize = BLOCK;
+    pub const BLOCK_LENGTH: usize = BLOCK_SIZE;
 
     #[inline]
-    fn pool_has_vacancy(&self) -> bool {
-        self.pool
-            .iter()
-            .any(|b| b.load(Ordering::Relaxed).is_null())
-    }
-
-    #[inline]
-    fn should_prepare_next_block(&self, next_index: usize) -> bool {
-        let () = Self::LAYOUT_CHECKS;
-
-        next_index == BLOCK && self.pool_has_vacancy()
-    }
-
-    #[inline]
-    fn try_store_pooled_block(&self, block: *mut Block<T, BLOCK, A>) -> bool {
-        self.pool.iter().any(|slot| {
+    fn release_block(&self, block: *mut Block<T, BLOCK_SIZE, A>) {
+        if !self.pool.iter().any(|slot| {
             slot.compare_exchange(null_mut(), block, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
-        })
-    }
-
-    #[inline]
-    fn take_pooled_block(&self) -> Option<*mut Block<T, BLOCK, A>> {
-        self.pool.iter().find_map(|slot| {
-            let pooled = slot.swap(null_mut(), Ordering::AcqRel);
-            (!pooled.is_null()).then_some(pooled)
-        })
-    }
-
-    #[inline]
-    fn release_producer_spare_block(&self, block: Box<Block<T, BLOCK, A>>) {
-        let new = Box::into_raw(block);
-
-        if self.try_store_pooled_block(new) {
-            return;
+        }) {
+            drop_spare_block(block);
         }
-
-        drop_spare_block(new);
-    }
-
-    #[inline]
-    fn release_consumed_block(&self, block: *mut Block<T, BLOCK, A>) {
-        if self.try_store_pooled_block(block) {
-            return;
-        }
-
-        drop_spare_block(block);
     }
 
     /// Creates a new, empty queue.
@@ -203,6 +164,7 @@ where
     /// Creates a new queue, like [`new`](Self::new), but using [`Arc::new_zeroed`].
     pub fn new_arc() -> Arc<Self> {
         let () = Self::LAYOUT_CHECKS;
+
         unsafe { Arc::new_zeroed().assume_init() }
     }
 
@@ -216,7 +178,7 @@ where
         }
 
         let phead = self.phead.load(Ordering::Acquire);
-        let mask = Head::<T, BLOCK, A>::mask();
+        let mask = Head::<T, BLOCK_SIZE, A>::mask();
 
         if (chead & !mask) != (phead & !mask) {
             return false;
@@ -237,7 +199,7 @@ where
 
         // This is the only time the ptr part of phead is invalid.
         if self.phead.load(Ordering::Acquire) == 0 {
-            let ptr = Box::into_raw(Block::<T, BLOCK, A>::new_zeroed());
+            let ptr = Box::into_raw(Block::<T, BLOCK_SIZE, A>::new_zeroed());
 
             match self.phead.compare_exchange(
                 0,
@@ -260,32 +222,46 @@ where
             phead = Head::new(self.phead.load(Ordering::Acquire));
 
             loop {
-                if phead.index >= BLOCK {
+                if phead.index >= BLOCK_SIZE {
                     backoff.snooze();
 
                     phead = Head::new(self.phead.load(Ordering::Acquire));
                     continue;
                 }
 
-                if next_block.is_none() && self.should_prepare_next_block(phead.index + 1) {
-                    next_block = Some(Block::<T, BLOCK, A>::new_zeroed());
+                if next_block.is_none()
+                    && phead.index + 1 == BLOCK_SIZE
+                    && self
+                        .pool
+                        .iter()
+                        .all(|b| b.load(Ordering::Relaxed).is_null())
+                {
+                    next_block = Some(Block::<T, BLOCK_SIZE, A>::new_zeroed());
                 }
 
                 phead = Head::new(self.phead.fetch_add(1, Ordering::SeqCst));
 
-                if phead.index < BLOCK {
+                if phead.index < BLOCK_SIZE {
                     break;
                 };
             }
         }
 
-        if phead.index + 1 == BLOCK {
+        if phead.index + 1 == BLOCK_SIZE {
+            // We are, at this point, guaranteed to be the only consuming (wrt the pool) accessor of pool.
+            // That is, no other producers are interfacing with the pool, in this critical section,
+            // which is until storing the new phead.
+
             let new = if let Some(block) = next_block.take() {
                 Box::into_raw(block)
-            } else if let Some(pooled) = self.take_pooled_block() {
-                pooled
+            } else if let Some(slot) = self
+                .pool
+                .iter()
+                .find_map(|slot| (!slot.load(Ordering::Relaxed).is_null()).then_some(slot))
+            {
+                slot.swap(null_mut(), Ordering::AcqRel)
             } else {
-                Box::into_raw(Block::<T, BLOCK, A>::new_zeroed())
+                Box::into_raw(Block::<T, BLOCK_SIZE, A>::new_zeroed())
             };
 
             unsafe { (*phead.block).next.store(new, Ordering::Release) };
@@ -298,7 +274,7 @@ where
         slot.state.store(WRITE, Ordering::Release);
 
         if let Some(block) = next_block {
-            self.release_producer_spare_block(block);
+            self.release_block(Box::into_raw(block))
         }
     }
 
@@ -318,7 +294,7 @@ where
         let mut chead = Head::new(self.chead.load(Ordering::Acquire));
 
         loop {
-            if chead.index >> 1 == BLOCK {
+            if chead.index >> 1 == BLOCK_SIZE {
                 backoff.snooze();
                 chead = Head::new(self.chead.load(Ordering::Acquire));
                 continue;
@@ -328,7 +304,7 @@ where
 
             if chead.index & 1 == 0 {
                 fence(Ordering::SeqCst);
-                let phead = Head::<T, BLOCK, A>::new(self.phead.load(Ordering::Relaxed));
+                let phead = Head::<T, BLOCK_SIZE, A>::new(self.phead.load(Ordering::Relaxed));
 
                 if phead.block == chead.block {
                     if chead.index >> 1 >= phead.index {
@@ -359,7 +335,7 @@ where
 
         chead.index >>= 1;
 
-        if chead.index + 1 == BLOCK {
+        if chead.index + 1 == BLOCK_SIZE {
             let next = loop {
                 let p = unsafe { (*chead.block).next.load(Ordering::Acquire) };
 
@@ -386,9 +362,9 @@ where
 
         let e = unsafe { slot.value.get().read().assume_init() };
 
-        if unsafe { (*chead.block).consumed.fetch_add(1, Ordering::Relaxed) } + 1 == BLOCK {
+        if unsafe { (*chead.block).consumed.fetch_add(1, Ordering::Relaxed) } + 1 == BLOCK_SIZE {
             unsafe { Block::reset(chead.block) };
-            self.release_consumed_block(chead.block);
+            self.release_block(chead.block);
         }
 
         Some(e)

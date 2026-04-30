@@ -7,22 +7,22 @@ use std::{
 };
 
 /// Default number of element slots per block for [`crate::UBQ`].
-pub const DEFAULT_BLOCK_LENGTH: usize = 2047;
+pub const DEFAULT_BLOCK_SIZE: usize = 2047;
 /// Default number of element slots per block for [`crate::UBQ`].
-pub const BLOCK_LENGTH: usize = DEFAULT_BLOCK_LENGTH;
+pub const BLOCK_LENGTH: usize = DEFAULT_BLOCK_SIZE;
 
 // Bits indicating the state of a slot:
 // * If a value has been written into the slot, `WRITE` is set.
 pub const WRITE: u8 = 1;
 
 /// A fixed-size ring-buffer segment.
-pub(crate) struct Block<T, const BLOCK: usize = DEFAULT_BLOCK_LENGTH, A = A4096> {
+pub(crate) struct Block<T, const BLOCK_SIZE: usize = DEFAULT_BLOCK_SIZE, A = A4096> {
     /// Alignment marker used to reserve pointer-tag bits in the block address.
     pub _align: A,
     /// Link to the successor block used by producer-head advancement/recycling.
     pub next: AtomicPtr<Self>,
     /// Per-slot storage for values in this block.
-    pub slots: [Slot<T>; BLOCK],
+    pub slots: [Slot<T>; BLOCK_SIZE],
     /// How many elements have been consumed from this block.
     pub consumed: AtomicUsize,
 }
@@ -32,20 +32,20 @@ pub(crate) struct Slot<T> {
     pub state: AtomicU8,
 }
 
-impl<T, const BLOCK: usize, A> Block<T, BLOCK, A> {
+impl<T, const BLOCK_SIZE: usize, A> Block<T, BLOCK_SIZE, A> {
     pub(crate) const LAYOUT_CHECKS: () = {
         assert!(
             size_of::<A>() == 0,
             "alignment marker types must be zero-sized"
         );
-        assert!(BLOCK > 0, "block length must be greater than zero");
+        assert!(BLOCK_SIZE > 0, "block length must be greater than zero");
         assert!(align_of::<Self>().is_power_of_two());
         assert!(
-            BLOCK <= (usize::MAX - 1) / 2,
+            BLOCK_SIZE <= (usize::MAX - 1) / 2,
             "block length overflows the pointer-tag encoding"
         );
 
-        let encoded_index_limit = BLOCK * 2 + 1;
+        let encoded_index_limit = BLOCK_SIZE * 2 + 1;
 
         assert!(
             encoded_index_limit <= align_of::<Self>() - 1,

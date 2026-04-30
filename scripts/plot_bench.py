@@ -11,10 +11,6 @@ from pathlib import Path
 try:
     from scripts.ubq_labels import (
         UBQ_IMMEDIATE_DIMS,
-        UBQ_MIN_POOL_SIZE,
-        UBQ_NO_POOL_SIZE,
-        UBQ_NO_POOL_VERSION,
-        UBQ_POOLED_VERSIONS,
         bench_label_sort_key,
         format_ubq_label_parts,
         is_valid_ubq_params,
@@ -23,10 +19,6 @@ try:
 except ImportError:
     from ubq_labels import (  # type: ignore
         UBQ_IMMEDIATE_DIMS,
-        UBQ_MIN_POOL_SIZE,
-        UBQ_NO_POOL_SIZE,
-        UBQ_NO_POOL_VERSION,
-        UBQ_POOLED_VERSIONS,
         bench_label_sort_key,
         format_ubq_label_parts,
         is_valid_ubq_params,
@@ -145,16 +137,67 @@ def parse_ubq_variant(label: str):
     return parse_ubq_queue_label(label, require_valid=False)
 
 
-def immediate_winner_variant_report(entries):
+def ubq_params_valid_for_scenario(params, scenario=None) -> bool:
+    if not is_valid_ubq_params(params):
+        return False
+    if scenario is None:
+        return True
+    threads = parse_scenario_threads(scenario)
+    if threads is None:
+        return True
+    producers, _consumers = threads
+    try:
+        block = int(params[2])
+    except (TypeError, ValueError, IndexError):
+        return False
+    return block >= producers
+
+
+def ubq_label_has_explicit_sync(label: str) -> bool:
+    text = str(label).strip().lower()
+    if text.startswith("ubq_") or text.startswith("ubq:"):
+        text = text[4:]
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if len(parts) == 1 and "_" in text:
+        parts = [part.strip() for part in text.split("_") if part.strip()]
+    return len(parts) >= 5
+
+
+def format_ubq_variant_label(params, include_sync: bool = False) -> str:
+    return "ubq_" + format_ubq_label_parts(
+        params[0],
+        params[1],
+        params[2],
+        params[3] if len(params) >= 4 else "",
+        params[4] if len(params) >= 5 else "cas",
+        include_sync=include_sync,
+    )
+
+
+def collect_ubq_plot_context(entries, scenario=None):
     labels = labels_by_ops_desc(entries)
     non_ubq_labels = []
     parsed = {}
+    label_by_params = {}
+    include_sync = False
+
     for label in labels:
         parsed_label = parse_ubq_variant(label)
-        if parsed_label is None or not is_valid_ubq_params(parsed_label):
+        if parsed_label is None or not ubq_params_valid_for_scenario(parsed_label, scenario):
             non_ubq_labels.append(label)
             continue
         parsed[label] = parsed_label
+        label_by_params.setdefault(parsed_label, label)
+        include_sync = include_sync or ubq_label_has_explicit_sync(label)
+
+    return labels, non_ubq_labels, parsed, label_by_params, include_sync
+
+
+def immediate_winner_variant_report(entries, scenario=None):
+    labels, non_ubq_labels, parsed, _label_by_params, _include_sync = collect_ubq_plot_context(
+        entries,
+        scenario,
+    )
 
     if not parsed:
         return {
@@ -165,7 +208,7 @@ def immediate_winner_variant_report(entries):
             "missing_required_labels": [],
         }
 
-    winner, required = strict_immediate_winner_ubq_labels(entries)
+    winner, required = strict_immediate_winner_ubq_labels(entries, scenario)
     required_labels = sorted(required, key=label_sort_key)
     present_required_labels = [label for label in required_labels if label in entries]
     missing_required_labels = [label for label in required_labels if label not in entries]
@@ -182,6 +225,7 @@ def immediate_winner_variant_report(entries):
         "missing_required_labels": missing_required_labels,
     }
 
+
 def immediate_domain_neighbors(value, ordered_values):
     try:
         idx = ordered_values.index(value)
@@ -196,19 +240,17 @@ def immediate_domain_neighbors(value, ordered_values):
     return neighbors
 
 
-def strict_immediate_winner_ubq_labels(entries):
-    parsed = {}
-    for label in entries:
-        parsed_label = parse_ubq_variant(label)
-        if parsed_label is not None and is_valid_ubq_params(parsed_label):
-            parsed[label] = parsed_label
-
+def strict_immediate_winner_ubq_labels(entries, scenario=None):
+    _labels, _non_ubq_labels, parsed, label_by_params, include_sync = collect_ubq_plot_context(
+        entries,
+        scenario,
+    )
     if not parsed:
         return None, set()
 
     winner = max(parsed.keys(), key=lambda label: entries[label]["mean_ops_per_sec"])
     winner_params = parsed[winner]
-    required = {winner}
+    required_params = {winner_params}
 
     for idx, winner_value in enumerate(winner_params):
         ordered_values = UBQ_IMMEDIATE_DIMS.get(idx)
@@ -218,81 +260,15 @@ def strict_immediate_winner_ubq_labels(entries):
             variant = list(winner_params)
             variant[idx] = neighbor_value
             candidate = tuple(variant)
-            if is_valid_ubq_params(candidate):
-                required.add(
-                    "ubq_"
-                    + format_ubq_label_parts(
-                        candidate[0],
-                        candidate[1],
-                        candidate[2],
-                        candidate[3] if len(candidate) >= 4 else "",
-                        candidate[4] if len(candidate) >= 5 else "cas",
-                    )
-                )
+            if ubq_params_valid_for_scenario(candidate, scenario):
+                required_params.add(candidate)
 
-    if len(winner_params) >= 3:
-        winner_version, winner_pool, winner_block = winner_params[:3]
-        winner_backoff = winner_params[3] if len(winner_params) >= 4 else ""
-        winner_sync = winner_params[4] if len(winner_params) >= 5 else "cas"
-
-        # Pooled-family versions should compare at the winner's pool + block.
-        if winner_version in UBQ_POOLED_VERSIONS:
-            for version in sorted(UBQ_POOLED_VERSIONS):
-                pooled_peer = (version, winner_pool, winner_block, winner_backoff, winner_sync)
-                if is_valid_ubq_params(pooled_peer):
-                    required.add(
-                        "ubq_"
-                        + format_ubq_label_parts(
-                            pooled_peer[0],
-                            pooled_peer[1],
-                            pooled_peer[2],
-                            pooled_peer[3],
-                            pooled_peer[4],
-                        )
-                    )
-
-        # If no-pool v6 wins, compare against each pooled version at its minimum pool.
-        if winner_version == UBQ_NO_POOL_VERSION:
-            for version in sorted(UBQ_POOLED_VERSIONS):
-                pooled_peer = (
-                    version,
-                    UBQ_MIN_POOL_SIZE,
-                    winner_block,
-                    winner_backoff,
-                    winner_sync,
-                )
-                if is_valid_ubq_params(pooled_peer):
-                    required.add(
-                        "ubq_"
-                        + format_ubq_label_parts(
-                            pooled_peer[0],
-                            pooled_peer[1],
-                            pooled_peer[2],
-                            pooled_peer[3],
-                            pooled_peer[4],
-                        )
-                    )
-
-        # Include the no-pool v6 baseline for any pooled winner at the same block/backoff.
-        if winner_version == UBQ_NO_POOL_VERSION or winner_version in UBQ_POOLED_VERSIONS:
-            v6_baseline = (
-                UBQ_NO_POOL_VERSION,
-                UBQ_NO_POOL_SIZE,
-                winner_block,
-                winner_backoff,
-                winner_sync,
-            )
-            if is_valid_ubq_params(v6_baseline):
-                required.add(
-                    "ubq_"
-                    + format_ubq_label_parts(
-                        v6_baseline[0],
-                        v6_baseline[1],
-                        v6_baseline[2],
-                        v6_baseline[3],
-                        v6_baseline[4],
-                    )
-                )
+    required = set()
+    for params in required_params:
+        required.add(
+            label_by_params.get(params)
+            or format_ubq_variant_label(params, include_sync=include_sync)
+        )
 
     return winner, required
 
@@ -677,7 +653,7 @@ def main():
         for mode in sorted(grouped[machine], key=mode_sort_key):
             for scenario in sorted(grouped[machine][mode], key=scenario_sort_key):
                 entries = grouped[machine][mode][scenario]
-                report = immediate_winner_variant_report(entries)
+                report = immediate_winner_variant_report(entries, scenario)
                 labels = report["selected_labels"]
                 values = [(label, entries[label]) for label in labels]
                 csv_path = out_root / machine / "csv" / mode / f"{scenario}_throughput.csv"
@@ -734,7 +710,7 @@ def main():
         for mode in sorted(grouped[machine], key=mode_sort_key):
             for scenario in sorted(grouped[machine][mode], key=scenario_sort_key):
                 entries = grouped[machine][mode][scenario]
-                report = immediate_winner_variant_report(entries)
+                report = immediate_winner_variant_report(entries, scenario)
                 labels = report["selected_labels"]
                 values = [entries[label]["mean_ops_per_sec"] for label in labels]
                 if not values:
