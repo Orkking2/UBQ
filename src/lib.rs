@@ -55,14 +55,12 @@ pub mod backoff;
 pub mod bench_harness;
 pub(crate) mod block;
 pub(crate) mod queue;
-pub mod sleepq;
 
 #[cfg(test)]
 mod tests;
 
 pub use block::BLOCK_LENGTH;
 pub use queue::{ConfiguredUBQ, DEFAULT_POOL_SIZE};
-pub use sleepq::{NonBlockingQueue, SleepQ};
 
 /// Default queue type alias that preserves the crate's legacy no-feature
 /// configuration.
