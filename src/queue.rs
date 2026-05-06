@@ -1,7 +1,7 @@
 use crate::{
     align::A4096,
     backoff::{BackoffPolicy, Crossbeam},
-    block::{Block, DEFAULT_BLOCK_SIZE, WRITE},
+    block::{Block, DEFAULT_BLOCK_SIZE, NOP, WRITE},
 };
 use crossbeam_utils::CachePadded;
 use std::{
@@ -124,9 +124,8 @@ impl<T, B, const POOL: usize, const BLOCK_SIZE: usize, A> fmt::Debug
     }
 }
 
-impl<T, B, const POOL: usize, const BLOCK_SIZE: usize, A> ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>
-where
-    B: BackoffPolicy,
+impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
+    ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>
 {
     const LAYOUT_CHECKS: () = Block::<T, BLOCK_SIZE, A>::LAYOUT_CHECKS;
 
@@ -191,6 +190,15 @@ where
     #[doc(alias = "enqueue")]
     #[doc(alias = "send")]
     pub fn push(&self, e: T) {
+        self.push_inner(Some(e));
+    }
+
+    /// Trigger all the mechanics of a push, but without pushing anything.
+    fn faux_push(&self) {
+        self.push_inner(None);
+    }
+
+    fn push_inner(&self, e_opt: Option<T>) {
         let () = Self::LAYOUT_CHECKS;
 
         let backoff = B::new();
@@ -269,9 +277,13 @@ where
         }
 
         let slot = unsafe { (*phead.block).slots.get_unchecked(phead.index) };
-        unsafe { slot.value.get().write(MaybeUninit::new(e)) };
 
-        slot.state.store(WRITE, Ordering::Release);
+        if let Some(e) = e_opt {
+            unsafe { slot.value.get().write(MaybeUninit::new(e)) };
+            slot.state.store(WRITE, Ordering::Release);
+        } else {
+            slot.state.store(NOP, Ordering::Release);
+        }
 
         if let Some(block) = next_block {
             self.release_block(Box::into_raw(block))
@@ -286,7 +298,6 @@ where
 
         let backoff = B::new();
 
-        // Cheap hint if queue is empty.
         if self.chead.load(Ordering::Relaxed) == 0 {
             return None;
         }
@@ -326,7 +337,16 @@ where
                 Ordering::SeqCst,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    // This load *must* be ordered subsequent (in time) to the CAS of chead
+                    let phead = Head::<T, BLOCK_SIZE, A>::new(self.phead.load(Ordering::SeqCst));
+
+                    if phead.block == chead.block && phead.index <= chead.index {
+                        self.faux_push();
+                    }
+
+                    break;
+                }
                 Err(head) => chead = Head::new(head),
             }
 
@@ -360,14 +380,15 @@ where
             backoff.snooze();
         }
 
-        let e = unsafe { slot.value.get().read().assume_init() };
+        let out = (slot.state.load(Ordering::Acquire) != NOP)
+            .then_some(unsafe { slot.value.get().read().assume_init() });
 
         if unsafe { (*chead.block).consumed.fetch_add(1, Ordering::Relaxed) } + 1 == BLOCK_SIZE {
             unsafe { Block::reset(chead.block) };
             self.release_block(chead.block);
         }
 
-        Some(e)
+        out.or_else(|| self.pop())
     }
 }
 
