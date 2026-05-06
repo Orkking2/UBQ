@@ -1,8 +1,8 @@
 #![cfg(feature = "bench_fastfifo")]
 
-//! Smoke tests for the local `fastfifo` benchmark backend candidate.
+//! Smoke tests for the `rbbq` benchmark backend.
 //!
-//! `FastFifo` is bounded, so fill/drain runs must provision enough capacity
+//! `rbbq::FastFifo` is bounded, so fill/drain runs must provision enough capacity
 //! for the full producer phase up front. These tests validate the queue under
 //! the same producer/consumer patterns our benchmark harness uses before we
 //! wire it into the benchmark scheduler.
@@ -15,18 +15,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_utils::Backoff;
-use fastfifo::mpmc::FastFifo;
+use rbbq::FastFifo;
 
 const SENTINEL: u64 = u64::MAX;
 const ITEMS_PER_PRODUCER: u64 = 500;
-const FASTFIFO_BLOCK_SIZE: usize = 64;
+const RBBQ_BLOCK_SIZE: usize = 64;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn new_integrity_queue(producers: usize, consumers: usize) -> Arc<FastFifo<u64>> {
-    let required_capacity =
-        ITEMS_PER_PRODUCER as usize * producers + consumers + FASTFIFO_BLOCK_SIZE;
-    let num_blocks = required_capacity.div_ceil(FASTFIFO_BLOCK_SIZE) + 2;
-    Arc::new(FastFifo::new(num_blocks.max(2), FASTFIFO_BLOCK_SIZE))
+    let required_capacity = ITEMS_PER_PRODUCER as usize * producers + consumers + RBBQ_BLOCK_SIZE;
+    let num_blocks = required_capacity.div_ceil(RBBQ_BLOCK_SIZE) + 2;
+    Arc::new(FastFifo::new(num_blocks.max(2), RBBQ_BLOCK_SIZE))
 }
 
 fn push_blocking(q: &FastFifo<u64>, value: u64) {
@@ -252,7 +251,7 @@ fn run_fill_drain_integrity(producers: usize, consumers: usize) {
     );
 }
 
-macro_rules! fastfifo_throughput_test {
+macro_rules! rbbq_throughput_test {
     ($name:ident, $producers:expr, $consumers:expr) => {
         #[test]
         fn $name() {
@@ -261,7 +260,7 @@ macro_rules! fastfifo_throughput_test {
     };
 }
 
-macro_rules! fastfifo_fill_drain_test {
+macro_rules! rbbq_fill_drain_test {
     ($name:ident, $producers:expr, $consumers:expr) => {
         #[test]
         fn $name() {
@@ -271,18 +270,18 @@ macro_rules! fastfifo_fill_drain_test {
 }
 
 #[test]
-fn fastfifo_is_bounded_and_preserves_fifo_order() {
+fn rbbq_is_bounded_and_preserves_fifo_order() {
     run_bounded_fifo_order_check();
 }
 
-fastfifo_throughput_test!(fastfifo_spsc_throughput, 1, 1);
-fastfifo_throughput_test!(fastfifo_mpsc_throughput, 4, 1);
-fastfifo_throughput_test!(fastfifo_spmc_throughput, 1, 4);
-fastfifo_throughput_test!(fastfifo_mpmc_throughput, 4, 4);
-fastfifo_throughput_test!(fastfifo_p8c8_throughput, 8, 8);
+rbbq_throughput_test!(rbbq_spsc_throughput, 1, 1);
+rbbq_throughput_test!(rbbq_mpsc_throughput, 4, 1);
+rbbq_throughput_test!(rbbq_spmc_throughput, 1, 4);
+rbbq_throughput_test!(rbbq_mpmc_throughput, 4, 4);
+rbbq_throughput_test!(rbbq_p8c8_throughput, 8, 8);
 
-fastfifo_fill_drain_test!(fastfifo_spsc_fill_drain, 1, 1);
-fastfifo_fill_drain_test!(fastfifo_mpsc_fill_drain, 4, 1);
-fastfifo_fill_drain_test!(fastfifo_spmc_fill_drain, 1, 4);
-fastfifo_fill_drain_test!(fastfifo_mpmc_fill_drain, 4, 4);
-fastfifo_fill_drain_test!(fastfifo_p8c8_fill_drain, 8, 8);
+rbbq_fill_drain_test!(rbbq_spsc_fill_drain, 1, 1);
+rbbq_fill_drain_test!(rbbq_mpsc_fill_drain, 4, 1);
+rbbq_fill_drain_test!(rbbq_spmc_fill_drain, 1, 4);
+rbbq_fill_drain_test!(rbbq_mpmc_fill_drain, 4, 4);
+rbbq_fill_drain_test!(rbbq_p8c8_fill_drain, 8, 8);

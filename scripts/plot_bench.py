@@ -144,7 +144,7 @@ def baseline_queue_priority(label: str):
 
 def display_label(label: str):
     if label.startswith("fastfifo_"):
-        return f"FastFifo/BBQ {label[len('fastfifo_'):]}"
+        return f"RBBQ/BBQ {label[len('fastfifo_'):]}"
     if label.startswith("lfqueue_"):
         return f"LSCQ {label[len('lfqueue_'):]}"
     if label.startswith("wcq_"):
@@ -179,7 +179,7 @@ def queue_metadata(label: str):
         }
     if label.startswith("fastfifo_"):
         return {
-            "family": "FastFifo/BBQ",
+            "family": "RBBQ/BBQ",
             "variant": label[len("fastfifo_") :],
             "publication": "BBQ, USENIX ATC 2022",
             "capacity_model": "bounded/pre-sized",

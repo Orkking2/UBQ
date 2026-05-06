@@ -76,7 +76,7 @@ TODO
 
 This repo includes a benchmark harness that compares UBQ against established
 MPMC queue implementations (`segqueue`, `concurrent-queue`, and optional
-FastFifo/BBQ, `lfqueue`/LSCQ, and wCQ variants) in
+RBBQ/BBQ, `lfqueue`/LSCQ, and wCQ variants) in
 `1p1c`, `4p1c`, `1p4c`, `4p4c`, `8p1c`, `8p4c`, `8p8c`, `1p8c`, `4p8c`,
 `16p1c`, `1p16c`, `8p16c`, `16p8c`, `16p16c`, `32p1c`, `1p32c`, `16p32c`,
 `32p16c`, `32p32c`, `64p1c`, `1p64c`, `32p64c`, `64p32c`, and `64p64c`
@@ -87,7 +87,7 @@ scenarios. The v2 harness has two layers:
   `bench_results/runs`.
 - `bench_frontier`: higher-level frontier search. It inspects existing v2 runs,
   expands the UBQ search graph scenario-by-scenario, and submits missing work to
-  `bench_matrix`. FastFifo/BBQ uses a fixed block-size grid rather than adaptive
+  `bench_matrix`. RBBQ/BBQ uses a fixed block-size grid rather than adaptive
   frontier expansion.
   A run is `frontier-complete` when no pending frontier bundles remain; the
   frontier expands around the best fully-covered UBQ label per
@@ -101,7 +101,7 @@ UBQ labels are 4-part identifiers:
 
 Publication-backed baseline labels are emitted with their sizing knob:
 
-- FastFifo/BBQ: `fastfifo_<block_size>`, for example `fastfifo_256`
+- RBBQ/BBQ: `fastfifo_<block_size>`, for example `fastfifo_256`
   (default grid `64,256,1024,4096`).
 - LSCQ via `lfqueue`: `lfqueue_<segment_size>`, for example `lfqueue_256`
   (default grid `32,256,1024`).
@@ -114,20 +114,14 @@ The plotting scripts also emit `queue_metadata.csv` files that map queue labels
 back to their implementation family and publication lineage, so paper-backed
 baselines remain identifiable in aggregate plots.
 
-Initialize benchmark submodules after cloning:
-
-```bash
-git submodule update --init --recursive
-```
-
 Run an explicit direct matrix:
 
 ```bash
-cargo run --release --features bench_registry,bench_fastfifo,bench_lfqueue,bench_wcq --bin bench_matrix -- \
+cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_matrix -- \
   --machine-label local \
-  --queues ubq,segqueue,concurrent-queue,fastfifo,lfqueue,wcq \
+  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
   --ubq-label balanced,8,127,crossbeam \
-  --fastfifo-block-sizes 64,256,1024,4096 \
+  --rbbq-block-sizes 64,256,1024,4096 \
   --lfqueue-segment-sizes 32,256,1024 \
   --wcq-capacities 4096,65536,1048576 \
   --scenarios 1p1c,8p8c \
@@ -138,11 +132,11 @@ cargo run --release --features bench_registry,bench_fastfifo,bench_lfqueue,bench
 Run the frontier search on one machine:
 
 ```bash
-cargo run --release --features bench_registry,bench_fastfifo,bench_lfqueue,bench_wcq --bin bench_frontier -- \
+cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_frontier -- \
   --machine-label local \
-  --queues ubq,segqueue,concurrent-queue,fastfifo,lfqueue,wcq \
+  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
   --seed-label balanced,8,127,crossbeam \
-  --fastfifo-block-sizes 64,256,1024,4096 \
+  --rbbq-block-sizes 64,256,1024,4096 \
   --lfqueue-segment-sizes 32,256,1024 \
   --wcq-capacities 4096,65536,1048576
 ```

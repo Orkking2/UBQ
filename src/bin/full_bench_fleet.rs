@@ -582,7 +582,7 @@ fn make_frontier_base_args(
         frontier_args.push(seed_label.clone());
     }
     if !runtime.fastfifo_block_sizes.is_empty() {
-        frontier_args.push("--fastfifo-block-sizes".to_string());
+        frontier_args.push("--rbbq-block-sizes".to_string());
         frontier_args.push(
             runtime
                 .fastfifo_block_sizes
@@ -625,7 +625,7 @@ fn queue_list_includes_fastfifo(queues: &[String]) -> bool {
     queues.iter().any(|queue| {
         matches!(
             queue.trim().to_ascii_lowercase().as_str(),
-            "fastfifo" | "fast-fifo" | "bbq"
+            "fastfifo" | "fast-fifo" | "rbbq" | "bbq"
         )
     })
 }
@@ -651,7 +651,7 @@ fn queue_list_includes_wcq(queues: &[String]) -> bool {
 fn cargo_feature_arg(runtime: &FleetRuntime) -> String {
     let mut features = vec!["bench_registry"];
     if queue_list_includes_fastfifo(&runtime.queues) {
-        features.push("bench_fastfifo");
+        features.push("bench_rbbq");
     }
     if queue_list_includes_lfqueue(&runtime.queues) {
         features.push("bench_lfqueue");
@@ -1398,13 +1398,13 @@ mod tests {
     }
 
     #[test]
-    fn local_frontier_command_enables_fastfifo_feature_when_selected() {
+    fn local_frontier_command_enables_rbbq_feature_when_selected() {
         let mut runtime = runtime();
-        runtime.queues.push("fastfifo".to_string());
+        runtime.queues.push("rbbq".to_string());
         let machine = machine_local();
         let cmd = build_local_complete_cmd(&runtime, &machine);
-        assert!(cmd.contains(&"bench_registry,bench_fastfifo".to_string()));
-        assert!(cmd.contains(&"--fastfifo-block-sizes".to_string()));
+        assert!(cmd.contains(&"bench_registry,bench_rbbq".to_string()));
+        assert!(cmd.contains(&"--rbbq-block-sizes".to_string()));
         assert!(cmd.contains(&"64,256,1024,4096".to_string()));
     }
 
@@ -1455,8 +1455,8 @@ mod tests {
         let cmd = build_path_dep_sync_cmd(
             &machine,
             &PathDependencySync {
-                local_dir: PathBuf::from("/tmp/FastFifo"),
-                remote_dir: "~/UBQ/vendor/FastFifo".to_string(),
+                local_dir: PathBuf::from("/tmp/path-dep-a"),
+                remote_dir: "~/UBQ/vendor/path-dep-a".to_string(),
             },
         );
         assert!(cmd.contains(&"--rsync-path".to_string()));
@@ -1465,27 +1465,27 @@ mod tests {
 
     #[test]
     fn remote_parent_dir_handles_common_forms() {
-        assert_eq!(remote_parent_dir("~/UBQ/vendor/FastFifo"), "~/UBQ/vendor");
+        assert_eq!(remote_parent_dir("~/UBQ/vendor/path-dep-a"), "~/UBQ/vendor");
         assert_eq!(
-            remote_parent_dir("/srv/bench/UBQ/vendor/FastFifo"),
+            remote_parent_dir("/srv/bench/UBQ/vendor/path-dep-a"),
             "/srv/bench/UBQ/vendor"
         );
-        assert_eq!(remote_parent_dir("FastFifo"), ".");
+        assert_eq!(remote_parent_dir("path-dep-a"), ".");
     }
 
     #[test]
     fn remote_dependency_paths_preserve_relative_layout() {
         assert_eq!(
-            resolve_remote_dependency_dir("~/UBQ", "../FastFifo").expect("resolve"),
-            "~/FastFifo"
+            resolve_remote_dependency_dir("~/UBQ", "../path-dep-a").expect("resolve"),
+            "~/path-dep-a"
         );
         assert_eq!(
-            resolve_remote_dependency_dir("/srv/bench/UBQ", "../FastFifo").expect("resolve"),
-            "/srv/bench/FastFifo"
+            resolve_remote_dependency_dir("/srv/bench/UBQ", "../path-dep-a").expect("resolve"),
+            "/srv/bench/path-dep-a"
         );
         assert_eq!(
-            resolve_remote_dependency_dir("UBQ", "../FastFifo").expect("resolve"),
-            "FastFifo"
+            resolve_remote_dependency_dir("UBQ", "../path-dep-a").expect("resolve"),
+            "path-dep-a"
         );
     }
 
@@ -1493,9 +1493,9 @@ mod tests {
     fn discover_path_dependency_syncs_follow_recursive_manifests() {
         let root = temp_root("path_syncs");
         let repo = root.join("UBQ");
-        let dep_a = repo.join("vendor").join("FastFifo");
-        let dep_b = dep_a.join("fastfifoprocmacro");
-        let dep_c = repo.join("vendor").join("AtomicList");
+        let dep_a = repo.join("vendor").join("path-dep-a");
+        let dep_b = dep_a.join("nested-proc-macro");
+        let dep_c = repo.join("vendor").join("path-dep-c");
 
         fs::create_dir_all(repo.join("src")).expect("mkdir repo");
         fs::create_dir_all(dep_a.join("src")).expect("mkdir dep_a");
@@ -1510,7 +1510,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fastfifo = { path = "vendor/FastFifo", optional = true }
+path_dep_a = { path = "vendor/path-dep-a", optional = true }
 "#,
         )
         .expect("write repo manifest");
@@ -1519,13 +1519,13 @@ fastfifo = { path = "vendor/FastFifo", optional = true }
         fs::write(
             dep_a.join("Cargo.toml"),
             r#"[package]
-name = "fastfifo"
+name = "path_dep_a"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fastfifoprocmacro = { path = "./fastfifoprocmacro" }
-atomic_list = { path = "../AtomicList" }
+nested_proc_macro = { path = "./nested-proc-macro" }
+path_dep_c = { path = "../path-dep-c" }
 "#,
         )
         .expect("write dep_a manifest");
@@ -1534,7 +1534,7 @@ atomic_list = { path = "../AtomicList" }
         fs::write(
             dep_b.join("Cargo.toml"),
             r#"[package]
-name = "fastfifoprocmacro"
+name = "nested_proc_macro"
 version = "0.1.0"
 edition = "2024"
 "#,
@@ -1545,7 +1545,7 @@ edition = "2024"
         fs::write(
             dep_c.join("Cargo.toml"),
             r#"[package]
-name = "atomic_list"
+name = "path_dep_c"
 version = "0.1.0"
 edition = "2024"
 "#,
@@ -1557,21 +1557,21 @@ edition = "2024"
         assert_eq!(
             syncs.len(),
             2,
-            "nested deps inside FastFifo should be covered"
+            "nested deps inside path-dep-a should be covered"
         );
         assert!(syncs.iter().any(|sync| {
             sync.local_dir == dep_a.canonicalize().expect("canon dep_a")
-                && sync.remote_dir == "~/UBQ/vendor/FastFifo"
+                && sync.remote_dir == "~/UBQ/vendor/path-dep-a"
         }));
         assert!(syncs.iter().any(|sync| {
             sync.local_dir == dep_c.canonicalize().expect("canon dep_c")
-                && sync.remote_dir == "~/UBQ/vendor/AtomicList"
+                && sync.remote_dir == "~/UBQ/vendor/path-dep-c"
         }));
         assert!(
             !syncs
                 .iter()
                 .any(|sync| sync.local_dir == dep_b.canonicalize().expect("canon dep_b")),
-            "FastFifo sync should already include fastfifoprocmacro"
+            "path-dep-a sync should already include nested-proc-macro"
         );
 
         let _ = fs::remove_dir_all(&root);

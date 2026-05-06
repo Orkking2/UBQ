@@ -6,10 +6,10 @@ use crate::{ConfiguredUBQ, backoff};
 use concurrent_queue::{ConcurrentQueue, PopError};
 use crossbeam_queue::SegQueue;
 use crossbeam_utils::Backoff;
-#[cfg(feature = "bench_fastfifo")]
-use fastfifo::mpmc::FastFifo;
 #[cfg(feature = "bench_lfqueue")]
 use lfqueue::UnboundedQueue as LfUnboundedQueue;
+#[cfg(feature = "bench_fastfifo")]
+use rbbq::FastFifo;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,7 +49,7 @@ pub const DEFAULT_SCENARIOS: &[&str] = &[
 const SENTINEL: u64 = u64::MAX;
 const DEFAULT_FASTFIFO_BLOCK_SIZES: [usize; 4] = [64, 256, 1024, 4096];
 #[cfg(feature = "bench_fastfifo")]
-const FASTFIFO_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const RBBQ_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "bench_wcq")]
 const WCQ_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const UBQ_POOL_VALUES: [u8; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
@@ -232,7 +232,11 @@ impl<const CAPACITY: usize> WcqBenchQueue<CAPACITY> {
         }
         std::thread::Builder::new()
             .stack_size(512 * 1024 * 1024)
-            .spawn(|| Arc::new(Self { inner: wcq::Queue::new() }))
+            .spawn(|| {
+                Arc::new(Self {
+                    inner: wcq::Queue::new(),
+                })
+            })
             .expect("WCQ init thread spawn failed")
             .join()
             .expect("WCQ init thread panicked")
@@ -287,23 +291,23 @@ impl<const CAPACITY: usize> BenchQueueThreadOps for WcqThreadHandle<CAPACITY> {
 }
 
 #[cfg(feature = "bench_fastfifo")]
-struct FastFifoBenchQueue {
+struct RbbqBenchQueue {
     inner: FastFifo<u64>,
 }
 
 #[cfg(feature = "bench_fastfifo")]
-impl FastFifoBenchQueue {
+impl RbbqBenchQueue {
     fn new(scenario: &ScenarioConfig, items_per_producer: u64, block_size: usize) -> Arc<Self> {
         let total_items = usize::try_from(total_items(items_per_producer, scenario.producers))
-            .expect("total items must fit usize for FastFifo capacity");
+            .expect("total items must fit usize for RBBQ capacity");
         let required_capacity = total_items
             .checked_add(scenario.consumers)
             .and_then(|value| value.checked_add(block_size))
-            .expect("FastFifo required capacity overflow");
+            .expect("RBBQ required capacity overflow");
         let num_blocks = required_capacity
             .div_ceil(block_size)
             .checked_add(2)
-            .expect("FastFifo block count overflow")
+            .expect("RBBQ block count overflow")
             .max(2);
         Arc::new(Self {
             inner: FastFifo::new(num_blocks, block_size),
@@ -312,27 +316,27 @@ impl FastFifoBenchQueue {
 }
 
 #[cfg(feature = "bench_fastfifo")]
-impl BenchQueueOps for FastFifoBenchQueue {
+impl BenchQueueOps for RbbqBenchQueue {
     fn send_value(&self, value: u64) {
-        let deadline = Instant::now() + FASTFIFO_WAIT_TIMEOUT;
+        let deadline = Instant::now() + RBBQ_WAIT_TIMEOUT;
         let backoff = Backoff::new();
         loop {
             if self.inner.push(value).is_ok() {
                 return;
             }
-            assert!(Instant::now() < deadline, "timed out pushing to FastFifo");
+            assert!(Instant::now() < deadline, "timed out pushing to RBBQ");
             backoff.snooze();
         }
     }
 
     fn recv_value(&self) -> u64 {
-        let deadline = Instant::now() + FASTFIFO_WAIT_TIMEOUT;
+        let deadline = Instant::now() + RBBQ_WAIT_TIMEOUT;
         let backoff = Backoff::new();
         loop {
             if let Ok(value) = self.inner.pop() {
                 return value;
             }
-            assert!(Instant::now() < deadline, "timed out popping from FastFifo");
+            assert!(Instant::now() < deadline, "timed out popping from RBBQ");
             backoff.snooze();
         }
     }
@@ -389,7 +393,7 @@ impl QueueKind {
             "ubq" => Some(Self::Ubq),
             "segqueue" | "crossbeam" | "crossbeam-segqueue" => Some(Self::SegQueue),
             "concurrent-queue" | "concurrent" => Some(Self::ConcurrentQueue),
-            "fastfifo" | "fast-fifo" | "bbq" => Some(Self::FastFifo),
+            "fastfifo" | "fast-fifo" | "rbbq" | "bbq" => Some(Self::FastFifo),
             "lfqueue" | "lf-queue" | "lscq" | "scq" => Some(Self::LfQueue),
             "wcq" | "w-cq" | "wait-free-cq" | "wait-free-queue" => Some(Self::Wcq),
             _ => None,
@@ -981,16 +985,16 @@ pub fn parse_fastfifo_block_sizes(raw: Option<&str>) -> Result<Vec<usize>, Strin
     for token in source {
         let parsed = token
             .parse::<usize>()
-            .map_err(|_| format!("invalid FastFifo block size '{token}'"))?;
+            .map_err(|_| format!("invalid RBBQ block size '{token}'"))?;
         if parsed == 0 {
-            return Err("FastFifo block sizes must be > 0".to_string());
+            return Err("RBBQ block sizes must be > 0".to_string());
         }
         if seen.insert(parsed) {
             out.push(parsed);
         }
     }
     if out.is_empty() {
-        return Err("at least one FastFifo block size is required".to_string());
+        return Err("at least one RBBQ block size is required".to_string());
     }
     Ok(out)
 }
@@ -1440,7 +1444,7 @@ pub fn build_direct_matrix_plan(
     }
     if include_fastfifo && fastfifo_block_sizes.is_empty() {
         return Err(
-            "at least one --fastfifo-block-sizes value is required when queue set includes fastfifo"
+            "at least one --fastfifo-block-sizes/--rbbq-block-sizes value is required when queue set includes rbbq"
                 .to_string(),
         );
     }
@@ -1458,7 +1462,7 @@ pub fn build_direct_matrix_plan(
     }
     for &block_size in fastfifo_block_sizes {
         if block_size == 0 {
-            return Err("FastFifo block sizes must be > 0".to_string());
+            return Err("RBBQ block sizes must be > 0".to_string());
         }
     }
     for &segment_size in lfqueue_segment_sizes {
@@ -2033,7 +2037,7 @@ pub fn make_fastfifo_job_factory(
     mode: Mode,
     items_per_producer: u64,
 ) -> JobFactory {
-    assert!(block_size > 0, "FastFifo block size must be > 0");
+    assert!(block_size > 0, "RBBQ block size must be > 0");
     let spec = JobSpec {
         scenario: scenario.clone(),
         repeat_index,
@@ -2048,7 +2052,7 @@ pub fn make_fastfifo_job_factory(
     let queue_name = fastfifo_queue_label(block_size);
     let run_scenario = scenario.clone();
     let run = Arc::new(move |core_offset: usize| {
-        let queue_handle = FastFifoBenchQueue::new(&run_scenario, items_per_producer, block_size);
+        let queue_handle = RbbqBenchQueue::new(&run_scenario, items_per_producer, block_size);
         match mode {
             Mode::Throughput => bench_throughput_with_queue(
                 queue_handle,
@@ -2629,7 +2633,7 @@ pub fn build_and_run_matrix_plan(
 
 fn generated_cargo_toml(repo_root: &Path) -> String {
     format!(
-        "[package]\nname = \"ubq_generated_scheduler\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nubq = {{ path = {:?}, features = [\"bench_fastfifo\", \"bench_lfqueue\", \"bench_wcq\"] }}\n",
+        "[package]\nname = \"ubq_generated_scheduler\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nubq = {{ path = {:?}, features = [\"bench_rbbq\", \"bench_lfqueue\", \"bench_wcq\"] }}\n",
         repo_root.display().to_string()
     )
 }
@@ -2665,7 +2669,7 @@ fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
             QueueKind::FastFifo => {
                 let block_size = spec
                     .fastfifo_block_size
-                    .expect("FastFifo block size must be present");
+                    .expect("RBBQ block size must be present");
                 out.push_str(&format!(
                     "    jobs.push(bench_harness::make_fastfifo_job_factory({}, {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
                     block_size, spec.repeat_index, spec.mode, spec.items_per_producer
@@ -3588,7 +3592,7 @@ pub fn run_matrix_plan_in_process(
             QueueKind::FastFifo => {
                 let block_size = spec
                     .fastfifo_block_size
-                    .ok_or_else(|| "FastFifo job spec is missing block size".to_string())?;
+                    .ok_or_else(|| "RBBQ job spec is missing block size".to_string())?;
                 #[cfg(feature = "bench_fastfifo")]
                 {
                     make_fastfifo_job_factory(
@@ -3603,8 +3607,8 @@ pub fn run_matrix_plan_in_process(
                 {
                     let _ = block_size;
                     return Err(
-                        "FastFifo selected but the bench_fastfifo feature is not enabled; \
-                         rebuild with --features bench_registry,bench_fastfifo"
+                        "RBBQ selected but the bench_fastfifo/bench_rbbq feature is not enabled; \
+                         rebuild with --features bench_registry,bench_rbbq"
                             .to_string(),
                     );
                 }
@@ -3768,6 +3772,7 @@ mod tests {
     #[test]
     fn parses_fastfifo_aliases_and_block_sizes() {
         assert_eq!(QueueKind::parse("fastfifo"), Some(QueueKind::FastFifo));
+        assert_eq!(QueueKind::parse("rbbq"), Some(QueueKind::FastFifo));
         assert_eq!(QueueKind::parse("bbq"), Some(QueueKind::FastFifo));
         assert_eq!(
             parse_fastfifo_block_sizes(Some("64,256,64")).expect("block sizes"),

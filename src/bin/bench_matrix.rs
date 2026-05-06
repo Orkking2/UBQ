@@ -41,7 +41,7 @@ struct Args {
     #[arg(long = "ubq-label")]
     ubq_labels: Vec<String>,
 
-    #[arg(long)]
+    #[arg(long, visible_alias = "rbbq-block-sizes")]
     fastfifo_block_sizes: Option<String>,
 
     #[arg(long)]
