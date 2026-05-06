@@ -207,7 +207,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
 
         // This is the only time the ptr part of phead is invalid.
         if self.phead.load(Ordering::Acquire) == 0 {
-            let ptr = Box::into_raw(Block::<T, BLOCK_SIZE, A>::new_zeroed());
+            let ptr = Box::into_raw(Block::new_zeroed());
 
             match self.phead.compare_exchange(
                 0,
@@ -256,21 +256,19 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         }
 
         if phead.index + 1 == BLOCK_SIZE {
-            // We are, at this point, guaranteed to be the only consuming (wrt the pool) accessor of pool.
-            // That is, no other producers are interfacing with the pool, in this critical section,
-            // which is until storing the new phead.
+            // We are, at this point, guaranteed to be the only consuming accessor of pool.
+            // That is, no other producers are interfacing with the pool until we have stored the new phead.
 
-            let new = if let Some(block) = next_block.take() {
-                Box::into_raw(block)
-            } else if let Some(slot) = self
-                .pool
-                .iter()
-                .find_map(|slot| (!slot.load(Ordering::Relaxed).is_null()).then_some(slot))
-            {
-                slot.swap(null_mut(), Ordering::AcqRel)
-            } else {
-                Box::into_raw(Block::<T, BLOCK_SIZE, A>::new_zeroed())
-            };
+            let new = next_block
+                .take()
+                .map(Box::into_raw)
+                .or_else(|| {
+                    self.pool
+                        .iter()
+                        .find_map(|slot| (!slot.load(Ordering::Relaxed).is_null()).then_some(slot))
+                        .map(|slot| slot.swap(null_mut(), Ordering::AcqRel))
+                })
+                .unwrap_or_else(|| Box::into_raw(Block::new_zeroed()));
 
             unsafe { (*phead.block).next.store(new, Ordering::Release) };
             self.phead.store(new.expose_provenance(), Ordering::Release);
@@ -280,7 +278,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
 
         let state = if let Some(e) = e_opt {
             unsafe { slot.value.get().write(MaybeUninit::new(e)) };
-            
+
             WRITE
         } else {
             NOP
