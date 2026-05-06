@@ -77,6 +77,8 @@ struct FleetDefaults {
     repeats: Option<usize>,
     ubq_labels: Option<Vec<String>>,
     fastfifo_block_sizes: Option<Vec<usize>>,
+    lfqueue_segment_sizes: Option<Vec<usize>>,
+    wcq_capacities: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -110,6 +112,8 @@ struct FleetRuntime {
     repeats: usize,
     ubq_labels: Vec<String>,
     fastfifo_block_sizes: Vec<usize>,
+    lfqueue_segment_sizes: Vec<usize>,
+    wcq_capacities: Vec<usize>,
     sync_repo: bool,
     dry_run: bool,
     frontier_args: Vec<String>,
@@ -588,6 +592,28 @@ fn make_frontier_base_args(
                 .join(","),
         );
     }
+    if !runtime.lfqueue_segment_sizes.is_empty() {
+        frontier_args.push("--lfqueue-segment-sizes".to_string());
+        frontier_args.push(
+            runtime
+                .lfqueue_segment_sizes
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    if !runtime.wcq_capacities.is_empty() {
+        frontier_args.push("--wcq-capacities".to_string());
+        frontier_args.push(
+            runtime
+                .wcq_capacities
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     frontier_args.extend(runtime.frontier_args.clone());
     if runtime.dry_run {
         frontier_args.push("--dry-run".to_string());
@@ -604,12 +630,36 @@ fn queue_list_includes_fastfifo(queues: &[String]) -> bool {
     })
 }
 
+fn queue_list_includes_lfqueue(queues: &[String]) -> bool {
+    queues.iter().any(|queue| {
+        matches!(
+            queue.trim().to_ascii_lowercase().as_str(),
+            "lfqueue" | "lf-queue" | "lscq" | "scq"
+        )
+    })
+}
+
+fn queue_list_includes_wcq(queues: &[String]) -> bool {
+    queues.iter().any(|queue| {
+        matches!(
+            queue.trim().to_ascii_lowercase().as_str(),
+            "wcq" | "w-cq" | "wait-free-cq" | "wait-free-queue"
+        )
+    })
+}
+
 fn cargo_feature_arg(runtime: &FleetRuntime) -> String {
+    let mut features = vec!["bench_registry"];
     if queue_list_includes_fastfifo(&runtime.queues) {
-        "bench_registry,bench_fastfifo".to_string()
-    } else {
-        "bench_registry".to_string()
+        features.push("bench_fastfifo");
     }
+    if queue_list_includes_lfqueue(&runtime.queues) {
+        features.push("bench_lfqueue");
+    }
+    if queue_list_includes_wcq(&runtime.queues) {
+        features.push("bench_wcq");
+    }
+    features.join(",")
 }
 
 fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -> Vec<String> {
@@ -1125,6 +1175,14 @@ fn run(args: Args) -> Result<i32, String> {
         .fastfifo_block_sizes
         .clone()
         .unwrap_or_else(|| vec![64, 256, 1024, 4096]);
+    let lfqueue_segment_sizes = defaults
+        .lfqueue_segment_sizes
+        .clone()
+        .unwrap_or_else(|| vec![32, 256, 1024]);
+    let wcq_capacities = defaults
+        .wcq_capacities
+        .clone()
+        .unwrap_or_else(|| vec![4096, 65536, 1048576]);
 
     let repo_root =
         std::env::current_dir().map_err(|err| format!("failed to read current dir: {err}"))?;
@@ -1140,6 +1198,8 @@ fn run(args: Args) -> Result<i32, String> {
         repeats,
         ubq_labels,
         fastfifo_block_sizes,
+        lfqueue_segment_sizes,
+        wcq_capacities,
         sync_repo: !args.no_sync_repo,
         dry_run: args.dry_run,
         frontier_args: args.frontier_args.clone(),
@@ -1278,6 +1338,8 @@ mod tests {
             repeats: 2,
             ubq_labels: vec!["balanced,8,127,crossbeam,cas".to_string()],
             fastfifo_block_sizes: vec![64, 256, 1024, 4096],
+            lfqueue_segment_sizes: vec![32, 256, 1024],
+            wcq_capacities: vec![4096, 65536, 1048576],
             sync_repo: true,
             dry_run: true,
             frontier_args: vec!["--parallelism=16".to_string()],
@@ -1344,6 +1406,20 @@ mod tests {
         assert!(cmd.contains(&"bench_registry,bench_fastfifo".to_string()));
         assert!(cmd.contains(&"--fastfifo-block-sizes".to_string()));
         assert!(cmd.contains(&"64,256,1024,4096".to_string()));
+    }
+
+    #[test]
+    fn local_frontier_command_enables_publication_queue_features_when_selected() {
+        let mut runtime = runtime();
+        runtime.queues.push("lfqueue".to_string());
+        runtime.queues.push("wcq".to_string());
+        let machine = machine_local();
+        let cmd = build_local_complete_cmd(&runtime, &machine);
+        assert!(cmd.contains(&"bench_registry,bench_lfqueue,bench_wcq".to_string()));
+        assert!(cmd.contains(&"--lfqueue-segment-sizes".to_string()));
+        assert!(cmd.contains(&"32,256,1024".to_string()));
+        assert!(cmd.contains(&"--wcq-capacities".to_string()));
+        assert!(cmd.contains(&"4096,65536,1048576".to_string()));
     }
 
     #[test]

@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use ubq::bench_harness::{
     DEFAULT_RUNS_DIR, FrontierConfig, QueueKind, build_direct_matrix_plan,
     detect_available_parallelism, frontier_search, parse_fastfifo_block_sizes,
-    parse_items_per_producer, parse_modes, parse_queue_kinds, parse_scenarios,
+    parse_items_per_producer, parse_lfqueue_segment_sizes, parse_modes, parse_queue_kinds,
+    parse_scenarios, parse_wcq_capacities,
 };
 
 #[derive(Parser, Debug)]
@@ -41,6 +42,12 @@ struct Args {
     fastfifo_block_sizes: Option<String>,
 
     #[arg(long)]
+    lfqueue_segment_sizes: Option<String>,
+
+    #[arg(long)]
+    wcq_capacities: Option<String>,
+
+    #[arg(long)]
     dry_run: bool,
 }
 
@@ -72,6 +79,9 @@ fn main() {
         let items = parse_items_per_producer(args.items_per_producer.as_deref())?;
         let fastfifo_block_sizes =
             parse_fastfifo_block_sizes(args.fastfifo_block_sizes.as_deref())?;
+        let lfqueue_segment_sizes =
+            parse_lfqueue_segment_sizes(args.lfqueue_segment_sizes.as_deref())?;
+        let wcq_capacities = parse_wcq_capacities(args.wcq_capacities.as_deref())?;
         let available_parallelism = match args.parallelism {
             Some(value) => value,
             None => detect_available_parallelism()?,
@@ -105,6 +115,8 @@ fn main() {
             &queues,
             &args.seed_labels,
             &fastfifo_block_sizes,
+            &lfqueue_segment_sizes,
+            &wcq_capacities,
             &runnable_scenarios,
             &modes,
             &items,
@@ -118,6 +130,8 @@ fn main() {
             scenarios: runnable_scenarios,
             baseline_queues,
             fastfifo_block_sizes,
+            lfqueue_segment_sizes,
+            wcq_capacities,
             seed_labels: args.seed_labels.clone(),
             modes,
             items_per_producer_values: items,

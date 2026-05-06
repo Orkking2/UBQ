@@ -278,12 +278,15 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
 
         let slot = unsafe { (*phead.block).slots.get_unchecked(phead.index) };
 
-        if let Some(e) = e_opt {
+        let state = if let Some(e) = e_opt {
             unsafe { slot.value.get().write(MaybeUninit::new(e)) };
-            slot.state.store(WRITE, Ordering::Release);
+            
+            WRITE
         } else {
-            slot.state.store(NOP, Ordering::Release);
-        }
+            NOP
+        };
+
+        slot.state.store(state, Ordering::Release);
 
         if let Some(block) = next_block {
             self.release_block(Box::into_raw(block))

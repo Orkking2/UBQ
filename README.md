@@ -76,7 +76,7 @@ TODO
 
 This repo includes a benchmark harness that compares UBQ against established
 MPMC queue implementations (`segqueue`, `concurrent-queue`, and optional
-FastFifo/BBQ variants) in
+FastFifo/BBQ, `lfqueue`/LSCQ, and wCQ variants) in
 `1p1c`, `4p1c`, `1p4c`, `4p4c`, `8p1c`, `8p4c`, `8p8c`, `1p8c`, `4p8c`,
 `16p1c`, `1p16c`, `8p16c`, `16p8c`, `16p16c`, `32p1c`, `1p32c`, `16p32c`,
 `32p16c`, `32p32c`, `64p1c`, `1p64c`, `32p64c`, `64p32c`, and `64p64c`
@@ -91,17 +91,28 @@ scenarios. The v2 harness has two layers:
   frontier expansion.
   A run is `frontier-complete` when no pending frontier bundles remain; the
   frontier expands around the best fully-covered UBQ label per
-  scenario/metric, while propagating baseline-beating fully-covered winners
-  across scenarios.
+  scenario/metric, including the matching `pool=0` no-pool variant, while
+  propagating baseline-beating fully-covered winners across scenarios.
 
 UBQ labels are 4-part identifiers:
 
 - `preset,pool,block,backoff`
 - Example: `balanced,8,127,crossbeam`
 
-FastFifo/BBQ labels are emitted as `fastfifo_<block_size>`, for example
-`fastfifo_256`. When FastFifo is selected, the default block-size grid is
-`64,256,1024,4096`.
+Publication-backed baseline labels are emitted with their sizing knob:
+
+- FastFifo/BBQ: `fastfifo_<block_size>`, for example `fastfifo_256`
+  (default grid `64,256,1024,4096`).
+- LSCQ via `lfqueue`: `lfqueue_<segment_size>`, for example `lfqueue_256`
+  (default grid `32,256,1024`).
+- wCQ: `wcq_<capacity>`, for example `wcq_65536`
+  (default grid `4096,65536,1048576`). wCQ is bounded, so fill/drain samples
+  are only scheduled when the selected capacity can hold the full pre-drain
+  item set plus consumer sentinels.
+
+The plotting scripts also emit `queue_metadata.csv` files that map queue labels
+back to their implementation family and publication lineage, so paper-backed
+baselines remain identifiable in aggregate plots.
 
 Initialize benchmark submodules after cloning:
 
@@ -112,11 +123,13 @@ git submodule update --init --recursive
 Run an explicit direct matrix:
 
 ```bash
-cargo run --release --features bench_registry,bench_fastfifo --bin bench_matrix -- \
+cargo run --release --features bench_registry,bench_fastfifo,bench_lfqueue,bench_wcq --bin bench_matrix -- \
   --machine-label local \
-  --queues ubq,segqueue,concurrent-queue,fastfifo \
+  --queues ubq,segqueue,concurrent-queue,fastfifo,lfqueue,wcq \
   --ubq-label balanced,8,127,crossbeam \
   --fastfifo-block-sizes 64,256,1024,4096 \
+  --lfqueue-segment-sizes 32,256,1024 \
+  --wcq-capacities 4096,65536,1048576 \
   --scenarios 1p1c,8p8c \
   --modes throughput,fill_drain \
   --items-per-producer 1000000
@@ -125,11 +138,13 @@ cargo run --release --features bench_registry,bench_fastfifo --bin bench_matrix 
 Run the frontier search on one machine:
 
 ```bash
-cargo run --release --features bench_registry,bench_fastfifo --bin bench_frontier -- \
+cargo run --release --features bench_registry,bench_fastfifo,bench_lfqueue,bench_wcq --bin bench_frontier -- \
   --machine-label local \
-  --queues ubq,segqueue,concurrent-queue,fastfifo \
+  --queues ubq,segqueue,concurrent-queue,fastfifo,lfqueue,wcq \
   --seed-label balanced,8,127,crossbeam \
-  --fastfifo-block-sizes 64,256,1024,4096
+  --fastfifo-block-sizes 64,256,1024,4096 \
+  --lfqueue-segment-sizes 32,256,1024 \
+  --wcq-capacities 4096,65536,1048576
 ```
 
 Run the configured fleet search:
@@ -175,10 +190,12 @@ Outputs are grouped by `meta.machine_label` and mode, e.g.:
 - `bench_results/plots/lab/throughput/1p1c_throughput.png`
 - `bench_results/plots/hebrides/csv/throughput/1p1c_throughput.csv`
 - `bench_results/plots/hebrides/csv/throughput/scenarios_line_throughput.csv`
+- `bench_results/plots/hebrides/csv/throughput/queue_metadata.csv`
 
 Per-scenario UBQ outputs also emit a companion CSV named
-`<scenario>_immediate_variants_throughput.csv` that marks each strict
-immediate winner variant as `present` or `missing`.
+`<scenario>_immediate_variants_throughput.csv` that marks each required
+winner-adjacent variant, including the matching `pool=0` no-pool comparison, as
+`present` or `missing`.
 
 ### UBQ label variants
 

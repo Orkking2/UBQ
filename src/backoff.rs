@@ -7,10 +7,10 @@ pub trait BackoffPolicy: Sized {
     /// Creates a new backoff state for the current operation.
     fn new() -> Self;
 
-    /// Invoked after a failed, tight retry.
+    /// We must wait, because another thread made progress.
     fn spin(&self);
 
-    /// Invoked after a slower retry path.
+    /// We must wait until another thread makes progress.
     fn snooze(&self);
 }
 

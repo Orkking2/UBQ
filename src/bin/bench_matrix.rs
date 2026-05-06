@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use ubq::bench_harness::{
     DEFAULT_RUNS_DIR, MatrixPlan, build_direct_matrix_plan, detect_available_parallelism,
-    parse_fastfifo_block_sizes, parse_items_per_producer, parse_modes, parse_queue_kinds,
-    parse_scenarios, run_matrix_plan_in_process,
+    parse_fastfifo_block_sizes, parse_items_per_producer, parse_lfqueue_segment_sizes, parse_modes,
+    parse_queue_kinds, parse_scenarios, parse_wcq_capacities, run_matrix_plan_in_process,
 };
 
 #[derive(Parser, Debug)]
@@ -45,6 +45,12 @@ struct Args {
     fastfifo_block_sizes: Option<String>,
 
     #[arg(long)]
+    lfqueue_segment_sizes: Option<String>,
+
+    #[arg(long)]
+    wcq_capacities: Option<String>,
+
+    #[arg(long)]
     reuse_existing: bool,
 
     #[arg(long)]
@@ -77,6 +83,9 @@ fn main() {
                 let items = parse_items_per_producer(args.items_per_producer.as_deref())?;
                 let fastfifo_block_sizes =
                     parse_fastfifo_block_sizes(args.fastfifo_block_sizes.as_deref())?;
+                let lfqueue_segment_sizes =
+                    parse_lfqueue_segment_sizes(args.lfqueue_segment_sizes.as_deref())?;
+                let wcq_capacities = parse_wcq_capacities(args.wcq_capacities.as_deref())?;
                 let available_parallelism = match args.parallelism {
                     Some(value) => value,
                     None => detect_available_parallelism()?,
@@ -88,6 +97,8 @@ fn main() {
                     &selected_queues,
                     &args.ubq_labels,
                     &fastfifo_block_sizes,
+                    &lfqueue_segment_sizes,
+                    &wcq_capacities,
                     &scenarios,
                     &modes,
                     &items,

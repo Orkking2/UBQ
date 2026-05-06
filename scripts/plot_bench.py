@@ -116,14 +116,98 @@ def label_sort_key(label: str):
         except ValueError:
             block_size = 2**31
         return (1, 2, block_size, label)
-    order = {"segqueue": 1, "concurrent-queue": 2}
-    return (1, order.get(label, 99), label)
+    if label.startswith("lfqueue_"):
+        try:
+            segment_size = int(label[len("lfqueue_") :])
+        except ValueError:
+            segment_size = 2**31
+        return (1, 3, segment_size, label)
+    if label.startswith("wcq_"):
+        try:
+            capacity = int(label[len("wcq_") :])
+        except ValueError:
+            capacity = 2**31
+        return (1, 4, capacity, label)
+    order = {"segqueue": 0, "concurrent-queue": 1}
+    return (1, order.get(label, 99), 0, label)
 
 
 def baseline_queue_priority(label: str):
     if label.startswith("fastfifo_"):
         return 2
+    if label.startswith("lfqueue_"):
+        return 3
+    if label.startswith("wcq_"):
+        return 4
     return BASELINE_QUEUE_PRIORITY.get(label, 99)
+
+
+def display_label(label: str):
+    if label.startswith("fastfifo_"):
+        return f"FastFifo/BBQ {label[len('fastfifo_'):]}"
+    if label.startswith("lfqueue_"):
+        return f"LSCQ {label[len('lfqueue_'):]}"
+    if label.startswith("wcq_"):
+        return f"wCQ {label[len('wcq_'):]}"
+    return label
+
+
+def queue_metadata(label: str):
+    if label.startswith("ubq_"):
+        return {
+            "family": "UBQ",
+            "variant": label[len("ubq_") :],
+            "publication": "this repository",
+            "capacity_model": "unbounded",
+            "ordering": "strict FIFO",
+        }
+    if label == "segqueue":
+        return {
+            "family": "crossbeam SegQueue",
+            "variant": "",
+            "publication": "Crossbeam production baseline",
+            "capacity_model": "unbounded",
+            "ordering": "strict FIFO",
+        }
+    if label == "concurrent-queue":
+        return {
+            "family": "concurrent-queue",
+            "variant": "",
+            "publication": "Rust production baseline",
+            "capacity_model": "unbounded",
+            "ordering": "strict FIFO",
+        }
+    if label.startswith("fastfifo_"):
+        return {
+            "family": "FastFifo/BBQ",
+            "variant": label[len("fastfifo_") :],
+            "publication": "BBQ, USENIX ATC 2022",
+            "capacity_model": "bounded/pre-sized",
+            "ordering": "strict FIFO",
+        }
+    if label.startswith("lfqueue_"):
+        return {
+            "family": "LSCQ",
+            "variant": label[len("lfqueue_") :],
+            "publication": "Nikolaev, DISC 2019",
+            "capacity_model": "unbounded linked SCQ",
+            "ordering": "strict FIFO",
+        }
+    if label.startswith("wcq_"):
+        return {
+            "family": "wCQ",
+            "variant": label[len("wcq_") :],
+            "publication": "Nikolaev/Ravindran, SPAA 2022",
+            "capacity_model": "bounded capacity variant",
+            "ordering": "strict FIFO",
+        }
+    return {
+        "family": label,
+        "variant": "",
+        "publication": "",
+        "capacity_model": "",
+        "ordering": "",
+    }
 
 
 def labels_by_ops_desc(entries):
@@ -174,6 +258,11 @@ def format_ubq_variant_label(params, include_sync: bool = False) -> str:
     )
 
 
+def is_zero_pool_label(label: str) -> bool:
+    params = parse_ubq_variant(label)
+    return params is not None and params[1] == 0
+
+
 def collect_ubq_plot_context(entries, scenario=None):
     labels = labels_by_ops_desc(entries)
     non_ubq_labels = []
@@ -206,12 +295,14 @@ def immediate_winner_variant_report(entries, scenario=None):
             "required_labels": [],
             "present_required_labels": [],
             "missing_required_labels": [],
+            "zero_pool_labels": [],
         }
 
     winner, required = strict_immediate_winner_ubq_labels(entries, scenario)
     required_labels = sorted(required, key=label_sort_key)
     present_required_labels = [label for label in required_labels if label in entries]
     missing_required_labels = [label for label in required_labels if label not in entries]
+    zero_pool_labels = [label for label in required_labels if is_zero_pool_label(label)]
 
     selected_set = set(non_ubq_labels)
     selected_set.update(present_required_labels)
@@ -223,6 +314,7 @@ def immediate_winner_variant_report(entries, scenario=None):
         "required_labels": required_labels,
         "present_required_labels": present_required_labels,
         "missing_required_labels": missing_required_labels,
+        "zero_pool_labels": zero_pool_labels,
     }
 
 
@@ -237,6 +329,13 @@ def immediate_domain_neighbors(value, ordered_values):
         neighbors.append(ordered_values[idx - 1])
     if idx + 1 < len(ordered_values):
         neighbors.append(ordered_values[idx + 1])
+    return neighbors
+
+
+def pool_neighbors(value, ordered_values):
+    neighbors = immediate_domain_neighbors(value, ordered_values)
+    if value != 0 and 0 in ordered_values and 0 not in neighbors:
+        neighbors.append(0)
     return neighbors
 
 
@@ -256,7 +355,11 @@ def strict_immediate_winner_ubq_labels(entries, scenario=None):
         ordered_values = UBQ_IMMEDIATE_DIMS.get(idx)
         if ordered_values is None:
             continue
-        for neighbor_value in immediate_domain_neighbors(winner_value, ordered_values):
+        if idx == 1:
+            neighbor_values = pool_neighbors(winner_value, ordered_values)
+        else:
+            neighbor_values = immediate_domain_neighbors(winner_value, ordered_values)
+        for neighbor_value in neighbor_values:
             variant = list(winner_params)
             variant[idx] = neighbor_value
             candidate = tuple(variant)
@@ -402,6 +505,7 @@ def write_immediate_variant_csv(out_path: Path, entries, winner, required_labels
                 "queue",
                 "status",
                 "is_winner",
+                "is_zero_pool",
                 "ops_per_sec",
                 "stddev_ops_per_sec",
                 "sem_ops_per_sec",
@@ -415,6 +519,7 @@ def write_immediate_variant_csv(out_path: Path, entries, winner, required_labels
                     label,
                     "present" if stats is not None else "missing",
                     "yes" if label == winner else "no",
+                    "yes" if is_zero_pool_label(label) else "no",
                     f"{stats['mean_ops_per_sec']:.6f}" if stats is not None else "",
                     f"{stats['stddev_ops_per_sec']:.6f}" if stats is not None else "",
                     f"{stats['sem_ops_per_sec']:.6f}" if stats is not None else "",
@@ -496,18 +601,54 @@ def write_scenario_line_csv(out_path: Path, scenarios, labels, entries_by_scenar
     return out_path
 
 
+def write_queue_metadata_csv(out_path: Path, labels):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "queue",
+                "family",
+                "variant",
+                "publication",
+                "capacity_model",
+                "ordering",
+            ]
+        )
+        for label in labels:
+            meta = queue_metadata(label)
+            writer.writerow(
+                [
+                    label,
+                    meta["family"],
+                    meta["variant"],
+                    meta["publication"],
+                    meta["capacity_model"],
+                    meta["ordering"],
+                ]
+            )
+    return out_path
+
+
 def annotate_immediate_variant_status(ax, coverage_csv_name: str, report):
     required_labels = report["required_labels"]
     if not required_labels:
         return
 
     missing_required_labels = report["missing_required_labels"]
+    zero_pool_labels = report["zero_pool_labels"]
+    zero_pool_missing = [
+        label for label in zero_pool_labels if label in missing_required_labels
+    ]
     if missing_required_labels:
-        note = (
-            "Immediate UBQ set incomplete\n"
-            f"Present: {len(report['present_required_labels'])}/{len(required_labels)}\n"
-            f"See {coverage_csv_name}"
-        )
+        note_lines = [
+            "Required UBQ set incomplete",
+            f"Present: {len(report['present_required_labels'])}/{len(required_labels)}",
+        ]
+        if zero_pool_missing:
+            note_lines.append(f"Missing pool=0: {len(zero_pool_missing)}")
+        note_lines.append(f"See {coverage_csv_name}")
+        note = "\n".join(note_lines)
         bbox = {
             "boxstyle": "round,pad=0.25",
             "facecolor": "#fff3e0",
@@ -564,7 +705,7 @@ def plot_scenario_lines(plt, out_path: Path, machine: str, mode: str, scenarios,
             continue
 
         plot_kwargs = {
-            "label": label,
+            "label": display_label(label),
             "color": color_map(idx),
             "marker": LINE_MARKERS[idx % len(LINE_MARKERS)],
             "linewidth": 1.8,
@@ -677,7 +818,7 @@ def main():
                     if report["missing_required_labels"]:
                         print(
                             f"warning: {machine} {mode} {scenario} is missing "
-                            f"{len(report['missing_required_labels'])} immediate UBQ variant(s)",
+                            f"{len(report['missing_required_labels'])} required UBQ variant(s)",
                             file=sys.stderr,
                         )
 
@@ -689,6 +830,17 @@ def main():
             csv_path = out_root / machine / "csv" / mode / "scenarios_line_throughput.csv"
             write_scenario_line_csv(csv_path, scenarios, labels, entries_by_scenario)
             print(f"Wrote CSV: {csv_path}")
+            all_labels = sorted(
+                {
+                    label
+                    for entries in entries_by_scenario.values()
+                    for label in entries.keys()
+                },
+                key=label_sort_key,
+            )
+            metadata_csv_path = out_root / machine / "csv" / mode / "queue_metadata.csv"
+            write_queue_metadata_csv(metadata_csv_path, all_labels)
+            print(f"Wrote CSV: {metadata_csv_path}")
 
     ensure_plot_runtime_env(out_root)
     try:
@@ -727,7 +879,12 @@ def main():
                     bar_kwargs["yerr"] = yerr
                     bar_kwargs["capsize"] = 3
                 ax.bar(bar_positions, values, **bar_kwargs)
-                ax.set_xticks(bar_positions, labels, rotation=30, ha="right")
+                ax.set_xticks(
+                    bar_positions,
+                    [display_label(label) for label in labels],
+                    rotation=30,
+                    ha="right",
+                )
                 ax.set_ylabel("Ops/sec")
                 ax.set_title(f"{machine}: {mode} {scenario}")
                 ax.grid(axis="y", linestyle=":", alpha=0.4)
@@ -745,7 +902,7 @@ def main():
                     color="tab:red",
                     linestyle="--",
                     linewidth=1.25,
-                    label=f"Best mean: {best_label} ({best_value:,.0f} ops/sec)",
+                    label=f"Best mean: {display_label(best_label)} ({best_value:,.0f} ops/sec)",
                 )
                 ax.legend(loc="upper left")
                 fig.tight_layout()

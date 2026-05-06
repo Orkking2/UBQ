@@ -8,6 +8,8 @@ use crossbeam_queue::SegQueue;
 use crossbeam_utils::Backoff;
 #[cfg(feature = "bench_fastfifo")]
 use fastfifo::mpmc::FastFifo;
+#[cfg(feature = "bench_lfqueue")]
+use lfqueue::UnboundedQueue as LfUnboundedQueue;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,13 +50,49 @@ const SENTINEL: u64 = u64::MAX;
 const DEFAULT_FASTFIFO_BLOCK_SIZES: [usize; 4] = [64, 256, 1024, 4096];
 #[cfg(feature = "bench_fastfifo")]
 const FASTFIFO_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "bench_wcq")]
+const WCQ_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const UBQ_POOL_VALUES: [u8; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
 const UBQ_BLOCK_VALUES: [u16; 8] = [31, 63, 127, 255, 511, 1023, 2047, 4095];
 const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
+const DEFAULT_LFQUEUE_SEGMENT_SIZES: [usize; 3] = [32, 256, 1024];
+const DEFAULT_WCQ_CAPACITIES: [usize; 3] = [4096, 65536, 1048576];
+const SUPPORTED_WCQ_CAPACITIES: [usize; 8] =
+    [256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304];
+const WCQ_MAX_THREADS: usize = 256;
 
 pub trait BenchQueueOps: Send + Sync + 'static {
     fn send_value(&self, value: u64);
     fn recv_value(&self) -> u64;
+}
+
+pub trait BenchQueueThreadOps: Send + 'static {
+    fn send_value(&self, value: u64);
+    fn recv_value(&self) -> u64;
+}
+
+impl<Q: BenchQueueOps> BenchQueueThreadOps for Arc<Q> {
+    fn send_value(&self, value: u64) {
+        (**self).send_value(value);
+    }
+
+    fn recv_value(&self) -> u64 {
+        (**self).recv_value()
+    }
+}
+
+pub trait BenchQueueHandleFactory: Send + Sync + 'static {
+    type ThreadHandle: BenchQueueThreadOps;
+
+    fn thread_handle(self: &Arc<Self>) -> Self::ThreadHandle;
+}
+
+impl<Q: BenchQueueOps> BenchQueueHandleFactory for Q {
+    type ThreadHandle = Arc<Q>;
+
+    fn thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
+        self.clone()
+    }
 }
 
 pub trait BenchQueue: BenchQueueOps {
@@ -141,6 +179,113 @@ impl BenchQueue for ConcurrentQueue<u64> {
     }
 }
 
+#[cfg(feature = "bench_lfqueue")]
+struct LfQueueBenchQueue {
+    inner: LfUnboundedQueue<u64>,
+}
+
+#[cfg(feature = "bench_lfqueue")]
+impl LfQueueBenchQueue {
+    fn new(segment_size: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: LfUnboundedQueue::with_segment_size(segment_size),
+        })
+    }
+}
+
+#[cfg(feature = "bench_lfqueue")]
+impl BenchQueueOps for LfQueueBenchQueue {
+    fn send_value(&self, value: u64) {
+        self.inner.enqueue(value);
+    }
+
+    fn recv_value(&self) -> u64 {
+        let backoff = Backoff::new();
+        loop {
+            if let Some(value) = self.inner.dequeue() {
+                return value;
+            }
+            backoff.snooze();
+        }
+    }
+}
+
+#[cfg(feature = "bench_wcq")]
+struct WcqBenchQueue<const CAPACITY: usize> {
+    inner: wcq::Queue<u64, CAPACITY, WCQ_MAX_THREADS>,
+}
+
+#[cfg(feature = "bench_wcq")]
+impl<const CAPACITY: usize> WcqBenchQueue<CAPACITY> {
+    fn new() -> Arc<Self> {
+        // Queue<u64, CAPACITY, WCQ_MAX_THREADS> is stored inline, so Arc::new()
+        // must construct it on the calling thread's stack before promoting it to
+        // the heap. For large CAPACITY values (e.g. 1M cells × ~48 B each = ~48 MB)
+        // this overflows the default tokio spawn_blocking stack (8 MB on Linux/macOS).
+        // Use a dedicated OS thread with a generous stack reservation whenever the
+        // struct exceeds 4 MiB; virtual pages are committed lazily on Linux/macOS.
+        const STACK_THRESHOLD: usize = 4 * 1024 * 1024;
+        if std::mem::size_of::<Self>() <= STACK_THRESHOLD {
+            return Arc::new(Self {
+                inner: wcq::Queue::new(),
+            });
+        }
+        std::thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(|| Arc::new(Self { inner: wcq::Queue::new() }))
+            .expect("WCQ init thread spawn failed")
+            .join()
+            .expect("WCQ init thread panicked")
+    }
+}
+
+#[cfg(feature = "bench_wcq")]
+struct WcqThreadHandle<const CAPACITY: usize> {
+    queue: Arc<WcqBenchQueue<CAPACITY>>,
+    handle: wcq::ThreadHandle<WCQ_MAX_THREADS>,
+}
+
+#[cfg(feature = "bench_wcq")]
+impl<const CAPACITY: usize> BenchQueueHandleFactory for WcqBenchQueue<CAPACITY> {
+    type ThreadHandle = WcqThreadHandle<CAPACITY>;
+
+    fn thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
+        let handle = self
+            .inner
+            .register()
+            .expect("wCQ thread handle registration failed");
+        WcqThreadHandle {
+            queue: self.clone(),
+            handle,
+        }
+    }
+}
+
+#[cfg(feature = "bench_wcq")]
+impl<const CAPACITY: usize> BenchQueueThreadOps for WcqThreadHandle<CAPACITY> {
+    fn send_value(&self, value: u64) {
+        let deadline = Instant::now() + WCQ_WAIT_TIMEOUT;
+        let backoff = Backoff::new();
+        loop {
+            if self.queue.inner.enqueue(self.handle, value).is_ok() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out pushing to wCQ");
+            backoff.snooze();
+        }
+    }
+
+    fn recv_value(&self) -> u64 {
+        let backoff = Backoff::new();
+        loop {
+            if let Some(value) = self.queue.inner.dequeue(self.handle) {
+                return value;
+            }
+            backoff.snooze();
+        }
+    }
+}
+
 #[cfg(feature = "bench_fastfifo")]
 struct FastFifoBenchQueue {
     inner: FastFifo<u64>,
@@ -223,6 +368,8 @@ pub enum QueueKind {
     SegQueue,
     ConcurrentQueue,
     FastFifo,
+    LfQueue,
+    Wcq,
 }
 
 impl QueueKind {
@@ -232,6 +379,8 @@ impl QueueKind {
             QueueKind::SegQueue => "segqueue",
             QueueKind::ConcurrentQueue => "concurrent-queue",
             QueueKind::FastFifo => "fastfifo",
+            QueueKind::LfQueue => "lfqueue",
+            QueueKind::Wcq => "wcq",
         }
     }
 
@@ -241,6 +390,8 @@ impl QueueKind {
             "segqueue" | "crossbeam" | "crossbeam-segqueue" => Some(Self::SegQueue),
             "concurrent-queue" | "concurrent" => Some(Self::ConcurrentQueue),
             "fastfifo" | "fast-fifo" | "bbq" => Some(Self::FastFifo),
+            "lfqueue" | "lf-queue" | "lscq" | "scq" => Some(Self::LfQueue),
+            "wcq" | "w-cq" | "wait-free-cq" | "wait-free-queue" => Some(Self::Wcq),
             _ => None,
         }
     }
@@ -326,13 +477,25 @@ pub struct JobSpec {
     pub queue: QueueKind,
     pub ubq_label: Option<String>,
     pub fastfifo_block_size: Option<usize>,
+    #[serde(default)]
+    pub lfqueue_segment_size: Option<usize>,
+    #[serde(default)]
+    pub wcq_capacity: Option<usize>,
 }
 
 impl JobSpec {
     pub fn queue_label(&self) -> String {
-        match (&self.queue, &self.ubq_label, self.fastfifo_block_size) {
-            (QueueKind::Ubq, Some(label), _) => format!("ubq_{label}"),
-            (QueueKind::FastFifo, _, Some(block_size)) => fastfifo_queue_label(block_size),
+        match (
+            &self.queue,
+            &self.ubq_label,
+            self.fastfifo_block_size,
+            self.lfqueue_segment_size,
+            self.wcq_capacity,
+        ) {
+            (QueueKind::Ubq, Some(label), _, _, _) => format!("ubq_{label}"),
+            (QueueKind::FastFifo, _, Some(block_size), _, _) => fastfifo_queue_label(block_size),
+            (QueueKind::LfQueue, _, _, Some(segment_size), _) => lfqueue_queue_label(segment_size),
+            (QueueKind::Wcq, _, _, _, Some(capacity)) => wcq_queue_label(capacity),
             _ => self.queue.name().to_string(),
         }
     }
@@ -392,6 +555,10 @@ pub struct MatrixPlan {
     pub baseline_queues: Vec<QueueKind>,
     #[serde(default)]
     pub fastfifo_block_sizes: Vec<usize>,
+    #[serde(default)]
+    pub lfqueue_segment_sizes: Vec<usize>,
+    #[serde(default)]
+    pub wcq_capacities: Vec<usize>,
     pub bundles: Vec<PlanBundle>,
     pub reuse_existing: bool,
 }
@@ -403,6 +570,8 @@ pub struct FrontierConfig {
     pub scenarios: Vec<ScenarioConfig>,
     pub baseline_queues: Vec<QueueKind>,
     pub fastfifo_block_sizes: Vec<usize>,
+    pub lfqueue_segment_sizes: Vec<usize>,
+    pub wcq_capacities: Vec<usize>,
     pub seed_labels: Vec<String>,
     pub modes: Vec<Mode>,
     pub items_per_producer_values: Vec<u64>,
@@ -830,9 +999,124 @@ fn fastfifo_queue_label(block_size: usize) -> String {
     format!("fastfifo_{block_size}")
 }
 
+pub fn parse_lfqueue_segment_sizes(raw: Option<&str>) -> Result<Vec<usize>, String> {
+    let source = raw.map(parse_csv_list).unwrap_or_else(|| {
+        DEFAULT_LFQUEUE_SEGMENT_SIZES
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    });
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for token in source {
+        let parsed = token
+            .parse::<usize>()
+            .map_err(|_| format!("invalid lfqueue segment size '{token}'"))?;
+        if parsed == 0 {
+            return Err("lfqueue segment sizes must be > 0".to_string());
+        }
+        if seen.insert(parsed) {
+            out.push(parsed);
+        }
+    }
+    if out.is_empty() {
+        return Err("at least one lfqueue segment size is required".to_string());
+    }
+    Ok(out)
+}
+
+fn lfqueue_queue_label(segment_size: usize) -> String {
+    format!("lfqueue_{segment_size}")
+}
+
+pub fn parse_wcq_capacities(raw: Option<&str>) -> Result<Vec<usize>, String> {
+    let source = raw.map(parse_csv_list).unwrap_or_else(|| {
+        DEFAULT_WCQ_CAPACITIES
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    });
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for token in source {
+        let parsed = token
+            .parse::<usize>()
+            .map_err(|_| format!("invalid wCQ capacity '{token}'"))?;
+        if parsed == 0 {
+            return Err("wCQ capacities must be > 0".to_string());
+        }
+        if !parsed.is_power_of_two() {
+            return Err(format!("wCQ capacity '{parsed}' must be a power of two"));
+        }
+        if !SUPPORTED_WCQ_CAPACITIES.contains(&parsed) {
+            return Err(format!(
+                "unsupported wCQ capacity '{parsed}'; supported capacities are {}",
+                SUPPORTED_WCQ_CAPACITIES
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if seen.insert(parsed) {
+            out.push(parsed);
+        }
+    }
+    if out.is_empty() {
+        return Err("at least one wCQ capacity is required".to_string());
+    }
+    Ok(out)
+}
+
+fn wcq_queue_label(capacity: usize) -> String {
+    format!("wcq_{capacity}")
+}
+
+fn wcq_mode_supported(
+    mode: Mode,
+    capacity: usize,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+) -> bool {
+    match mode {
+        // wCQ throughput mode is disabled due to two bugs in the wcq crate:
+        //
+        // 1. `Queue::len()` scans linearly from cell 0 and stops at the first
+        //    empty cell.  Once the ring has wrapped (head past slot 0), cell 0
+        //    can be empty while cells 1..N-1 hold valid items.  `is_empty()`
+        //    then returns true for a non-empty queue.  The dequeue fast-path
+        //    uses `!nonempty` to decide whether to short-circuit; with a
+        //    spuriously empty-looking queue it advances head past valid items,
+        //    permanently losing them, and producers eventually time out.
+        //
+        // 2. `AtomicPositionPair::compare_exchange` performs two *separate*
+        //    atomic CAS operations (one on `entry`, one on `phase2`) with a
+        //    non-atomic rollback when the second CAS fails.  Other threads can
+        //    observe the inconsistent intermediate state, causing the slow-path
+        //    helping mechanism to stall under concurrent producer/consumer load.
+        //
+        // Fill-drain mode is unaffected: the queue is fully loaded before any
+        // consumer runs, so the ring never wraps during the fill phase, and
+        // concurrency on head/tail is minimal during the drain phase.
+        Mode::Throughput => false,
+        Mode::FillDrain => {
+            let Ok(total_items) =
+                usize::try_from(total_items(items_per_producer, scenario.producers))
+            else {
+                return false;
+            };
+            total_items
+                .checked_add(scenario.consumers)
+                .is_some_and(|required| required <= capacity)
+        }
+    }
+}
+
 fn baseline_queue_labels(
     baseline_queues: &[QueueKind],
     fastfifo_block_sizes: &[usize],
+    lfqueue_segment_sizes: &[usize],
+    wcq_capacities: &[usize],
 ) -> Vec<String> {
     let mut labels = Vec::new();
     for queue in baseline_queues {
@@ -843,6 +1127,62 @@ fn baseline_queue_labels(
                         .iter()
                         .copied()
                         .map(fastfifo_queue_label),
+                );
+            }
+            QueueKind::LfQueue => {
+                labels.extend(
+                    lfqueue_segment_sizes
+                        .iter()
+                        .copied()
+                        .map(lfqueue_queue_label),
+                );
+            }
+            QueueKind::Wcq => {
+                labels.extend(wcq_capacities.iter().copied().map(wcq_queue_label));
+            }
+            _ => labels.push(queue.name().to_string()),
+        }
+    }
+    labels
+}
+
+fn baseline_queue_labels_for_sample(
+    baseline_queues: &[QueueKind],
+    fastfifo_block_sizes: &[usize],
+    lfqueue_segment_sizes: &[usize],
+    wcq_capacities: &[usize],
+    scenario: &ScenarioConfig,
+    mode: Mode,
+    items_per_producer: u64,
+) -> Vec<String> {
+    let mut labels = Vec::new();
+    for queue in baseline_queues {
+        match queue {
+            QueueKind::FastFifo => {
+                labels.extend(
+                    fastfifo_block_sizes
+                        .iter()
+                        .copied()
+                        .map(fastfifo_queue_label),
+                );
+            }
+            QueueKind::LfQueue => {
+                labels.extend(
+                    lfqueue_segment_sizes
+                        .iter()
+                        .copied()
+                        .map(lfqueue_queue_label),
+                );
+            }
+            QueueKind::Wcq => {
+                labels.extend(
+                    wcq_capacities
+                        .iter()
+                        .copied()
+                        .filter(|capacity| {
+                            wcq_mode_supported(mode, *capacity, scenario, items_per_producer)
+                        })
+                        .map(wcq_queue_label),
                 );
             }
             _ => labels.push(queue.name().to_string()),
@@ -979,11 +1319,19 @@ fn immediate_domain_neighbors_str<'a>(value: &str, domain: &'a [&str]) -> Vec<&'
     Vec::new()
 }
 
+fn pool_neighbors(value: u8) -> Vec<u8> {
+    let mut out = immediate_domain_neighbors_u8(value, &UBQ_POOL_VALUES);
+    if value != 0 && UBQ_POOL_VALUES.contains(&0) && !out.contains(&0) {
+        out.push(0);
+    }
+    out
+}
+
 fn immediate_neighbors(label: &UbqLabel, idx: usize) -> Vec<UbqLabel> {
     let mut out = Vec::new();
     match idx {
         0 => {
-            for pool in immediate_domain_neighbors_u8(label.pool, &UBQ_POOL_VALUES) {
+            for pool in pool_neighbors(label.pool) {
                 out.push(UbqLabel {
                     preset: label.preset.clone(),
                     pool,
@@ -1060,6 +1408,8 @@ pub fn build_direct_matrix_plan(
     selected_queues: &[QueueKind],
     ubq_labels: &[String],
     fastfifo_block_sizes: &[usize],
+    lfqueue_segment_sizes: &[usize],
+    wcq_capacities: &[usize],
     scenarios: &[ScenarioConfig],
     modes: &[Mode],
     items_per_producer_values: &[u64],
@@ -1081,6 +1431,10 @@ pub fn build_direct_matrix_plan(
     let include_fastfifo = selected_queues
         .iter()
         .any(|queue| *queue == QueueKind::FastFifo);
+    let include_lfqueue = selected_queues
+        .iter()
+        .any(|queue| *queue == QueueKind::LfQueue);
+    let include_wcq = selected_queues.iter().any(|queue| *queue == QueueKind::Wcq);
     if include_ubq && ubq_labels.is_empty() {
         return Err("at least one --ubq-label is required when queue set includes ubq".to_string());
     }
@@ -1090,9 +1444,44 @@ pub fn build_direct_matrix_plan(
                 .to_string(),
         );
     }
+    if include_lfqueue && lfqueue_segment_sizes.is_empty() {
+        return Err(
+            "at least one --lfqueue-segment-sizes value is required when queue set includes lfqueue"
+                .to_string(),
+        );
+    }
+    if include_wcq && wcq_capacities.is_empty() {
+        return Err(
+            "at least one --wcq-capacities value is required when queue set includes wcq"
+                .to_string(),
+        );
+    }
     for &block_size in fastfifo_block_sizes {
         if block_size == 0 {
             return Err("FastFifo block sizes must be > 0".to_string());
+        }
+    }
+    for &segment_size in lfqueue_segment_sizes {
+        if segment_size == 0 {
+            return Err("lfqueue segment sizes must be > 0".to_string());
+        }
+    }
+    for &capacity in wcq_capacities {
+        if capacity == 0 {
+            return Err("wCQ capacities must be > 0".to_string());
+        }
+        if !capacity.is_power_of_two() {
+            return Err(format!("wCQ capacity '{capacity}' must be a power of two"));
+        }
+        if !SUPPORTED_WCQ_CAPACITIES.contains(&capacity) {
+            return Err(format!(
+                "unsupported wCQ capacity '{capacity}'; supported capacities are {}",
+                SUPPORTED_WCQ_CAPACITIES
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
         }
     }
     let normalized_fastfifo_block_sizes = if include_fastfifo {
@@ -1101,6 +1490,30 @@ pub fn build_direct_matrix_plan(
         for &block_size in fastfifo_block_sizes {
             if seen.insert(block_size) {
                 out.push(block_size);
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    let normalized_lfqueue_segment_sizes = if include_lfqueue {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for &segment_size in lfqueue_segment_sizes {
+            if seen.insert(segment_size) {
+                out.push(segment_size);
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    let normalized_wcq_capacities = if include_wcq {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for &capacity in wcq_capacities {
+            if seen.insert(capacity) {
+                out.push(capacity);
             }
         }
         out
@@ -1131,6 +1544,15 @@ pub fn build_direct_matrix_plan(
                 scenario.name,
                 scenario.total_threads(),
                 available_parallelism
+            ));
+        }
+        if include_wcq && scenario.total_threads().saturating_add(1) > WCQ_MAX_THREADS {
+            return Err(format!(
+                "scenario {} requires {} wCQ thread handles including sentinel sender but \
+                 this harness supports {}",
+                scenario.name,
+                scenario.total_threads() + 1,
+                WCQ_MAX_THREADS
             ));
         }
     }
@@ -1170,6 +1592,8 @@ pub fn build_direct_matrix_plan(
         available_parallelism,
         baseline_queues,
         fastfifo_block_sizes: normalized_fastfifo_block_sizes,
+        lfqueue_segment_sizes: normalized_lfqueue_segment_sizes,
+        wcq_capacities: normalized_wcq_capacities,
         bundles,
         reuse_existing,
     })
@@ -1272,7 +1696,46 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                     queue: baseline_queue,
                                     ubq_label: None,
                                     fastfifo_block_size: Some(block_size),
+                                    lfqueue_segment_size: None,
+                                    wcq_capacity: None,
                                 });
+                            }
+                        }
+                        QueueKind::LfQueue => {
+                            for &segment_size in &plan.lfqueue_segment_sizes {
+                                out.insert(JobSpec {
+                                    scenario: bundle.scenario.clone(),
+                                    repeat_index: bundle.repeat_index,
+                                    mode: *mode,
+                                    items_per_producer,
+                                    queue: baseline_queue,
+                                    ubq_label: None,
+                                    fastfifo_block_size: None,
+                                    lfqueue_segment_size: Some(segment_size),
+                                    wcq_capacity: None,
+                                });
+                            }
+                        }
+                        QueueKind::Wcq => {
+                            for &capacity in &plan.wcq_capacities {
+                                if wcq_mode_supported(
+                                    *mode,
+                                    capacity,
+                                    &bundle.scenario,
+                                    items_per_producer,
+                                ) {
+                                    out.insert(JobSpec {
+                                        scenario: bundle.scenario.clone(),
+                                        repeat_index: bundle.repeat_index,
+                                        mode: *mode,
+                                        items_per_producer,
+                                        queue: baseline_queue,
+                                        ubq_label: None,
+                                        fastfifo_block_size: None,
+                                        lfqueue_segment_size: None,
+                                        wcq_capacity: Some(capacity),
+                                    });
+                                }
                             }
                         }
                         _ => {
@@ -1284,6 +1747,8 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                 queue: baseline_queue,
                                 ubq_label: None,
                                 fastfifo_block_size: None,
+                                lfqueue_segment_size: None,
+                                wcq_capacity: None,
                             });
                         }
                     }
@@ -1297,6 +1762,8 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                         queue: QueueKind::Ubq,
                         ubq_label: Some(label.clone()),
                         fastfifo_block_size: None,
+                        lfqueue_segment_size: None,
+                        wcq_capacity: None,
                     });
                 }
             }
@@ -1323,6 +1790,8 @@ pub fn make_ubq_job_factory<Q: BenchQueue>(
         queue: QueueKind::Ubq,
         ubq_label: Some(normalized),
         fastfifo_block_size: None,
+        lfqueue_segment_size: None,
+        wcq_capacity: None,
     };
     let queue_name = "ubq".to_string();
     let run_scenario = scenario.clone();
@@ -1351,6 +1820,8 @@ pub fn make_segqueue_job_factory(
         queue: QueueKind::SegQueue,
         ubq_label: None,
         fastfifo_block_size: None,
+        lfqueue_segment_size: None,
+        wcq_capacity: None,
     };
     let queue_name = QueueKind::SegQueue.name().to_string();
     let run_scenario = scenario.clone();
@@ -1385,6 +1856,8 @@ pub fn make_concurrent_queue_job_factory(
         queue: QueueKind::ConcurrentQueue,
         ubq_label: None,
         fastfifo_block_size: None,
+        lfqueue_segment_size: None,
+        wcq_capacity: None,
     };
     let queue_name = QueueKind::ConcurrentQueue.name().to_string();
     let run_scenario = scenario.clone();
@@ -1405,6 +1878,153 @@ pub fn make_concurrent_queue_job_factory(
     JobFactory { spec, run }
 }
 
+#[cfg(feature = "bench_lfqueue")]
+pub fn make_lfqueue_job_factory(
+    segment_size: usize,
+    scenario: ScenarioConfig,
+    repeat_index: usize,
+    mode: Mode,
+    items_per_producer: u64,
+) -> JobFactory {
+    assert!(segment_size > 0, "lfqueue segment size must be > 0");
+    let spec = JobSpec {
+        scenario: scenario.clone(),
+        repeat_index,
+        mode,
+        items_per_producer,
+        queue: QueueKind::LfQueue,
+        ubq_label: None,
+        fastfifo_block_size: None,
+        lfqueue_segment_size: Some(segment_size),
+        wcq_capacity: None,
+    };
+    let queue_name = lfqueue_queue_label(segment_size);
+    let run_scenario = scenario.clone();
+    let run = Arc::new(move |core_offset: usize| {
+        let queue_handle = LfQueueBenchQueue::new(segment_size);
+        match mode {
+            Mode::Throughput => bench_throughput_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::FillDrain => bench_fill_drain_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+        }
+    });
+    JobFactory { spec, run }
+}
+
+#[cfg(feature = "bench_wcq")]
+fn make_wcq_job_factory_typed<const CAPACITY: usize>(
+    scenario: ScenarioConfig,
+    repeat_index: usize,
+    mode: Mode,
+    items_per_producer: u64,
+) -> JobFactory {
+    let spec = JobSpec {
+        scenario: scenario.clone(),
+        repeat_index,
+        mode,
+        items_per_producer,
+        queue: QueueKind::Wcq,
+        ubq_label: None,
+        fastfifo_block_size: None,
+        lfqueue_segment_size: None,
+        wcq_capacity: Some(CAPACITY),
+    };
+    let queue_name = wcq_queue_label(CAPACITY);
+    let run_scenario = scenario.clone();
+    let run = Arc::new(move |core_offset: usize| {
+        let queue_handle = WcqBenchQueue::<CAPACITY>::new();
+        match mode {
+            Mode::Throughput => bench_throughput_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::FillDrain => bench_fill_drain_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+        }
+    });
+    JobFactory { spec, run }
+}
+
+#[cfg(feature = "bench_wcq")]
+pub fn make_wcq_job_factory(
+    capacity: usize,
+    scenario: ScenarioConfig,
+    repeat_index: usize,
+    mode: Mode,
+    items_per_producer: u64,
+) -> Option<JobFactory> {
+    match capacity {
+        256 => Some(make_wcq_job_factory_typed::<256>(
+            scenario,
+            repeat_index,
+            mode,
+            items_per_producer,
+        )),
+        1024 => Some(make_wcq_job_factory_typed::<1024>(
+            scenario,
+            repeat_index,
+            mode,
+            items_per_producer,
+        )),
+        4096 => Some(make_wcq_job_factory_typed::<4096>(
+            scenario,
+            repeat_index,
+            mode,
+            items_per_producer,
+        )),
+        16384 => Some(make_wcq_job_factory_typed::<16384>(
+            scenario,
+            repeat_index,
+            mode,
+            items_per_producer,
+        )),
+        65536 => Some(make_wcq_job_factory_typed::<65536>(
+            scenario,
+            repeat_index,
+            mode,
+            items_per_producer,
+        )),
+        262144 => Some(make_wcq_job_factory_typed::<262144>(
+            scenario,
+            repeat_index,
+            mode,
+            items_per_producer,
+        )),
+        1048576 => Some(make_wcq_job_factory_typed::<1048576>(
+            scenario,
+            repeat_index,
+            mode,
+            items_per_producer,
+        )),
+        4194304 => Some(make_wcq_job_factory_typed::<4194304>(
+            scenario,
+            repeat_index,
+            mode,
+            items_per_producer,
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(feature = "bench_fastfifo")]
 pub fn make_fastfifo_job_factory(
     block_size: usize,
@@ -1422,6 +2042,8 @@ pub fn make_fastfifo_job_factory(
         queue: QueueKind::FastFifo,
         ubq_label: None,
         fastfifo_block_size: Some(block_size),
+        lfqueue_segment_size: None,
+        wcq_capacity: None,
     };
     let queue_name = fastfifo_queue_label(block_size);
     let run_scenario = scenario.clone();
@@ -1656,11 +2278,15 @@ fn result_key_sort(lhs: &SampleKey, rhs: &SampleKey) -> Ordering {
         "segqueue" => 1,
         "concurrent-queue" => 2,
         value if value.starts_with("fastfifo_") => 3,
+        value if value.starts_with("lfqueue_") => 4,
+        value if value.starts_with("wcq_") => 5,
         _ => 99,
     };
     let queue_variant = |label: &str| {
         label
             .strip_prefix("fastfifo_")
+            .or_else(|| label.strip_prefix("lfqueue_"))
+            .or_else(|| label.strip_prefix("wcq_"))
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(usize::MAX)
     };
@@ -1696,8 +2322,49 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                                 queue: *baseline_queue,
                                 ubq_label: None,
                                 fastfifo_block_size: Some(block_size),
+                                lfqueue_segment_size: None,
+                                wcq_capacity: None,
                             };
                             keys.push(SampleKey::from_job(&spec));
+                        }
+                    }
+                    QueueKind::LfQueue => {
+                        for &segment_size in &plan.lfqueue_segment_sizes {
+                            let spec = JobSpec {
+                                scenario: bundle.scenario.clone(),
+                                repeat_index: bundle.repeat_index,
+                                mode: *mode,
+                                items_per_producer,
+                                queue: *baseline_queue,
+                                ubq_label: None,
+                                fastfifo_block_size: None,
+                                lfqueue_segment_size: Some(segment_size),
+                                wcq_capacity: None,
+                            };
+                            keys.push(SampleKey::from_job(&spec));
+                        }
+                    }
+                    QueueKind::Wcq => {
+                        for &capacity in &plan.wcq_capacities {
+                            if wcq_mode_supported(
+                                *mode,
+                                capacity,
+                                &bundle.scenario,
+                                items_per_producer,
+                            ) {
+                                let spec = JobSpec {
+                                    scenario: bundle.scenario.clone(),
+                                    repeat_index: bundle.repeat_index,
+                                    mode: *mode,
+                                    items_per_producer,
+                                    queue: *baseline_queue,
+                                    ubq_label: None,
+                                    fastfifo_block_size: None,
+                                    lfqueue_segment_size: None,
+                                    wcq_capacity: Some(capacity),
+                                };
+                                keys.push(SampleKey::from_job(&spec));
+                            }
                         }
                     }
                     _ => {
@@ -1709,6 +2376,8 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                             queue: *baseline_queue,
                             ubq_label: None,
                             fastfifo_block_size: None,
+                            lfqueue_segment_size: None,
+                            wcq_capacity: None,
                         };
                         keys.push(SampleKey::from_job(&spec));
                     }
@@ -1723,6 +2392,8 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                     queue: QueueKind::Ubq,
                     ubq_label: Some(label.clone()),
                     fastfifo_block_size: None,
+                    lfqueue_segment_size: None,
+                    wcq_capacity: None,
                 };
                 keys.push(SampleKey::from_job(&spec));
             }
@@ -1958,7 +2629,7 @@ pub fn build_and_run_matrix_plan(
 
 fn generated_cargo_toml(repo_root: &Path) -> String {
     format!(
-        "[package]\nname = \"ubq_generated_scheduler\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nubq = {{ path = {:?}, features = [\"bench_fastfifo\"] }}\n",
+        "[package]\nname = \"ubq_generated_scheduler\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nubq = {{ path = {:?}, features = [\"bench_fastfifo\", \"bench_lfqueue\", \"bench_wcq\"] }}\n",
         repo_root.display().to_string()
     )
 }
@@ -1998,6 +2669,22 @@ fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
                 out.push_str(&format!(
                     "    jobs.push(bench_harness::make_fastfifo_job_factory({}, {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
                     block_size, spec.repeat_index, spec.mode, spec.items_per_producer
+                ));
+            }
+            QueueKind::LfQueue => {
+                let segment_size = spec
+                    .lfqueue_segment_size
+                    .expect("lfqueue segment size must be present");
+                out.push_str(&format!(
+                    "    jobs.push(bench_harness::make_lfqueue_job_factory({}, {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
+                    segment_size, spec.repeat_index, spec.mode, spec.items_per_producer
+                ));
+            }
+            QueueKind::Wcq => {
+                let capacity = spec.wcq_capacity.expect("wCQ capacity must be present");
+                out.push_str(&format!(
+                    "    jobs.push(bench_harness::make_wcq_job_factory({}, {scenario_expr}, {}, bench_harness::Mode::{:?}, {}).expect(\"supported wCQ capacity\"));\n",
+                    capacity, spec.repeat_index, spec.mode, spec.items_per_producer
                 ));
             }
             QueueKind::Ubq => {
@@ -2157,8 +2844,12 @@ pub fn compute_frontier_round_plan(
     }
 
     let present_labels = collect_present_ubq_labels(index);
-    let baseline_labels =
-        baseline_queue_labels(&config.baseline_queues, &config.fastfifo_block_sizes);
+    let baseline_labels = baseline_queue_labels(
+        &config.baseline_queues,
+        &config.fastfifo_block_sizes,
+        &config.lfqueue_segment_sizes,
+        &config.wcq_capacities,
+    );
     let globally_desired_winners = collect_global_winner_labels(
         index,
         &config.scenarios,
@@ -2220,6 +2911,8 @@ pub fn compute_frontier_round_plan(
                     Some(label.as_str()),
                     &config.baseline_queues,
                     &config.fastfifo_block_sizes,
+                    &config.lfqueue_segment_sizes,
+                    &config.wcq_capacities,
                     &config.modes,
                     &config.items_per_producer_values,
                 ) {
@@ -2243,6 +2936,8 @@ pub fn compute_frontier_round_plan(
         available_parallelism: config.available_parallelism,
         baseline_queues: config.baseline_queues.clone(),
         fastfifo_block_sizes: config.fastfifo_block_sizes.clone(),
+        lfqueue_segment_sizes: config.lfqueue_segment_sizes.clone(),
+        wcq_capacities: config.wcq_capacities.clone(),
         bundles,
         reuse_existing: true,
     })
@@ -2393,12 +3088,22 @@ fn bundle_complete(
     label: Option<&str>,
     baseline_queues: &[QueueKind],
     fastfifo_block_sizes: &[usize],
+    lfqueue_segment_sizes: &[usize],
+    wcq_capacities: &[usize],
     modes: &[Mode],
     items_per_producer_values: &[u64],
 ) -> bool {
-    let baseline_labels = baseline_queue_labels(baseline_queues, fastfifo_block_sizes);
     for mode in modes {
         for &items in items_per_producer_values {
+            let baseline_labels = baseline_queue_labels_for_sample(
+                baseline_queues,
+                fastfifo_block_sizes,
+                lfqueue_segment_sizes,
+                wcq_capacities,
+                scenario,
+                *mode,
+                items,
+            );
             for baseline_label in &baseline_labels {
                 let key = SampleKey {
                     scenario: scenario.name.clone(),
@@ -2481,6 +3186,8 @@ fn mean_ops(
         || queue_label == "segqueue"
         || queue_label == "concurrent-queue"
         || queue_label.starts_with("fastfifo_")
+        || queue_label.starts_with("lfqueue_")
+        || queue_label.starts_with("wcq_")
     {
         queue_label.to_string()
     } else {
@@ -2515,7 +3222,7 @@ fn bench_throughput_for<Q: BenchQueue>(
     )
 }
 
-fn bench_throughput_with_queue<Q: BenchQueueOps>(
+fn bench_throughput_with_queue<Q: BenchQueueHandleFactory>(
     queue_handle: Arc<Q>,
     queue_name: &str,
     scenario: &ScenarioConfig,
@@ -2533,7 +3240,7 @@ fn bench_throughput_with_queue<Q: BenchQueueOps>(
 
     let mut producer_handles = Vec::with_capacity(scenario.producers);
     for producer_id in 0..scenario.producers {
-        let queue_handle = queue_handle.clone();
+        let queue_thread = queue_handle.thread_handle();
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
@@ -2551,7 +3258,7 @@ fn bench_throughput_with_queue<Q: BenchQueueOps>(
                 .expect("item count overflow");
             for offset in 0..items_per_producer {
                 let value = base.checked_add(offset).expect("item count overflow");
-                queue_handle.send_value(value);
+                queue_thread.send_value(value);
             }
             let end_ns = start.elapsed().as_nanos() as u64;
             producer_max.fetch_max(end_ns, AtomicOrdering::Relaxed);
@@ -2560,7 +3267,7 @@ fn bench_throughput_with_queue<Q: BenchQueueOps>(
 
     let mut consumer_handles = Vec::with_capacity(scenario.consumers);
     for consumer_id in 0..scenario.consumers {
-        let queue_handle = queue_handle.clone();
+        let queue_thread = queue_handle.thread_handle();
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
@@ -2577,7 +3284,7 @@ fn bench_throughput_with_queue<Q: BenchQueueOps>(
             start_gate.wait();
             let start: Instant = *start.get().expect("start set");
             loop {
-                let value = queue_handle.recv_value();
+                let value = queue_thread.recv_value();
                 if value == SENTINEL {
                     break;
                 }
@@ -2595,8 +3302,9 @@ fn bench_throughput_with_queue<Q: BenchQueueOps>(
     for handle in producer_handles {
         handle.join().expect("producer join failed");
     }
+    let sentinel_sender = queue_handle.thread_handle();
     for _ in 0..scenario.consumers {
-        queue_handle.send_value(SENTINEL);
+        sentinel_sender.send_value(SENTINEL);
     }
     for handle in consumer_handles {
         handle.join().expect("consumer join failed");
@@ -2636,7 +3344,7 @@ fn bench_fill_drain_for<Q: BenchQueue>(
     )
 }
 
-fn bench_fill_drain_with_queue<Q: BenchQueueOps>(
+fn bench_fill_drain_with_queue<Q: BenchQueueHandleFactory>(
     queue_handle: Arc<Q>,
     queue_name: &str,
     scenario: &ScenarioConfig,
@@ -2650,8 +3358,9 @@ fn bench_fill_drain_with_queue<Q: BenchQueueOps>(
         items_per_producer,
         core_offset,
     );
+    let sentinel_sender = queue_handle.thread_handle();
     for _ in 0..scenario.consumers {
-        queue_handle.send_value(SENTINEL);
+        sentinel_sender.send_value(SENTINEL);
     }
     let (drain_elapsed, consumed) =
         run_consumers_only_for(&queue_handle, scenario.consumers, core_offset);
@@ -2680,7 +3389,7 @@ fn throughput_ops(consumed: u64, elapsed_ns: u64) -> Option<f64> {
     }
 }
 
-fn run_producers_only_for<Q: BenchQueueOps>(
+fn run_producers_only_for<Q: BenchQueueHandleFactory>(
     queue_handle: &Arc<Q>,
     producers: usize,
     items_per_producer: u64,
@@ -2693,7 +3402,7 @@ fn run_producers_only_for<Q: BenchQueueOps>(
     let mut handles = Vec::with_capacity(producers);
 
     for producer_id in 0..producers {
-        let queue_handle = queue_handle.clone();
+        let queue_thread = queue_handle.thread_handle();
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
@@ -2711,7 +3420,7 @@ fn run_producers_only_for<Q: BenchQueueOps>(
                 .expect("item count overflow");
             for offset in 0..items_per_producer {
                 let value = base.checked_add(offset).expect("item count overflow");
-                queue_handle.send_value(value);
+                queue_thread.send_value(value);
             }
             let end_ns = start.elapsed().as_nanos() as u64;
             max_end.fetch_max(end_ns, AtomicOrdering::Relaxed);
@@ -2727,7 +3436,7 @@ fn run_producers_only_for<Q: BenchQueueOps>(
     Duration::from_nanos(max_end.load(AtomicOrdering::Relaxed))
 }
 
-fn run_consumers_only_for<Q: BenchQueueOps>(
+fn run_consumers_only_for<Q: BenchQueueHandleFactory>(
     queue_handle: &Arc<Q>,
     consumers: usize,
     core_offset: usize,
@@ -2740,7 +3449,7 @@ fn run_consumers_only_for<Q: BenchQueueOps>(
     let mut handles = Vec::with_capacity(consumers);
 
     for consumer_id in 0..consumers {
-        let queue_handle = queue_handle.clone();
+        let queue_thread = queue_handle.thread_handle();
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
@@ -2755,7 +3464,7 @@ fn run_consumers_only_for<Q: BenchQueueOps>(
             start_gate.wait();
             let start: Instant = *start.get().expect("start set");
             loop {
-                let value = queue_handle.recv_value();
+                let value = queue_thread.recv_value();
                 if value == SENTINEL {
                     break;
                 }
@@ -2900,6 +3609,58 @@ pub fn run_matrix_plan_in_process(
                     );
                 }
             }
+            QueueKind::LfQueue => {
+                let segment_size = spec
+                    .lfqueue_segment_size
+                    .ok_or_else(|| "lfqueue job spec is missing segment size".to_string())?;
+                #[cfg(feature = "bench_lfqueue")]
+                {
+                    make_lfqueue_job_factory(
+                        segment_size,
+                        spec.scenario.clone(),
+                        spec.repeat_index,
+                        spec.mode,
+                        spec.items_per_producer,
+                    )
+                }
+                #[cfg(not(feature = "bench_lfqueue"))]
+                {
+                    let _ = segment_size;
+                    return Err(
+                        "lfqueue selected but the bench_lfqueue feature is not enabled; \
+                         rebuild with --features bench_registry,bench_lfqueue"
+                            .to_string(),
+                    );
+                }
+            }
+            QueueKind::Wcq => {
+                let capacity = spec
+                    .wcq_capacity
+                    .ok_or_else(|| "wCQ job spec is missing capacity".to_string())?;
+                #[cfg(feature = "bench_wcq")]
+                {
+                    make_wcq_job_factory(
+                        capacity,
+                        spec.scenario.clone(),
+                        spec.repeat_index,
+                        spec.mode,
+                        spec.items_per_producer,
+                    )
+                    .ok_or_else(|| {
+                        format!(
+                            "unsupported wCQ capacity {capacity}; supported capacities are \
+                             256,1024,4096,16384,65536,262144,1048576,4194304"
+                        )
+                    })?
+                }
+                #[cfg(not(feature = "bench_wcq"))]
+                {
+                    let _ = capacity;
+                    return Err("wCQ selected but the bench_wcq feature is not enabled; \
+                         rebuild with --features bench_registry,bench_wcq"
+                        .to_string());
+                }
+            }
             QueueKind::Ubq => {
                 let label = spec
                     .ubq_label
@@ -2996,6 +3757,15 @@ mod tests {
     }
 
     #[test]
+    fn scenario_search_includes_zero_pool_counterpart_for_nonzero_pool() {
+        let scenario = ScenarioConfig::new(1, 1);
+        let labels = immediate_search_labels_for_scenario("balanced,8,127,crossbeam", &scenario)
+            .expect("scenario labels");
+
+        assert!(labels.contains("balanced,0,127,crossbeam"));
+    }
+
+    #[test]
     fn parses_fastfifo_aliases_and_block_sizes() {
         assert_eq!(QueueKind::parse("fastfifo"), Some(QueueKind::FastFifo));
         assert_eq!(QueueKind::parse("bbq"), Some(QueueKind::FastFifo));
@@ -3010,6 +3780,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_publication_queue_aliases_and_sizes() {
+        assert_eq!(QueueKind::parse("lfqueue"), Some(QueueKind::LfQueue));
+        assert_eq!(QueueKind::parse("lscq"), Some(QueueKind::LfQueue));
+        assert_eq!(QueueKind::parse("wcq"), Some(QueueKind::Wcq));
+        assert_eq!(
+            parse_lfqueue_segment_sizes(Some("32,256,32")).expect("segment sizes"),
+            vec![32, 256]
+        );
+        assert_eq!(
+            parse_wcq_capacities(Some("4096,65536,4096")).expect("capacities"),
+            vec![4096, 65536]
+        );
+        assert!(parse_wcq_capacities(Some("8192")).is_err());
+    }
+
+    #[test]
     fn direct_plan_expands_fastfifo_block_variants() {
         let plan = build_direct_matrix_plan(
             "local",
@@ -3018,6 +3804,8 @@ mod tests {
             &[QueueKind::FastFifo],
             &[],
             &[64, 256],
+            &[],
+            &[],
             &[ScenarioConfig::new(1, 1)],
             &[Mode::Throughput],
             &[1],
@@ -3035,12 +3823,65 @@ mod tests {
     }
 
     #[test]
+    fn direct_plan_expands_publication_queue_variants() {
+        let plan = build_direct_matrix_plan(
+            "local",
+            PathBuf::from(DEFAULT_RUNS_DIR),
+            16,
+            &[QueueKind::LfQueue, QueueKind::Wcq],
+            &[],
+            &[],
+            &[32, 256],
+            &[4096, 65536],
+            &[ScenarioConfig::new(1, 1)],
+            &[Mode::Throughput],
+            &[1],
+            1,
+            false,
+        )
+        .expect("plan");
+        let keys = expected_keys_for_bundle(&plan, &plan.bundles[0]);
+        let labels = keys
+            .into_iter()
+            .map(|key| key.queue_label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec!["lfqueue_32", "lfqueue_256", "wcq_4096", "wcq_65536"]
+        );
+    }
+
+    #[test]
+    fn direct_plan_omits_wcq_fill_drain_when_capacity_cannot_hold_prefill() {
+        let plan = build_direct_matrix_plan(
+            "local",
+            PathBuf::from(DEFAULT_RUNS_DIR),
+            16,
+            &[QueueKind::Wcq],
+            &[],
+            &[],
+            &[],
+            &[4096],
+            &[ScenarioConfig::new(8, 8)],
+            &[Mode::FillDrain],
+            &[1000],
+            1,
+            false,
+        )
+        .expect("plan");
+        let keys = expected_keys_for_bundle(&plan, &plan.bundles[0]);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
     fn direct_plan_requires_ubq_labels_if_ubq_selected() {
         let err = build_direct_matrix_plan(
             "local",
             PathBuf::from(DEFAULT_RUNS_DIR),
             16,
             &[QueueKind::Ubq, QueueKind::SegQueue],
+            &[],
+            &[],
             &[],
             &[],
             &[ScenarioConfig::new(1, 1)],
@@ -3061,6 +3902,8 @@ mod tests {
             128,
             &[QueueKind::Ubq],
             &["balanced,8,63,crossbeam".to_string()],
+            &[],
+            &[],
             &[],
             &[ScenarioConfig::new(64, 1)],
             &[Mode::Throughput],
@@ -3122,6 +3965,8 @@ mod tests {
             available_parallelism: 2,
             baseline_queues: vec![QueueKind::SegQueue],
             fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
             bundles: vec![PlanBundle {
                 scenario: ScenarioConfig::new(1, 1),
                 repeat_index: 1,
@@ -3176,6 +4021,8 @@ mod tests {
             available_parallelism: 2,
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
             fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
             bundles: vec![PlanBundle {
                 scenario: scenario.clone(),
                 repeat_index: 1,
@@ -3237,6 +4084,8 @@ mod tests {
             available_parallelism: 4,
             baseline_queues: Vec::new(),
             fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
             bundles: vec![
                 PlanBundle {
                     scenario: scenario.clone(),
@@ -3272,6 +4121,8 @@ mod tests {
                     queue: QueueKind::Ubq,
                     ubq_label: Some(ubq_label.clone()),
                     fastfifo_block_size: None,
+                    lfqueue_segment_size: None,
+                    wcq_capacity: None,
                 },
                 run: std::sync::Arc::new(move |_| {
                     start_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3321,6 +4172,8 @@ mod tests {
             scenarios: vec![ScenarioConfig::new(1, 1), ScenarioConfig::new(1, 4)],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
             fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
             seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3412,6 +4265,8 @@ mod tests {
             scenarios: vec![scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
             fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
             seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3423,6 +4278,11 @@ mod tests {
             plan.bundles
                 .iter()
                 .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,yield"))
+        );
+        assert!(
+            plan.bundles
+                .iter()
+                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,0,127,crossbeam"))
         );
     }
 
@@ -3505,6 +4365,8 @@ mod tests {
             scenarios: vec![scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
             fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
             seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3625,6 +4487,8 @@ mod tests {
             scenarios: vec![scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
             fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
             seed_labels: vec![weaker_label.to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3654,6 +4518,8 @@ mod tests {
             scenarios: vec![ScenarioConfig::new(64, 1)],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
             fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
             seed_labels: vec!["balanced,8,63,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3749,6 +4615,8 @@ mod tests {
             scenarios: vec![winner_scenario.clone(), other_scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
             fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
             seed_labels: vec!["balanced,1,31,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3852,6 +4720,8 @@ mod tests {
             scenarios: vec![winner_scenario, constrained_scenario.clone()],
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
             fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
             seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
@@ -3875,6 +4745,8 @@ mod tests {
             queue: QueueKind::SegQueue,
             ubq_label: None,
             fastfifo_block_size: None,
+            lfqueue_segment_size: None,
+            wcq_capacity: None,
         };
         let ubq = JobSpec {
             scenario: ScenarioConfig::new(1, 1),
@@ -3884,6 +4756,8 @@ mod tests {
             queue: QueueKind::Ubq,
             ubq_label: Some("balanced,1,31,crossbeam".to_string()),
             fastfifo_block_size: None,
+            lfqueue_segment_size: None,
+            wcq_capacity: None,
         };
 
         assert!(can_start_job(&baseline, 0, 8));

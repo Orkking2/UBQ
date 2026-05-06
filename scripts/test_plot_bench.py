@@ -1,6 +1,14 @@
+import csv
+import tempfile
 import unittest
+from pathlib import Path
 
-from scripts.plot_bench import immediate_winner_variant_report
+from scripts.plot_bench import (
+    immediate_winner_variant_report,
+    label_sort_key,
+    queue_metadata,
+    write_immediate_variant_csv,
+)
 
 
 def stats(ops):
@@ -17,6 +25,7 @@ class ImmediateWinnerVariantReportTest(unittest.TestCase):
         entries = {
             "segqueue": stats(1),
             "ubq_balanced,8,127,crossbeam": stats(100),
+            "ubq_balanced,0,127,crossbeam": stats(90),
             "ubq_balanced,4,127,crossbeam": stats(90),
             "ubq_balanced,16,127,crossbeam": stats(90),
             "ubq_balanced,8,63,crossbeam": stats(90),
@@ -50,9 +59,86 @@ class ImmediateWinnerVariantReportTest(unittest.TestCase):
         )
         self.assertEqual([], report["missing_required_labels"])
 
+    def test_pool_zero_is_included_for_nonzero_winner(self):
+        entries = {
+            "ubq_balanced,8,127,crossbeam": stats(100),
+            "ubq_balanced,4,127,crossbeam": stats(90),
+            "ubq_balanced,16,127,crossbeam": stats(90),
+            "ubq_balanced,8,63,crossbeam": stats(90),
+            "ubq_balanced,8,255,crossbeam": stats(90),
+            "ubq_balanced,8,127,yield": stats(90),
+        }
+
+        report = immediate_winner_variant_report(entries, "1p1c")
+
+        self.assertIn(
+            "ubq_balanced,0,127,crossbeam",
+            report["required_labels"],
+        )
+        self.assertIn(
+            "ubq_balanced,0,127,crossbeam",
+            report["missing_required_labels"],
+        )
+        self.assertEqual(
+            ["ubq_balanced,0,127,crossbeam"],
+            report["zero_pool_labels"],
+        )
+
+    def test_present_zero_pool_variant_is_selected_for_primary_plot(self):
+        entries = {
+            "segqueue": stats(1),
+            "ubq_balanced,8,127,crossbeam": stats(100),
+            "ubq_balanced,0,127,crossbeam": stats(90),
+            "ubq_balanced,4,127,crossbeam": stats(80),
+            "ubq_balanced,16,127,crossbeam": stats(70),
+            "ubq_balanced,8,63,crossbeam": stats(60),
+            "ubq_balanced,8,255,crossbeam": stats(50),
+            "ubq_balanced,8,127,yield": stats(40),
+            "ubq_balanced,32,127,crossbeam": stats(30),
+        }
+
+        report = immediate_winner_variant_report(entries, "1p1c")
+
+        self.assertIn(
+            "ubq_balanced,0,127,crossbeam",
+            report["selected_labels"],
+        )
+        self.assertNotIn(
+            "ubq_balanced,32,127,crossbeam",
+            report["selected_labels"],
+        )
+
+    def test_immediate_variant_csv_marks_zero_pool_rows(self):
+        entries = {
+            "ubq_balanced,8,127,crossbeam": stats(100),
+            "ubq_balanced,0,127,crossbeam": stats(90),
+        }
+        labels = [
+            "ubq_balanced,0,127,crossbeam",
+            "ubq_balanced,8,127,crossbeam",
+            "ubq_balanced,16,127,crossbeam",
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "coverage.csv"
+            write_immediate_variant_csv(
+                out_path,
+                entries,
+                "ubq_balanced,8,127,crossbeam",
+                labels,
+            )
+            with out_path.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+
+        self.assertEqual("yes", rows[0]["is_zero_pool"])
+        self.assertEqual("present", rows[0]["status"])
+        self.assertEqual("no", rows[1]["is_zero_pool"])
+        self.assertEqual("missing", rows[2]["status"])
+
     def test_explicit_cas_alias_counts_as_present(self):
         entries = {
             "ubq_balanced,8,127,crossbeam,cas": stats(100),
+            "ubq_balanced,0,127,crossbeam,cas": stats(90),
             "ubq_balanced,4,127,crossbeam": stats(90),
             "ubq_balanced,16,127,crossbeam": stats(90),
             "ubq_balanced,8,63,crossbeam": stats(90),
@@ -67,6 +153,7 @@ class ImmediateWinnerVariantReportTest(unittest.TestCase):
     def test_scenario_excludes_block_neighbor_below_producer_count(self):
         entries = {
             "ubq_balanced,8,127,crossbeam": stats(100),
+            "ubq_balanced,0,127,crossbeam": stats(90),
             "ubq_balanced,4,127,crossbeam": stats(90),
             "ubq_balanced,16,127,crossbeam": stats(90),
             "ubq_balanced,8,255,crossbeam": stats(90),
@@ -80,6 +167,35 @@ class ImmediateWinnerVariantReportTest(unittest.TestCase):
             report["required_labels"],
         )
         self.assertEqual([], report["missing_required_labels"])
+
+
+class PublicationQueuePlotTest(unittest.TestCase):
+    def test_publication_queue_labels_sort_after_existing_baselines(self):
+        labels = [
+            "wcq_65536",
+            "lfqueue_32",
+            "fastfifo_256",
+            "concurrent-queue",
+            "segqueue",
+        ]
+
+        self.assertEqual(
+            [
+                "segqueue",
+                "concurrent-queue",
+                "fastfifo_256",
+                "lfqueue_32",
+                "wcq_65536",
+            ],
+            sorted(labels, key=label_sort_key),
+        )
+
+    def test_publication_queue_metadata_identifies_paper_family(self):
+        self.assertEqual("Nikolaev, DISC 2019", queue_metadata("lfqueue_32")["publication"])
+        self.assertEqual(
+            "Nikolaev/Ravindran, SPAA 2022",
+            queue_metadata("wcq_65536")["publication"],
+        )
 
 
 if __name__ == "__main__":

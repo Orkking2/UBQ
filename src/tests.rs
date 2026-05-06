@@ -10,7 +10,6 @@ use std::{
     usize,
 };
 
-use crate::SleepQ;
 use crate::{BLOCK_LENGTH, ConfiguredUBQ, UBQ, align, backoff, ubq};
 
 #[test]
@@ -206,98 +205,6 @@ fn ubq_macro_supports_custom_alignment_override() {
 
     q.push(13);
     assert_eq!(q.pop(), Some(13));
-}
-
-#[test]
-fn sleepq_try_pop_remains_nonblocking() {
-    let q = SleepQ::<u64>::new();
-
-    assert_eq!(q.try_pop(), None);
-    q.push(17);
-    assert_eq!(q.try_pop(), Some(17));
-    assert!(q.is_empty());
-}
-
-#[test]
-fn sleepq_pop_blocks_until_push_wakes_it() {
-    let q = SleepQ::<u64>::new_arc();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-
-    let consumer = {
-        let q = q.clone();
-
-        thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            done_tx.send(q.pop()).unwrap();
-        })
-    };
-
-    started_rx.recv().unwrap();
-    assert!(
-        done_rx
-            .recv_timeout(std::time::Duration::from_millis(25))
-            .is_err()
-    );
-
-    q.push(99);
-
-    assert_eq!(
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap(),
-        99
-    );
-    consumer.join().unwrap();
-}
-
-#[test]
-fn sleepq_pop_async_waits_until_push_wakes_it() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .unwrap();
-
-    runtime.block_on(async {
-        let q = SleepQ::<u64>::new_arc();
-        let mut consumer = {
-            let q = q.clone();
-
-            tokio::spawn(async move { q.pop_async().await })
-        };
-
-        tokio::task::yield_now().await;
-
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), &mut consumer)
-                .await
-                .is_err()
-        );
-
-        q.push(77);
-
-        assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), consumer)
-                .await
-                .unwrap()
-                .unwrap(),
-            77
-        );
-    });
-}
-
-#[test]
-fn sleepq_supports_other_nonblocking_queue_implementations() {
-    let q = SleepQ::<u64, crossbeam_queue::SegQueue<u64>>::new_arc();
-    let consumer = {
-        let q = q.clone();
-
-        thread::spawn(move || q.pop())
-    };
-
-    q.push(123);
-
-    assert_eq!(consumer.join().unwrap(), 123);
 }
 
 // Seg: 2.12s

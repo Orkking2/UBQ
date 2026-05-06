@@ -19,11 +19,13 @@ core_affinity = "0.8"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8.21"
 fastfifo = { path = "vendor/FastFifo", optional = true }
+lfqueue = { version = "0.8.1", optional = true }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 toml = "0.8"
+wcq = { version = "0.1.0", optional = true }
 
 [features]
 default = []
@@ -32,6 +34,8 @@ bench_small = []
 bench_medium = []
 bench_large = []
 bench_fastfifo = ["dep:fastfifo"]
+bench_lfqueue = ["dep:lfqueue"]
+bench_wcq = ["dep:wcq"]
 # Compile the full static UBQ variant registry (928 monomorphizations).
 # Required for bench_frontier and bench_matrix to run in-process.
 bench_registry = []

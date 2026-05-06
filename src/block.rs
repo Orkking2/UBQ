@@ -11,9 +11,8 @@ pub const DEFAULT_BLOCK_SIZE: usize = 2047;
 /// Default number of element slots per block for [`crate::UBQ`].
 pub const BLOCK_LENGTH: usize = DEFAULT_BLOCK_SIZE;
 
-// Bits indicating the state of a slot:
-// * If a value has been written into the slot, `WRITE` is set.
 pub const WRITE: u8 = 1;
+pub(crate) const NOP: u8 = u8::MAX;
 
 /// A fixed-size ring-buffer segment.
 pub(crate) struct Block<T, const BLOCK_SIZE: usize = DEFAULT_BLOCK_SIZE, A = A4096> {
