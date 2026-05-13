@@ -99,10 +99,39 @@ def scaling_scenario_sort_key(name: str):
 def mode_sort_key(name: str):
     priority = {
         "throughput": 0,
-        "fill_drain": 1,
-        "mutable_placeholder": 2,
+        "complex_throughput": 1,
+        "data_latency": 2,
+        "producer_fairness": 3,
+        "consumer_fairness": 4,
+        "fairness": 5,
+        "fill_drain": 6,
+        "mutable_placeholder": 7,
     }
     return (priority.get(name, 99), name)
+
+
+def metric_column(mode: str):
+    if mode == "data_latency":
+        return "avg_data_latency_ns"
+    if mode in ("producer_fairness", "consumer_fairness", "fairness"):
+        return "fairness_ratio"
+    return "ops_per_sec"
+
+
+def metric_axis_label(mode: str):
+    if mode == "data_latency":
+        return "Average data latency (ns)"
+    if mode in ("producer_fairness", "consumer_fairness", "fairness"):
+        return "Fairness ratio (max/min)"
+    return "Ops/sec"
+
+
+def metric_file_slug(mode: str):
+    if mode == "data_latency":
+        return "data_latency"
+    if mode in ("producer_fairness", "consumer_fairness", "fairness"):
+        return mode
+    return "throughput"
 
 
 def label_sort_key(label: str):
@@ -398,7 +427,16 @@ def clear_generated_outputs(out_root: Path):
         return
 
     removed = 0
-    for pattern in ("*_throughput.csv", "*_throughput.png"):
+    for pattern in (
+        "*_throughput.csv",
+        "*_throughput.png",
+        "*_data_latency.csv",
+        "*_data_latency.png",
+        "*_producer_fairness.csv",
+        "*_producer_fairness.png",
+        "*_consumer_fairness.csv",
+        "*_consumer_fairness.png",
+    ):
         for path in out_root.rglob(pattern):
             if not path.is_file():
                 continue
@@ -437,10 +475,6 @@ def load_records(path: Path):
         if rec.get("skipped_reason"):
             continue
 
-        ops = rec.get("ops_per_sec")
-        if ops is None:
-            continue
-
         queue = rec.get("queue")
         scenario = scenario_meta
         mode = str(rec.get("mode", "throughput"))
@@ -450,12 +484,36 @@ def load_records(path: Path):
         else:
             queue_label = str(queue)
 
+        if mode == "data_latency":
+            raw_value = rec.get("avg_data_latency_ns")
+            output_mode = "data_latency"
+        elif mode == "fairness":
+            for output_mode, field in (
+                ("producer_fairness", "producer_fairness_ratio"),
+                ("consumer_fairness", "consumer_fairness_ratio"),
+            ):
+                raw_value = rec.get(field)
+                if raw_value is None:
+                    continue
+                try:
+                    metric_value = float(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                yield machine_label, output_mode, scenario, queue_label, metric_value
+            continue
+        else:
+            raw_value = rec.get("ops_per_sec")
+            output_mode = mode
+
+        if raw_value is None:
+            continue
+
         try:
-            ops_value = float(ops)
+            metric_value = float(raw_value)
         except (TypeError, ValueError):
             continue
 
-        yield machine_label, mode, scenario, queue_label, ops_value
+        yield machine_label, output_mode, scenario, queue_label, metric_value
 
 
 def summarize_ops(samples):
@@ -476,12 +534,12 @@ def summarize_ops(samples):
     }
 
 
-def write_csv(out_path: Path, values):
+def write_csv(out_path: Path, mode: str, values):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
-            ["queue", "ops_per_sec", "stddev_ops_per_sec", "sem_ops_per_sec", "samples"]
+            ["queue", metric_column(mode), "stddev", "sem", "samples"]
         )
         for label, stats in values:
             writer.writerow(
@@ -575,12 +633,12 @@ def scenario_line_labels(entries_by_scenario, max_series: int):
     return labels[:max_series]
 
 
-def write_scenario_line_csv(out_path: Path, scenarios, labels, entries_by_scenario):
+def write_scenario_line_csv(out_path: Path, mode: str, scenarios, labels, entries_by_scenario):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
-            ["scenario", "queue", "ops_per_sec", "stddev_ops_per_sec", "sem_ops_per_sec", "samples"]
+            ["scenario", "queue", metric_column(mode), "stddev", "sem", "samples"]
         )
         for scenario in scenarios:
             entries = entries_by_scenario[scenario]
@@ -718,7 +776,7 @@ def plot_scenario_lines(plt, out_path: Path, machine: str, mode: str, scenarios,
 
     ax.set_xticks(x_positions, scenarios, rotation=40, ha="right")
     ax.set_xlabel("Scenario (XpYc)")
-    ax.set_ylabel("Ops/sec")
+    ax.set_ylabel(metric_axis_label(mode))
     ax.set_title(f"{machine}: {mode} scaling")
     ax.grid(axis="y", linestyle=":", alpha=0.4)
     ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=9, frameon=False)
@@ -778,7 +836,7 @@ def main():
             sample_points += 1
 
     if sample_points == 0:
-        print("No throughput records found in input files.")
+        print("No benchmark records found in input files.")
         return
 
     if not args.no_clean:
@@ -797,16 +855,17 @@ def main():
                 report = immediate_winner_variant_report(entries, scenario)
                 labels = report["selected_labels"]
                 values = [(label, entries[label]) for label in labels]
-                csv_path = out_root / machine / "csv" / mode / f"{scenario}_throughput.csv"
-                write_csv(csv_path, values)
+                slug = metric_file_slug(mode)
+                csv_path = out_root / machine / "csv" / mode / f"{scenario}_{slug}.csv"
+                write_csv(csv_path, mode, values)
                 print(f"Wrote CSV: {csv_path}")
-                if report["required_labels"]:
+                if report["required_labels"] and mode in ("throughput", "complex_throughput"):
                     coverage_csv_path = (
                         out_root
                         / machine
                         / "csv"
                         / mode
-                        / f"{scenario}_immediate_variants_throughput.csv"
+                        / f"{scenario}_immediate_variants_{slug}.csv"
                     )
                     write_immediate_variant_csv(
                         coverage_csv_path,
@@ -827,8 +886,9 @@ def main():
             scenarios = sorted(grouped[machine][mode], key=scaling_scenario_sort_key)
             entries_by_scenario = grouped[machine][mode]
             labels = scenario_line_labels(entries_by_scenario, args.max_line_series)
-            csv_path = out_root / machine / "csv" / mode / "scenarios_line_throughput.csv"
-            write_scenario_line_csv(csv_path, scenarios, labels, entries_by_scenario)
+            slug = metric_file_slug(mode)
+            csv_path = out_root / machine / "csv" / mode / f"scenarios_line_{slug}.csv"
+            write_scenario_line_csv(csv_path, mode, scenarios, labels, entries_by_scenario)
             print(f"Wrote CSV: {csv_path}")
             all_labels = sorted(
                 {
@@ -885,14 +945,16 @@ def main():
                     rotation=30,
                     ha="right",
                 )
-                ax.set_ylabel("Ops/sec")
+                ax.set_ylabel(metric_axis_label(mode))
                 ax.set_title(f"{machine}: {mode} {scenario}")
                 ax.grid(axis="y", linestyle=":", alpha=0.4)
-                annotate_immediate_variant_status(
-                    ax,
-                    f"{scenario}_immediate_variants_throughput.csv",
-                    report,
-                )
+                slug = metric_file_slug(mode)
+                if mode in ("throughput", "complex_throughput"):
+                    annotate_immediate_variant_status(
+                        ax,
+                        f"{scenario}_immediate_variants_{slug}.csv",
+                        report,
+                    )
 
                 best_idx = max(range(len(values)), key=lambda i: values[i])
                 best_label = labels[best_idx]
@@ -902,12 +964,12 @@ def main():
                     color="tab:red",
                     linestyle="--",
                     linewidth=1.25,
-                    label=f"Best mean: {display_label(best_label)} ({best_value:,.0f} ops/sec)",
+                    label=f"Best mean: {display_label(best_label)} ({best_value:,.0f})",
                 )
                 ax.legend(loc="upper left")
                 fig.tight_layout()
 
-                png_path = out_root / machine / mode / f"{scenario}_throughput.png"
+                png_path = out_root / machine / mode / f"{scenario}_{slug}.png"
                 png_path.parent.mkdir(parents=True, exist_ok=True)
                 fig.savefig(png_path, dpi=200)
                 print(f"Wrote PNG: {png_path}")
@@ -918,7 +980,8 @@ def main():
             scenarios = sorted(grouped[machine][mode], key=scaling_scenario_sort_key)
             entries_by_scenario = grouped[machine][mode]
             labels = scenario_line_labels(entries_by_scenario, args.max_line_series)
-            png_path = out_root / machine / mode / "scenarios_line_throughput.png"
+            slug = metric_file_slug(mode)
+            png_path = out_root / machine / mode / f"scenarios_line_{slug}.png"
             plot_scenario_lines(
                 plt,
                 png_path,

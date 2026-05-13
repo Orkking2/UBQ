@@ -1,0 +1,36 @@
+[defaults]
+runs_dir = "bench_results/runs"
+plot_out_dir = "bench_results/plots"
+remote_repo_dir = "~/UBQ"
+remote_runs_dir = "bench_results/runs"
+
+# Paper-style microbenchmark suite from Wang et al., "BBQ: A Block-based
+# Bounded Queue for Exchanging Data and Profiling", USENIX ATC 2022.
+#
+# This suite expands to SPSC plus MPSC/SPMC scaling through the x86-88T paper
+# limit: 1p1c, 1pNc, and Np1c for N=1..87. Use
+# "bbq-atc22-oversub-x86-12t" with --frontier-arg=--parallelism --frontier-arg=60
+# for the x86-12T oversubscription shape.
+scenarios = ["bbq-atc22-x86-88t"]
+
+queues = ["ubq", "segqueue", "concurrent-queue", "rbbq", "lfqueue", "wcq"]
+modes = ["throughput", "complex_throughput", "data_latency", "fairness"]
+items_per_producer = [1000000]
+repeats = 3
+
+ubq_labels = ["balanced,8,127,crossbeam"]
+fastfifo_block_sizes = [64, 256, 1024, 4096]
+lfqueue_segment_sizes = [32, 256, 1024]
+wcq_capacities = [4096, 65536, 1048576]
+
+[machines.local]
+local = true
+machine_label = "local"
+
+[machines.lab]
+host = "lab"
+machine_label = "lab"
+
+[machines.hebrides]
+host = "hebrides"
+machine_label = "hebrides"

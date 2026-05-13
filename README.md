@@ -129,6 +129,13 @@ cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq
   --items-per-producer 1000000
 ```
 
+For BBQ ATC 2022-style microbenchmarks, the scenario parser also accepts
+`spsc`, `mpsc:N-M`, `spmc:N-M`, `mpmc:N-M`, `bbq-atc22-x86-88t`, and
+`bbq-atc22-oversub-x86-12t`. The paper-style metric modes are
+`throughput`, `complex_throughput`, `data_latency`, and `fairness`. See
+[docs/bbq_atc22_reproduction.md](docs/bbq_atc22_reproduction.md) and
+`bench_fleet_bbq_atc22.toml` for the ready-to-run suite.
+
 Run the frontier search on one machine:
 
 ```bash

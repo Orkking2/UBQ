@@ -45,6 +45,8 @@ pub const DEFAULT_SCENARIOS: &[&str] = &[
     "8p16c", "16p8c", "16p16c", "32p1c", "1p32c", "16p32c", "32p16c", "32p32c", "64p1c", "1p64c",
     "32p64c", "64p32c", "64p64c",
 ];
+pub const BBQ_ATC22_X86_88T_SCENARIO_SUITE: &str = "bbq-atc22-x86-88t";
+pub const BBQ_ATC22_OVERSUB_X86_12T_SCENARIO_SUITE: &str = "bbq-atc22-oversub-x86-12t";
 
 const SENTINEL: u64 = u64::MAX;
 const DEFAULT_FASTFIFO_BLOCK_SIZES: [usize; 4] = [64, 256, 1024, 4096];
@@ -346,6 +348,9 @@ impl BenchQueueOps for RbbqBenchQueue {
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     Throughput,
+    ComplexThroughput,
+    DataLatency,
+    Fairness,
     FillDrain,
 }
 
@@ -353,6 +358,9 @@ impl Mode {
     pub fn name(self) -> &'static str {
         match self {
             Mode::Throughput => "throughput",
+            Mode::ComplexThroughput => "complex_throughput",
+            Mode::DataLatency => "data_latency",
+            Mode::Fairness => "fairness",
             Mode::FillDrain => "fill_drain",
         }
     }
@@ -360,6 +368,11 @@ impl Mode {
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
             "throughput" => Some(Self::Throughput),
+            "complex_throughput" | "complex-throughput" | "complex" => {
+                Some(Self::ComplexThroughput)
+            }
+            "data_latency" | "data-latency" => Some(Self::DataLatency),
+            "fairness" => Some(Self::Fairness),
             "fill_drain" | "fill-drain" => Some(Self::FillDrain),
             _ => None,
         }
@@ -629,6 +642,12 @@ pub struct BenchRecord {
     pub fill_elapsed_ns: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain_elapsed_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_data_latency_ns: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer_fairness_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumer_fairness_ratio: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -915,6 +934,79 @@ pub fn default_scenarios() -> Vec<ScenarioConfig> {
         .collect()
 }
 
+fn parse_positive_range(input: &str) -> Option<(usize, usize)> {
+    let (start, end) = match input.split_once('-') {
+        Some((start, end)) => (start.trim(), end.trim()),
+        None => (input.trim(), input.trim()),
+    };
+    if start.is_empty() || end.is_empty() {
+        return None;
+    }
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?;
+    if start == 0 || end == 0 || start > end {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn expand_family_range(
+    family: &str,
+    range: &str,
+    out: &mut Vec<ScenarioConfig>,
+) -> Result<bool, String> {
+    let Some((start, end)) = parse_positive_range(range) else {
+        return Err(format!("invalid {family} scenario range '{range}'"));
+    };
+    for threads in start..=end {
+        let scenario = match family {
+            "mpsc" => ScenarioConfig::new(threads, 1),
+            "spmc" => ScenarioConfig::new(1, threads),
+            "mpmc" => ScenarioConfig::new(threads, threads),
+            _ => return Ok(false),
+        };
+        out.push(scenario);
+    }
+    Ok(true)
+}
+
+fn expand_scenario_selector(token: &str) -> Result<Vec<ScenarioConfig>, String> {
+    let normalized = token.trim().to_ascii_lowercase();
+    if normalized == "spsc" {
+        return Ok(vec![ScenarioConfig::new(1, 1)]);
+    }
+    if normalized == BBQ_ATC22_X86_88T_SCENARIO_SUITE {
+        let mut out = vec![ScenarioConfig::new(1, 1)];
+        for producers in 1..=87 {
+            out.push(ScenarioConfig::new(producers, 1));
+        }
+        for consumers in 1..=87 {
+            out.push(ScenarioConfig::new(1, consumers));
+        }
+        return Ok(out);
+    }
+    if normalized == BBQ_ATC22_OVERSUB_X86_12T_SCENARIO_SUITE {
+        let mut out = Vec::new();
+        for producers in 1..=59 {
+            out.push(ScenarioConfig::new(producers, 1));
+        }
+        for consumers in 1..=59 {
+            out.push(ScenarioConfig::new(1, consumers));
+        }
+        return Ok(out);
+    }
+    for family in ["mpsc", "spmc", "mpmc"] {
+        if let Some(range) = normalized.strip_prefix(&format!("{family}:")) {
+            let mut out = Vec::new();
+            expand_family_range(family, range, &mut out)?;
+            return Ok(out);
+        }
+    }
+    let parsed = parse_scenario_token(&normalized)
+        .ok_or_else(|| format!("invalid scenario token '{token}'"))?;
+    Ok(vec![parsed])
+}
+
 pub fn parse_scenarios(raw: Option<&str>) -> Result<Vec<ScenarioConfig>, String> {
     let source = raw.map(parse_csv_list).unwrap_or_else(|| {
         DEFAULT_SCENARIOS
@@ -925,10 +1017,10 @@ pub fn parse_scenarios(raw: Option<&str>) -> Result<Vec<ScenarioConfig>, String>
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for token in source {
-        let parsed = parse_scenario_token(&token)
-            .ok_or_else(|| format!("invalid scenario token '{token}'"))?;
-        if seen.insert(parsed.name.clone()) {
-            out.push(parsed);
+        for parsed in expand_scenario_selector(&token)? {
+            if seen.insert(parsed.name.clone()) {
+                out.push(parsed);
+            }
         }
     }
     out.sort_by_key(|scenario| (scenario.total_threads(), scenario.name.clone()));
@@ -1102,7 +1194,7 @@ fn wcq_mode_supported(
         // Fill-drain mode is unaffected: the queue is fully loaded before any
         // consumer runs, so the ring never wraps during the fill phase, and
         // concurrency on head/tail is minimal during the drain phase.
-        Mode::Throughput => false,
+        Mode::Throughput | Mode::ComplexThroughput | Mode::DataLatency | Mode::Fairness => false,
         Mode::FillDrain => {
             let Ok(total_items) =
                 usize::try_from(total_items(items_per_producer, scenario.producers))
@@ -1803,6 +1895,18 @@ pub fn make_ubq_job_factory<Q: BenchQueue>(
         Mode::Throughput => {
             bench_throughput_for::<Q>(&queue_name, &run_scenario, items_per_producer, core_offset)
         }
+        Mode::ComplexThroughput => bench_complex_throughput_for::<Q>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::DataLatency => {
+            bench_data_latency_for::<Q>(&queue_name, &run_scenario, items_per_producer, core_offset)
+        }
+        Mode::Fairness => {
+            bench_fairness_for::<Q>(&queue_name, &run_scenario, items_per_producer, core_offset)
+        }
         Mode::FillDrain => {
             bench_fill_drain_for::<Q>(&queue_name, &run_scenario, items_per_producer, core_offset)
         }
@@ -1831,6 +1935,24 @@ pub fn make_segqueue_job_factory(
     let run_scenario = scenario.clone();
     let run = Arc::new(move |core_offset: usize| match mode {
         Mode::Throughput => bench_throughput_for::<SegQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::ComplexThroughput => bench_complex_throughput_for::<SegQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::DataLatency => bench_data_latency_for::<SegQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::Fairness => bench_fairness_for::<SegQueue<u64>>(
             &queue_name,
             &run_scenario,
             items_per_producer,
@@ -1867,6 +1989,24 @@ pub fn make_concurrent_queue_job_factory(
     let run_scenario = scenario.clone();
     let run = Arc::new(move |core_offset: usize| match mode {
         Mode::Throughput => bench_throughput_for::<ConcurrentQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::ComplexThroughput => bench_complex_throughput_for::<ConcurrentQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::DataLatency => bench_data_latency_for::<ConcurrentQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::Fairness => bench_fairness_for::<ConcurrentQueue<u64>>(
             &queue_name,
             &run_scenario,
             items_per_producer,
@@ -1914,6 +2054,27 @@ pub fn make_lfqueue_job_factory(
                 items_per_producer,
                 core_offset,
             ),
+            Mode::ComplexThroughput => bench_complex_throughput_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::DataLatency => bench_data_latency_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::Fairness => bench_fairness_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
             Mode::FillDrain => bench_fill_drain_with_queue(
                 queue_handle,
                 &queue_name,
@@ -1950,6 +2111,27 @@ fn make_wcq_job_factory_typed<const CAPACITY: usize>(
         let queue_handle = WcqBenchQueue::<CAPACITY>::new();
         match mode {
             Mode::Throughput => bench_throughput_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::ComplexThroughput => bench_complex_throughput_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::DataLatency => bench_data_latency_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::Fairness => bench_fairness_with_queue(
                 queue_handle,
                 &queue_name,
                 &run_scenario,
@@ -2061,6 +2243,27 @@ pub fn make_fastfifo_job_factory(
                 items_per_producer,
                 core_offset,
             ),
+            Mode::ComplexThroughput => bench_complex_throughput_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::DataLatency => bench_data_latency_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::Fairness => bench_fairness_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
             Mode::FillDrain => bench_fill_drain_with_queue(
                 queue_handle,
                 &queue_name,
@@ -2126,13 +2329,6 @@ fn execute_job_factories(
     mut pending: Vec<JobFactory>,
     available_parallelism: usize,
 ) -> Result<(BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>), String> {
-    let num_cores = bench_core_ids().len();
-    if available_parallelism > num_cores {
-        return Err(format!(
-            "cannot pin bench threads: available_parallelism is {} but only {} CPU cores detected",
-            available_parallelism, num_cores
-        ));
-    }
     for job in &pending {
         if job.spec.thread_budget() > available_parallelism {
             return Err(format!(
@@ -3330,6 +3526,418 @@ fn bench_throughput_with_queue<Q: BenchQueueHandleFactory>(
         pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
         fill_elapsed_ns: None,
         drain_elapsed_ns: None,
+        avg_data_latency_ns: None,
+        producer_fairness_ratio: None,
+        consumer_fairness_ratio: None,
+    }
+}
+
+fn deterministic_busy(thread_id: usize, op_index: u64) {
+    let mut value = op_index
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(thread_id as u64);
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    let iterations = (value % 101) as usize;
+    for _ in 0..iterations {
+        std::hint::spin_loop();
+    }
+}
+
+fn bench_complex_throughput_for<Q: BenchQueue>(
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    bench_complex_throughput_with_queue(
+        Q::new_queue(),
+        queue_name,
+        scenario,
+        items_per_producer,
+        core_offset,
+    )
+}
+
+fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
+    queue_handle: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    let total_items = total_items(items_per_producer, scenario.producers);
+    let total_threads = scenario.total_threads();
+    let ready = Arc::new(Barrier::new(total_threads + 1));
+    let start_gate = Arc::new(Barrier::new(total_threads + 1));
+    let start = Arc::new(OnceLock::new());
+    let producer_max = Arc::new(AtomicU64::new(0));
+    let consumer_max = Arc::new(AtomicU64::new(0));
+    let consumed_total = Arc::new(AtomicU64::new(0));
+    let producer_count = scenario.producers;
+
+    let mut producer_handles = Vec::with_capacity(scenario.producers);
+    for producer_id in 0..scenario.producers {
+        let queue_thread = queue_handle.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let producer_max = producer_max.clone();
+        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        producer_handles.push(thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            let base = (producer_id as u64)
+                .checked_mul(items_per_producer)
+                .expect("item count overflow");
+            for offset in 0..items_per_producer {
+                deterministic_busy(producer_id, offset);
+                let value = base.checked_add(offset).expect("item count overflow");
+                let ptr = Box::into_raw(Box::new(value)) as usize as u64;
+                queue_thread.send_value(ptr);
+            }
+            let end_ns = start.elapsed().as_nanos() as u64;
+            producer_max.fetch_max(end_ns, AtomicOrdering::Relaxed);
+        }));
+    }
+
+    let mut consumer_handles = Vec::with_capacity(scenario.consumers);
+    for consumer_id in 0..scenario.consumers {
+        let queue_thread = queue_handle.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let consumer_max = consumer_max.clone();
+        let consumed_total = consumed_total.clone();
+        let core_id = bench_core_ids()
+            .get(core_offset + scenario.producers + consumer_id)
+            .copied();
+        consumer_handles.push(thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            loop {
+                let ptr = queue_thread.recv_value();
+                if ptr == SENTINEL {
+                    break;
+                }
+                deterministic_busy(producer_count + consumer_id, ptr);
+                let boxed = unsafe { Box::from_raw(ptr as usize as *mut u64) };
+                std::hint::black_box(*boxed);
+                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let end_ns = start.elapsed().as_nanos() as u64;
+            consumer_max.fetch_max(end_ns, AtomicOrdering::Relaxed);
+        }));
+    }
+
+    ready.wait();
+    start.set(Instant::now()).ok();
+    start_gate.wait();
+
+    for handle in producer_handles {
+        handle.join().expect("producer join failed");
+    }
+    let sentinel_sender = queue_handle.thread_handle();
+    for _ in 0..scenario.consumers {
+        sentinel_sender.send_value(SENTINEL);
+    }
+    for handle in consumer_handles {
+        handle.join().expect("consumer join failed");
+    }
+
+    let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
+    let ops_per_sec = throughput_ops(consumed, elapsed_ns);
+
+    BenchRecord {
+        queue: queue_name.to_string(),
+        mode: Mode::ComplexThroughput.name().to_string(),
+        items_per_producer,
+        total_items,
+        consumed_items: consumed,
+        elapsed_ns,
+        ops_per_sec,
+        push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
+        pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
+        fill_elapsed_ns: None,
+        drain_elapsed_ns: None,
+        avg_data_latency_ns: None,
+        producer_fairness_ratio: None,
+        consumer_fairness_ratio: None,
+    }
+}
+
+fn bench_data_latency_for<Q: BenchQueue>(
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    bench_data_latency_with_queue(
+        Q::new_queue(),
+        queue_name,
+        scenario,
+        items_per_producer,
+        core_offset,
+    )
+}
+
+fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
+    queue_handle: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    let total_items = total_items(items_per_producer, scenario.producers);
+    let total_threads = scenario.total_threads();
+    let ready = Arc::new(Barrier::new(total_threads + 1));
+    let start_gate = Arc::new(Barrier::new(total_threads + 1));
+    let start = Arc::new(OnceLock::new());
+    let producer_max = Arc::new(AtomicU64::new(0));
+    let consumer_max = Arc::new(AtomicU64::new(0));
+    let consumed_total = Arc::new(AtomicU64::new(0));
+    let latency_total = Arc::new(AtomicU64::new(0));
+    let producer_count = scenario.producers;
+
+    let mut producer_handles = Vec::with_capacity(scenario.producers);
+    for producer_id in 0..scenario.producers {
+        let queue_thread = queue_handle.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let producer_max = producer_max.clone();
+        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        producer_handles.push(thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            for offset in 0..items_per_producer {
+                deterministic_busy(producer_id, offset);
+                let mut boxed = Box::new(0_u64);
+                let enqueue_ns = start.elapsed().as_nanos() as u64;
+                *boxed = enqueue_ns;
+                let ptr = Box::into_raw(boxed) as usize as u64;
+                queue_thread.send_value(ptr);
+            }
+            let end_ns = start.elapsed().as_nanos() as u64;
+            producer_max.fetch_max(end_ns, AtomicOrdering::Relaxed);
+        }));
+    }
+
+    let mut consumer_handles = Vec::with_capacity(scenario.consumers);
+    for consumer_id in 0..scenario.consumers {
+        let queue_thread = queue_handle.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let consumer_max = consumer_max.clone();
+        let consumed_total = consumed_total.clone();
+        let latency_total = latency_total.clone();
+        let core_id = bench_core_ids()
+            .get(core_offset + scenario.producers + consumer_id)
+            .copied();
+        consumer_handles.push(thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            loop {
+                let ptr = queue_thread.recv_value();
+                if ptr == SENTINEL {
+                    break;
+                }
+                let now_ns = start.elapsed().as_nanos() as u64;
+                deterministic_busy(producer_count + consumer_id, ptr);
+                let enqueue_ns = unsafe { *Box::from_raw(ptr as usize as *mut u64) };
+                latency_total.fetch_add(now_ns.saturating_sub(enqueue_ns), AtomicOrdering::Relaxed);
+                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let end_ns = start.elapsed().as_nanos() as u64;
+            consumer_max.fetch_max(end_ns, AtomicOrdering::Relaxed);
+        }));
+    }
+
+    ready.wait();
+    start.set(Instant::now()).ok();
+    start_gate.wait();
+
+    for handle in producer_handles {
+        handle.join().expect("producer join failed");
+    }
+    let sentinel_sender = queue_handle.thread_handle();
+    for _ in 0..scenario.consumers {
+        sentinel_sender.send_value(SENTINEL);
+    }
+    for handle in consumer_handles {
+        handle.join().expect("consumer join failed");
+    }
+
+    let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
+    let ops_per_sec = throughput_ops(consumed, elapsed_ns);
+    let avg_data_latency_ns = if consumed == 0 {
+        None
+    } else {
+        Some(latency_total.load(AtomicOrdering::Relaxed) as f64 / consumed as f64)
+    };
+
+    BenchRecord {
+        queue: queue_name.to_string(),
+        mode: Mode::DataLatency.name().to_string(),
+        items_per_producer,
+        total_items,
+        consumed_items: consumed,
+        elapsed_ns,
+        ops_per_sec,
+        push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
+        pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
+        fill_elapsed_ns: None,
+        drain_elapsed_ns: None,
+        avg_data_latency_ns,
+        producer_fairness_ratio: None,
+        consumer_fairness_ratio: None,
+    }
+}
+
+fn bench_fairness_for<Q: BenchQueue>(
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    bench_fairness_with_queue(
+        Q::new_queue(),
+        queue_name,
+        scenario,
+        items_per_producer,
+        core_offset,
+    )
+}
+
+fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
+    queue_handle: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    let total_items = total_items(items_per_producer, scenario.producers);
+    let total_threads = scenario.total_threads();
+    let ready = Arc::new(Barrier::new(total_threads + 1));
+    let start_gate = Arc::new(Barrier::new(total_threads + 1));
+    let start = Arc::new(OnceLock::new());
+
+    let mut producer_handles = Vec::with_capacity(scenario.producers);
+    for producer_id in 0..scenario.producers {
+        let queue_thread = queue_handle.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        producer_handles.push(thread::spawn(move || -> u64 {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            let base = (producer_id as u64)
+                .checked_mul(items_per_producer)
+                .expect("item count overflow");
+            for offset in 0..items_per_producer {
+                let value = base.checked_add(offset).expect("item count overflow");
+                queue_thread.send_value(value);
+            }
+            start.elapsed().as_nanos() as u64
+        }));
+    }
+
+    let mut consumer_handles = Vec::with_capacity(scenario.consumers);
+    for consumer_id in 0..scenario.consumers {
+        let queue_thread = queue_handle.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let core_id = bench_core_ids()
+            .get(core_offset + scenario.producers + consumer_id)
+            .copied();
+        consumer_handles.push(thread::spawn(move || -> (u64, u64) {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            let mut consumed = 0_u64;
+            loop {
+                let value = queue_thread.recv_value();
+                if value == SENTINEL {
+                    break;
+                }
+                consumed += 1;
+            }
+            (start.elapsed().as_nanos() as u64, consumed)
+        }));
+    }
+
+    ready.wait();
+    start.set(Instant::now()).ok();
+    start_gate.wait();
+
+    let mut producer_end_ns = Vec::with_capacity(scenario.producers);
+    for handle in producer_handles {
+        producer_end_ns.push(handle.join().expect("producer join failed"));
+    }
+    let sentinel_sender = queue_handle.thread_handle();
+    for _ in 0..scenario.consumers {
+        sentinel_sender.send_value(SENTINEL);
+    }
+    let mut consumer_results = Vec::with_capacity(scenario.consumers);
+    for handle in consumer_handles {
+        consumer_results.push(handle.join().expect("consumer join failed"));
+    }
+
+    let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+    let consumed = consumer_results.iter().map(|(_, count)| *count).sum();
+    let ops_per_sec = throughput_ops(consumed, elapsed_ns);
+    let producer_rates = producer_end_ns
+        .iter()
+        .filter_map(|&end_ns| throughput_ops(items_per_producer, end_ns))
+        .collect::<Vec<_>>();
+    let consumer_rates = consumer_results
+        .iter()
+        .filter_map(|&(end_ns, count)| throughput_ops(count, end_ns))
+        .collect::<Vec<_>>();
+
+    BenchRecord {
+        queue: queue_name.to_string(),
+        mode: Mode::Fairness.name().to_string(),
+        items_per_producer,
+        total_items,
+        consumed_items: consumed,
+        elapsed_ns,
+        ops_per_sec,
+        push_elapsed_ns: producer_end_ns.iter().copied().max(),
+        pop_elapsed_ns: consumer_results.iter().map(|(end_ns, _)| *end_ns).max(),
+        fill_elapsed_ns: None,
+        drain_elapsed_ns: None,
+        avg_data_latency_ns: None,
+        producer_fairness_ratio: fairness_ratio(&producer_rates),
+        consumer_fairness_ratio: fairness_ratio(&consumer_rates),
     }
 }
 
@@ -3382,7 +3990,22 @@ fn bench_fill_drain_with_queue<Q: BenchQueueHandleFactory>(
         pop_elapsed_ns: None,
         fill_elapsed_ns: Some(fill_elapsed.as_nanos() as u64),
         drain_elapsed_ns: Some(drain_elapsed.as_nanos() as u64),
+        avg_data_latency_ns: None,
+        producer_fairness_ratio: None,
+        consumer_fairness_ratio: None,
     }
+}
+
+fn fairness_ratio(values: &[f64]) -> Option<f64> {
+    let mut min = f64::INFINITY;
+    let mut max = 0.0_f64;
+    for &value in values {
+        if value > 0.0 {
+            min = min.min(value);
+            max = max.max(value);
+        }
+    }
+    min.is_finite().then_some(max / min)
 }
 
 fn throughput_ops(consumed: u64, elapsed_ns: u64) -> Option<f64> {
@@ -3739,6 +4362,9 @@ mod tests {
             pop_elapsed_ns: None,
             fill_elapsed_ns: None,
             drain_elapsed_ns: None,
+            avg_data_latency_ns: None,
+            producer_fairness_ratio: None,
+            consumer_fairness_ratio: None,
         }
     }
 
@@ -3801,6 +4427,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_bbq_atc22_scenario_selectors() {
+        let scenarios = parse_scenarios(Some("spsc,mpsc:2-3,spmc:2-3")).expect("scenarios");
+        let names = scenarios
+            .into_iter()
+            .map(|scenario| scenario.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["1p1c", "1p2c", "2p1c", "1p3c", "3p1c"]);
+
+        let full = parse_scenarios(Some(BBQ_ATC22_X86_88T_SCENARIO_SUITE)).expect("suite");
+        assert!(full.iter().any(|scenario| scenario.name == "87p1c"));
+        assert!(full.iter().any(|scenario| scenario.name == "1p87c"));
+
+        let oversub =
+            parse_scenarios(Some(BBQ_ATC22_OVERSUB_X86_12T_SCENARIO_SUITE)).expect("suite");
+        assert!(oversub.iter().any(|scenario| scenario.name == "59p1c"));
+        assert!(oversub.iter().any(|scenario| scenario.name == "1p59c"));
+    }
+
+    #[test]
+    fn parses_bbq_atc22_metric_modes() {
+        assert_eq!(Mode::parse("complex"), Some(Mode::ComplexThroughput));
+        assert_eq!(
+            Mode::parse("complex-throughput"),
+            Some(Mode::ComplexThroughput)
+        );
+        assert_eq!(Mode::parse("data-latency"), Some(Mode::DataLatency));
+        assert_eq!(Mode::parse("fairness"), Some(Mode::Fairness));
+    }
+
+    #[test]
     fn direct_plan_expands_fastfifo_block_variants() {
         let plan = build_direct_matrix_plan(
             "local",
@@ -3839,7 +4495,7 @@ mod tests {
             &[32, 256],
             &[4096, 65536],
             &[ScenarioConfig::new(1, 1)],
-            &[Mode::Throughput],
+            &[Mode::FillDrain],
             &[1],
             1,
             false,
@@ -3948,6 +4604,9 @@ mod tests {
                 pop_elapsed_ns: None,
                 fill_elapsed_ns: None,
                 drain_elapsed_ns: None,
+                avg_data_latency_ns: None,
+                producer_fairness_ratio: None,
+                consumer_fairness_ratio: None,
             }],
         };
         let json = serde_json::to_string(&output).expect("json");
@@ -4216,6 +4875,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4238,6 +4900,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4260,6 +4925,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
         }
@@ -4316,6 +4984,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4338,6 +5009,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4360,6 +5034,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
         }
@@ -4416,6 +5093,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4438,6 +5118,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4460,6 +5143,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4482,6 +5168,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
         }
@@ -4566,6 +5255,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4588,6 +5280,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4610,6 +5305,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
         }
@@ -4671,6 +5369,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4693,6 +5394,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
             index.records.insert(
@@ -4715,6 +5419,9 @@ mod tests {
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
                     drain_elapsed_ns: None,
+                    avg_data_latency_ns: None,
+                    producer_fairness_ratio: None,
+                    consumer_fairness_ratio: None,
                 },
             );
         }
