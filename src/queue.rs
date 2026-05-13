@@ -1,7 +1,7 @@
 use crate::{
     align::A4096,
     backoff::{BackoffPolicy, Crossbeam},
-    block::{Block, DEFAULT_BLOCK_SIZE, NOP, WRITE},
+    block::{Block, DEFAULT_BLOCK_SIZE, SKIP, WRITE},
 };
 use crossbeam_utils::CachePadded;
 use std::{
@@ -281,7 +281,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
 
             WRITE
         } else {
-            NOP
+            SKIP
         };
 
         slot.state.store(state, Ordering::Release);
@@ -381,7 +381,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
             backoff.snooze();
         }
 
-        let out = (slot.state.load(Ordering::Acquire) != NOP)
+        let out = (slot.state.load(Ordering::Acquire) != SKIP)
             .then_some(unsafe { slot.value.get().read().assume_init() });
 
         if unsafe { (*chead.block).consumed.fetch_add(1, Ordering::Relaxed) } + 1 == BLOCK_SIZE {

@@ -12,7 +12,7 @@ pub const DEFAULT_BLOCK_SIZE: usize = 2047;
 pub const BLOCK_LENGTH: usize = DEFAULT_BLOCK_SIZE;
 
 pub const WRITE: u8 = 1;
-pub(crate) const NOP: u8 = u8::MAX;
+pub(crate) const SKIP: u8 = u8::MAX;
 
 /// A fixed-size ring-buffer segment.
 pub(crate) struct Block<T, const BLOCK_SIZE: usize = DEFAULT_BLOCK_SIZE, A = A4096> {
