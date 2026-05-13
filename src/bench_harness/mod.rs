@@ -1208,40 +1208,6 @@ fn wcq_mode_supported(
     }
 }
 
-fn baseline_queue_labels(
-    baseline_queues: &[QueueKind],
-    fastfifo_block_sizes: &[usize],
-    lfqueue_segment_sizes: &[usize],
-    wcq_capacities: &[usize],
-) -> Vec<String> {
-    let mut labels = Vec::new();
-    for queue in baseline_queues {
-        match queue {
-            QueueKind::FastFifo => {
-                labels.extend(
-                    fastfifo_block_sizes
-                        .iter()
-                        .copied()
-                        .map(fastfifo_queue_label),
-                );
-            }
-            QueueKind::LfQueue => {
-                labels.extend(
-                    lfqueue_segment_sizes
-                        .iter()
-                        .copied()
-                        .map(lfqueue_queue_label),
-                );
-            }
-            QueueKind::Wcq => {
-                labels.extend(wcq_capacities.iter().copied().map(wcq_queue_label));
-            }
-            _ => labels.push(queue.name().to_string()),
-        }
-    }
-    labels
-}
-
 fn baseline_queue_labels_for_sample(
     baseline_queues: &[QueueKind],
     fastfifo_block_sizes: &[usize],
@@ -3044,17 +3010,14 @@ pub fn compute_frontier_round_plan(
     }
 
     let present_labels = collect_present_ubq_labels(index);
-    let baseline_labels = baseline_queue_labels(
-        &config.baseline_queues,
-        &config.fastfifo_block_sizes,
-        &config.lfqueue_segment_sizes,
-        &config.wcq_capacities,
-    );
     let globally_desired_winners = collect_global_winner_labels(
         index,
         &config.scenarios,
         &present_labels,
-        &baseline_labels,
+        &config.baseline_queues,
+        &config.fastfifo_block_sizes,
+        &config.lfqueue_segment_sizes,
+        &config.wcq_capacities,
         &config.modes,
         &config.items_per_producer_values,
         config.repeats,
@@ -3076,7 +3039,10 @@ pub fn compute_frontier_round_plan(
         index,
         &config.scenarios,
         &present_labels,
-        &baseline_labels,
+        &config.baseline_queues,
+        &config.fastfifo_block_sizes,
+        &config.lfqueue_segment_sizes,
+        &config.wcq_capacities,
         &config.modes,
         &config.items_per_producer_values,
         config.repeats,
@@ -3159,7 +3125,10 @@ fn collect_global_winner_labels(
     index: &ExistingRunsIndex,
     scenarios: &[ScenarioConfig],
     present_labels: &BTreeSet<String>,
-    baseline_labels: &[String],
+    baseline_queues: &[QueueKind],
+    fastfifo_block_sizes: &[usize],
+    lfqueue_segment_sizes: &[usize],
+    wcq_capacities: &[usize],
     modes: &[Mode],
     items_per_producer_values: &[u64],
     repeats: usize,
@@ -3168,6 +3137,15 @@ fn collect_global_winner_labels(
     for scenario in scenarios {
         for mode in modes {
             for &items_per_producer in items_per_producer_values {
+                let baseline_labels = baseline_queue_labels_for_sample(
+                    baseline_queues,
+                    fastfifo_block_sizes,
+                    lfqueue_segment_sizes,
+                    wcq_capacities,
+                    scenario,
+                    *mode,
+                    items_per_producer,
+                );
                 let best_baseline = baseline_labels
                     .iter()
                     .filter_map(|queue_label| {
@@ -3196,7 +3174,10 @@ fn collect_global_winner_labels(
                             index,
                             scenario,
                             label,
-                            baseline_labels,
+                            baseline_queues,
+                            fastfifo_block_sizes,
+                            lfqueue_segment_sizes,
+                            wcq_capacities,
                             modes,
                             items_per_producer_values,
                             repeats,
@@ -3230,7 +3211,10 @@ fn collect_local_best_ubq_labels(
     index: &ExistingRunsIndex,
     scenarios: &[ScenarioConfig],
     present_labels: &BTreeSet<String>,
-    baseline_labels: &[String],
+    baseline_queues: &[QueueKind],
+    fastfifo_block_sizes: &[usize],
+    lfqueue_segment_sizes: &[usize],
+    wcq_capacities: &[usize],
     modes: &[Mode],
     items_per_producer_values: &[u64],
     repeats: usize,
@@ -3251,7 +3235,10 @@ fn collect_local_best_ubq_labels(
                             index,
                             scenario,
                             label,
-                            baseline_labels,
+                            baseline_queues,
+                            fastfifo_block_sizes,
+                            lfqueue_segment_sizes,
+                            wcq_capacities,
                             modes,
                             items_per_producer_values,
                             repeats,
@@ -3337,7 +3324,10 @@ fn is_complete_coverage(
     index: &ExistingRunsIndex,
     scenario: &ScenarioConfig,
     label: &str,
-    baseline_labels: &[String],
+    baseline_queues: &[QueueKind],
+    fastfifo_block_sizes: &[usize],
+    lfqueue_segment_sizes: &[usize],
+    wcq_capacities: &[usize],
     modes: &[Mode],
     items_per_producer_values: &[u64],
     repeats: usize,
@@ -3345,13 +3335,22 @@ fn is_complete_coverage(
     (1..=repeats).all(|repeat_index| {
         for mode in modes {
             for &items in items_per_producer_values {
+                let baseline_labels = baseline_queue_labels_for_sample(
+                    baseline_queues,
+                    fastfifo_block_sizes,
+                    lfqueue_segment_sizes,
+                    wcq_capacities,
+                    scenario,
+                    *mode,
+                    items,
+                );
                 for baseline_label in baseline_labels {
                     let key = SampleKey {
                         scenario: scenario.name.clone(),
                         repeat_index,
                         mode: *mode,
                         items_per_producer: items,
-                        queue_label: baseline_label.clone(),
+                        queue_label: baseline_label,
                     };
                     if !index.records.contains_key(&key) {
                         return false;
@@ -5060,6 +5059,70 @@ mod tests {
             plan.bundles
                 .iter()
                 .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,yield"))
+        );
+    }
+
+    #[test]
+    fn frontier_expands_when_wcq_is_unsupported_for_one_mode() {
+        let scenario = ScenarioConfig::new(1, 1);
+        let mut index = ExistingRunsIndex::default();
+        for mode in [Mode::Throughput, Mode::FillDrain] {
+            index.records.insert(
+                SampleKey {
+                    scenario: scenario.name.clone(),
+                    repeat_index: 1,
+                    mode,
+                    items_per_producer: 1,
+                    queue_label: "segqueue".to_string(),
+                },
+                test_record("segqueue", mode, 1),
+            );
+            index.records.insert(
+                SampleKey {
+                    scenario: scenario.name.clone(),
+                    repeat_index: 1,
+                    mode,
+                    items_per_producer: 1,
+                    queue_label: "ubq_balanced,8,127,crossbeam".to_string(),
+                },
+                test_record("ubq", mode, 1),
+            );
+        }
+        index.records.insert(
+            SampleKey {
+                scenario: scenario.name.clone(),
+                repeat_index: 1,
+                mode: Mode::FillDrain,
+                items_per_producer: 1,
+                queue_label: "wcq_4096".to_string(),
+            },
+            test_record("wcq", Mode::FillDrain, 1),
+        );
+
+        let config = FrontierConfig {
+            machine_label: "local".to_string(),
+            runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
+            scenarios: vec![scenario],
+            baseline_queues: vec![QueueKind::SegQueue, QueueKind::Wcq],
+            fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: vec![4096],
+            seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
+            modes: vec![Mode::Throughput, Mode::FillDrain],
+            items_per_producer_values: vec![1],
+            repeats: 1,
+            available_parallelism: 8,
+        };
+        let plan = compute_frontier_round_plan(&config, &index, &BTreeSet::new()).expect("plan");
+        assert!(
+            plan.bundles
+                .iter()
+                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,yield"))
+        );
+        assert!(
+            plan.bundles
+                .iter()
+                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,0,127,crossbeam"))
         );
     }
 
