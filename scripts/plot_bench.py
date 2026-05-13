@@ -96,6 +96,30 @@ def scaling_scenario_sort_key(name: str):
     return (1, scenario)
 
 
+def scenario_family(name: str):
+    threads = parse_scenario_threads(name)
+    if threads is None:
+        return None
+    producers, consumers = threads
+    if producers == 1 and consumers == 1:
+        return "spsc"
+    if consumers == 1:
+        return "mpsc"
+    if producers == 1:
+        return "spmc"
+    if producers == consumers:
+        return "mpmc"
+    return "mixed"
+
+
+def family_axis_label(family):
+    return {
+        "mpsc": "Producers",
+        "spmc": "Consumers",
+        "mpmc": "Producer/consumer threads",
+    }.get(family, "Scenario (XpYc)")
+
+
 def mode_sort_key(name: str):
     priority = {
         "throughput": 0,
@@ -805,6 +829,10 @@ def write_queue_metadata_csv(out_path: Path, labels):
     return out_path
 
 
+def family_scenarios(scenarios, family):
+    return [scenario for scenario in scenarios if scenario_family(scenario) == family]
+
+
 def annotate_immediate_variant_status(ax, coverage_csv_name: str, report):
     required_labels = report["required_labels"]
     if not required_labels:
@@ -853,7 +881,17 @@ def annotate_immediate_variant_status(ax, coverage_csv_name: str, report):
     )
 
 
-def plot_scenario_lines(plt, out_path: Path, machine: str, mode: str, scenarios, labels, entries_by_scenario, error_bars: str):
+def plot_scenario_lines(
+    plt,
+    out_path: Path,
+    machine: str,
+    mode: str,
+    scenarios,
+    labels,
+    entries_by_scenario,
+    error_bars: str,
+    family=None,
+):
     if not scenarios or not labels:
         return
 
@@ -892,9 +930,10 @@ def plot_scenario_lines(plt, out_path: Path, machine: str, mode: str, scenarios,
             ax.plot(xs, ys, **plot_kwargs)
 
     ax.set_xticks(x_positions, scenarios, rotation=40, ha="right")
-    ax.set_xlabel("Scenario (XpYc)")
+    ax.set_xlabel(family_axis_label(family))
     ax.set_ylabel(metric_axis_label(mode))
-    ax.set_title(f"{machine}: {metric_display_name(mode)} scaling")
+    family_prefix = f"{family.upper()} " if family else ""
+    ax.set_title(f"{machine}: {family_prefix}{metric_display_name(mode)} scaling")
     ax.grid(axis="y", linestyle=":", alpha=0.4)
     ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=9, frameon=False)
     fig.tight_layout(rect=(0, 0, 0.84, 1))
@@ -1018,6 +1057,34 @@ def main():
             metadata_csv_path = out_root / machine / "csv" / mode / "queue_metadata.csv"
             write_queue_metadata_csv(metadata_csv_path, all_labels)
             print(f"Wrote CSV: {metadata_csv_path}")
+            for family in ("mpsc", "spmc"):
+                selected_scenarios = family_scenarios(scenarios, family)
+                if len(selected_scenarios) < 2:
+                    continue
+                selected_entries = {
+                    scenario: entries_by_scenario[scenario]
+                    for scenario in selected_scenarios
+                }
+                labels = scenario_line_labels(
+                    selected_entries,
+                    args.max_line_series,
+                    mode,
+                )
+                csv_path = (
+                    out_root
+                    / machine
+                    / "csv"
+                    / mode
+                    / f"{family}_line_{slug}.csv"
+                )
+                write_scenario_line_csv(
+                    csv_path,
+                    mode,
+                    selected_scenarios,
+                    labels,
+                    selected_entries,
+                )
+                print(f"Wrote CSV: {csv_path}")
 
     ensure_plot_runtime_env(out_root)
     try:
@@ -1116,6 +1183,32 @@ def main():
                 args.error_bars,
             )
             print(f"Wrote PNG: {png_path}")
+            for family in ("mpsc", "spmc"):
+                selected_scenarios = family_scenarios(scenarios, family)
+                if len(selected_scenarios) < 2:
+                    continue
+                selected_entries = {
+                    scenario: entries_by_scenario[scenario]
+                    for scenario in selected_scenarios
+                }
+                labels = scenario_line_labels(
+                    selected_entries,
+                    args.max_line_series,
+                    mode,
+                )
+                png_path = out_root / machine / mode / f"{family}_line_{slug}.png"
+                plot_scenario_lines(
+                    plt,
+                    png_path,
+                    machine,
+                    mode,
+                    selected_scenarios,
+                    labels,
+                    selected_entries,
+                    args.error_bars,
+                    family=family,
+                )
+                print(f"Wrote PNG: {png_path}")
 
 
 if __name__ == "__main__":

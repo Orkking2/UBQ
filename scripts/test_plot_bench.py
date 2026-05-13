@@ -9,6 +9,7 @@ from scripts.plot_bench import (
     label_sort_key,
     load_records,
     queue_metadata,
+    scenario_family,
     write_immediate_variant_csv,
 )
 
@@ -243,6 +244,15 @@ class MetricExtractionTest(unittest.TestCase):
         )
         self.assertEqual(23.0, by_mode[("fill_drain_fill_elapsed", "segqueue")])
         self.assertEqual(29.0, by_mode[("fill_drain_drain_elapsed", "segqueue")])
+
+
+class ScenarioFamilyTest(unittest.TestCase):
+    def test_classifies_paper_scaling_families(self):
+        self.assertEqual("spsc", scenario_family("1p1c"))
+        self.assertEqual("mpsc", scenario_family("8p1c"))
+        self.assertEqual("spmc", scenario_family("1p8c"))
+        self.assertEqual("mpmc", scenario_family("8p8c"))
+        self.assertEqual("mixed", scenario_family("8p16c"))
 
 
 if __name__ == "__main__":
