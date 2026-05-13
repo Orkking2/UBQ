@@ -188,10 +188,18 @@ Outputs are grouped by `meta.machine_label` and mode, e.g.:
 
 - `bench_results/plots/local/throughput/1p1c_throughput.png`
 - `bench_results/plots/local/throughput/scenarios_line_throughput.png`
+- `bench_results/plots/local/throughput_push_elapsed/1p1c_push_elapsed.png`
+- `bench_results/plots/local/fill_drain_drain_elapsed/1p1c_drain_elapsed.png`
 - `bench_results/plots/lab/throughput/1p1c_throughput.png`
 - `bench_results/plots/hebrides/csv/throughput/1p1c_throughput.csv`
 - `bench_results/plots/hebrides/csv/throughput/scenarios_line_throughput.csv`
 - `bench_results/plots/hebrides/csv/throughput/queue_metadata.csv`
+
+When records contain the newer timing fields, the plotter also emits derived
+metric folders such as `throughput_push_elapsed`,
+`throughput_pop_elapsed`, `fill_drain_fill_elapsed`, and
+`fill_drain_drain_elapsed`. Timing, latency, and fairness-ratio charts sort
+lower values first; throughput charts still sort higher values first.
 
 Per-scenario UBQ outputs also emit a companion CSV named
 `<scenario>_immediate_variants_throughput.csv` that marks each required

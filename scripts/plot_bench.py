@@ -103,11 +103,23 @@ def mode_sort_key(name: str):
         "data_latency": 2,
         "producer_fairness": 3,
         "consumer_fairness": 4,
-        "fairness": 5,
-        "fill_drain": 6,
-        "mutable_placeholder": 7,
+        "fairness_throughput": 5,
+        "fairness": 6,
+        "fill_drain": 7,
+        "mutable_placeholder": 8,
     }
-    return (priority.get(name, 99), name)
+    derived_suffixes = {
+        "push_elapsed": 1,
+        "pop_elapsed": 2,
+        "fill_elapsed": 3,
+        "drain_elapsed": 4,
+    }
+    for suffix, suffix_priority in derived_suffixes.items():
+        marker = f"_{suffix}"
+        if name.endswith(marker):
+            base = name[: -len(marker)]
+            return (priority.get(base, 99), suffix_priority, name)
+    return (priority.get(name, 99), 0, name)
 
 
 def metric_column(mode: str):
@@ -115,6 +127,14 @@ def metric_column(mode: str):
         return "avg_data_latency_ns"
     if mode in ("producer_fairness", "consumer_fairness", "fairness"):
         return "fairness_ratio"
+    if mode.endswith("_push_elapsed"):
+        return "push_elapsed_ns"
+    if mode.endswith("_pop_elapsed"):
+        return "pop_elapsed_ns"
+    if mode.endswith("_fill_elapsed"):
+        return "fill_elapsed_ns"
+    if mode.endswith("_drain_elapsed"):
+        return "drain_elapsed_ns"
     return "ops_per_sec"
 
 
@@ -123,6 +143,8 @@ def metric_axis_label(mode: str):
         return "Average data latency (ns)"
     if mode in ("producer_fairness", "consumer_fairness", "fairness"):
         return "Fairness ratio (max/min)"
+    if mode.endswith(("_push_elapsed", "_pop_elapsed", "_fill_elapsed", "_drain_elapsed")):
+        return "Elapsed time (ns)"
     return "Ops/sec"
 
 
@@ -131,7 +153,52 @@ def metric_file_slug(mode: str):
         return "data_latency"
     if mode in ("producer_fairness", "consumer_fairness", "fairness"):
         return mode
+    for suffix in ("push_elapsed", "pop_elapsed", "fill_elapsed", "drain_elapsed"):
+        if mode.endswith(f"_{suffix}"):
+            return suffix
     return "throughput"
+
+
+def source_mode_display_name(mode: str):
+    names = {
+        "throughput": "throughput",
+        "complex_throughput": "complex throughput",
+        "data_latency": "data latency",
+        "fairness": "fairness",
+        "fill_drain": "fill/drain",
+    }
+    return names.get(mode, mode.replace("_", " "))
+
+
+def metric_display_name(mode: str):
+    names = {
+        "throughput": "throughput",
+        "complex_throughput": "complex throughput",
+        "data_latency": "data latency",
+        "producer_fairness": "producer fairness",
+        "consumer_fairness": "consumer fairness",
+        "fairness_throughput": "fairness throughput",
+        "fill_drain": "fill/drain throughput",
+    }
+    for suffix, label in (
+        ("push_elapsed", "push elapsed"),
+        ("pop_elapsed", "pop elapsed"),
+        ("fill_elapsed", "fill elapsed"),
+        ("drain_elapsed", "drain elapsed"),
+    ):
+        marker = f"_{suffix}"
+        if mode.endswith(marker):
+            base = mode[: -len(marker)]
+            return f"{source_mode_display_name(base)} {label}"
+    return names.get(mode, mode.replace("_", " "))
+
+
+def metric_lower_is_better(mode: str):
+    return (
+        mode == "data_latency"
+        or mode in ("producer_fairness", "consumer_fairness", "fairness")
+        or mode.endswith(("_push_elapsed", "_pop_elapsed", "_fill_elapsed", "_drain_elapsed"))
+    )
 
 
 def label_sort_key(label: str):
@@ -240,9 +307,19 @@ def queue_metadata(label: str):
 
 
 def labels_by_ops_desc(entries):
+    return labels_by_metric(entries, "throughput")
+
+
+def labels_by_metric(entries, mode: str):
+    lower_is_better = metric_lower_is_better(mode)
     return sorted(
         entries.keys(),
-        key=lambda label: (-entries[label]["mean_ops_per_sec"], label_sort_key(label)),
+        key=lambda label: (
+            entries[label]["mean_ops_per_sec"]
+            if lower_is_better
+            else -entries[label]["mean_ops_per_sec"],
+            label_sort_key(label),
+        ),
     )
 
 
@@ -347,6 +424,23 @@ def immediate_winner_variant_report(entries, scenario=None):
     }
 
 
+def empty_immediate_variant_report(selected_labels):
+    return {
+        "selected_labels": selected_labels,
+        "winner": None,
+        "required_labels": [],
+        "present_required_labels": [],
+        "missing_required_labels": [],
+        "zero_pool_labels": [],
+    }
+
+
+def primary_plot_report(entries, mode: str, scenario=None):
+    if mode in ("throughput", "complex_throughput"):
+        return immediate_winner_variant_report(entries, scenario)
+    return empty_immediate_variant_report(labels_by_metric(entries, mode))
+
+
 def immediate_domain_neighbors(value, ordered_values):
     try:
         idx = ordered_values.index(value)
@@ -436,6 +530,14 @@ def clear_generated_outputs(out_root: Path):
         "*_producer_fairness.png",
         "*_consumer_fairness.csv",
         "*_consumer_fairness.png",
+        "*_push_elapsed.csv",
+        "*_push_elapsed.png",
+        "*_pop_elapsed.csv",
+        "*_pop_elapsed.png",
+        "*_fill_elapsed.csv",
+        "*_fill_elapsed.png",
+        "*_drain_elapsed.csv",
+        "*_drain_elapsed.png",
     ):
         for path in out_root.rglob(pattern):
             if not path.is_file():
@@ -484,36 +586,40 @@ def load_records(path: Path):
         else:
             queue_label = str(queue)
 
+        metric_specs = []
         if mode == "data_latency":
-            raw_value = rec.get("avg_data_latency_ns")
-            output_mode = "data_latency"
+            metric_specs.append(("data_latency", "avg_data_latency_ns"))
         elif mode == "fairness":
-            for output_mode, field in (
-                ("producer_fairness", "producer_fairness_ratio"),
-                ("consumer_fairness", "consumer_fairness_ratio"),
-            ):
-                raw_value = rec.get(field)
-                if raw_value is None:
-                    continue
-                try:
-                    metric_value = float(raw_value)
-                except (TypeError, ValueError):
-                    continue
-                yield machine_label, output_mode, scenario, queue_label, metric_value
-            continue
+            metric_specs.extend(
+                (
+                    ("fairness_throughput", "ops_per_sec"),
+                    ("producer_fairness", "producer_fairness_ratio"),
+                    ("consumer_fairness", "consumer_fairness_ratio"),
+                )
+            )
         else:
-            raw_value = rec.get("ops_per_sec")
-            output_mode = mode
+            metric_specs.append((mode, "ops_per_sec"))
 
-        if raw_value is None:
-            continue
+        for suffix, field in (
+            ("push_elapsed", "push_elapsed_ns"),
+            ("pop_elapsed", "pop_elapsed_ns"),
+            ("fill_elapsed", "fill_elapsed_ns"),
+            ("drain_elapsed", "drain_elapsed_ns"),
+        ):
+            if rec.get(field) is not None:
+                metric_specs.append((f"{mode}_{suffix}", field))
 
-        try:
-            metric_value = float(raw_value)
-        except (TypeError, ValueError):
-            continue
+        for output_mode, field in metric_specs:
+            raw_value = rec.get(field)
+            if raw_value is None:
+                continue
 
-        yield machine_label, output_mode, scenario, queue_label, metric_value
+            try:
+                metric_value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+
+            yield machine_label, output_mode, scenario, queue_label, metric_value
 
 
 def summarize_ops(samples):
@@ -607,11 +713,19 @@ def error_value(stats, error_bars: str):
     raise ValueError(f"Unknown error bar mode: {error_bars}")
 
 
+def format_metric_value(mode: str, value: float):
+    if mode in ("producer_fairness", "consumer_fairness", "fairness"):
+        return f"{value:,.3f}"
+    if mode == "data_latency" or mode.endswith(("_push_elapsed", "_pop_elapsed", "_fill_elapsed", "_drain_elapsed")):
+        return f"{value:,.0f} ns"
+    return f"{value:,.0f}"
+
+
 def average_ops_per_sec(values):
     return sum(values) / len(values) if values else 0.0
 
 
-def scenario_line_labels(entries_by_scenario, max_series: int):
+def scenario_line_labels(entries_by_scenario, max_series: int, mode: str):
     label_samples = {}
     label_coverage = {}
     for entries in entries_by_scenario.values():
@@ -619,12 +733,15 @@ def scenario_line_labels(entries_by_scenario, max_series: int):
             label_samples.setdefault(label, []).append(stats["mean_ops_per_sec"])
             label_coverage[label] = label_coverage.get(label, 0) + 1
 
+    lower_is_better = metric_lower_is_better(mode)
     labels = sorted(
         label_samples.keys(),
         key=lambda label: (
             baseline_queue_priority(label),
             -label_coverage[label],
-            -average_ops_per_sec(label_samples[label]),
+            average_ops_per_sec(label_samples[label])
+            if lower_is_better
+            else -average_ops_per_sec(label_samples[label]),
             label_sort_key(label),
         ),
     )
@@ -777,7 +894,7 @@ def plot_scenario_lines(plt, out_path: Path, machine: str, mode: str, scenarios,
     ax.set_xticks(x_positions, scenarios, rotation=40, ha="right")
     ax.set_xlabel("Scenario (XpYc)")
     ax.set_ylabel(metric_axis_label(mode))
-    ax.set_title(f"{machine}: {mode} scaling")
+    ax.set_title(f"{machine}: {metric_display_name(mode)} scaling")
     ax.grid(axis="y", linestyle=":", alpha=0.4)
     ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=9, frameon=False)
     fig.tight_layout(rect=(0, 0, 0.84, 1))
@@ -808,7 +925,7 @@ def main():
     parser.add_argument(
         "--no-clean",
         action="store_true",
-        help="Keep pre-existing *_throughput CSV/PNG outputs in --out-dir.",
+        help="Keep pre-existing generated CSV/PNG outputs in --out-dir.",
     )
     parser.add_argument(
         "--max-line-series",
@@ -852,7 +969,7 @@ def main():
         for mode in sorted(grouped[machine], key=mode_sort_key):
             for scenario in sorted(grouped[machine][mode], key=scenario_sort_key):
                 entries = grouped[machine][mode][scenario]
-                report = immediate_winner_variant_report(entries, scenario)
+                report = primary_plot_report(entries, mode, scenario)
                 labels = report["selected_labels"]
                 values = [(label, entries[label]) for label in labels]
                 slug = metric_file_slug(mode)
@@ -885,7 +1002,7 @@ def main():
         for mode in sorted(grouped[machine], key=mode_sort_key):
             scenarios = sorted(grouped[machine][mode], key=scaling_scenario_sort_key)
             entries_by_scenario = grouped[machine][mode]
-            labels = scenario_line_labels(entries_by_scenario, args.max_line_series)
+            labels = scenario_line_labels(entries_by_scenario, args.max_line_series, mode)
             slug = metric_file_slug(mode)
             csv_path = out_root / machine / "csv" / mode / f"scenarios_line_{slug}.csv"
             write_scenario_line_csv(csv_path, mode, scenarios, labels, entries_by_scenario)
@@ -922,7 +1039,7 @@ def main():
         for mode in sorted(grouped[machine], key=mode_sort_key):
             for scenario in sorted(grouped[machine][mode], key=scenario_sort_key):
                 entries = grouped[machine][mode][scenario]
-                report = immediate_winner_variant_report(entries, scenario)
+                report = primary_plot_report(entries, mode, scenario)
                 labels = report["selected_labels"]
                 values = [entries[label]["mean_ops_per_sec"] for label in labels]
                 if not values:
@@ -946,7 +1063,7 @@ def main():
                     ha="right",
                 )
                 ax.set_ylabel(metric_axis_label(mode))
-                ax.set_title(f"{machine}: {mode} {scenario}")
+                ax.set_title(f"{machine}: {metric_display_name(mode)} {scenario}")
                 ax.grid(axis="y", linestyle=":", alpha=0.4)
                 slug = metric_file_slug(mode)
                 if mode in ("throughput", "complex_throughput"):
@@ -956,7 +1073,10 @@ def main():
                         report,
                     )
 
-                best_idx = max(range(len(values)), key=lambda i: values[i])
+                if metric_lower_is_better(mode):
+                    best_idx = min(range(len(values)), key=lambda i: values[i])
+                else:
+                    best_idx = max(range(len(values)), key=lambda i: values[i])
                 best_label = labels[best_idx]
                 best_value = values[best_idx]
                 ax.axhline(
@@ -964,7 +1084,10 @@ def main():
                     color="tab:red",
                     linestyle="--",
                     linewidth=1.25,
-                    label=f"Best mean: {display_label(best_label)} ({best_value:,.0f})",
+                    label=(
+                        f"Best mean: {display_label(best_label)} "
+                        f"({format_metric_value(mode, best_value)})"
+                    ),
                 )
                 ax.legend(loc="upper left")
                 fig.tight_layout()
@@ -979,7 +1102,7 @@ def main():
         for mode in sorted(grouped[machine], key=mode_sort_key):
             scenarios = sorted(grouped[machine][mode], key=scaling_scenario_sort_key)
             entries_by_scenario = grouped[machine][mode]
-            labels = scenario_line_labels(entries_by_scenario, args.max_line_series)
+            labels = scenario_line_labels(entries_by_scenario, args.max_line_series, mode)
             slug = metric_file_slug(mode)
             png_path = out_root / machine / mode / f"scenarios_line_{slug}.png"
             plot_scenario_lines(

@@ -1,4 +1,5 @@
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 from scripts.plot_bench import (
     immediate_winner_variant_report,
     label_sort_key,
+    load_records,
     queue_metadata,
     write_immediate_variant_csv,
 )
@@ -196,6 +198,51 @@ class PublicationQueuePlotTest(unittest.TestCase):
             "Nikolaev/Ravindran, SPAA 2022",
             queue_metadata("wcq_65536")["publication"],
         )
+
+
+class MetricExtractionTest(unittest.TestCase):
+    def test_load_records_emits_derived_timing_metrics(self):
+        payload = {
+            "schema_version": 2,
+            "meta": {
+                "machine_label": "local",
+                "scenario": "1p1c",
+                "ubq_label": "balanced,8,127,crossbeam",
+            },
+            "results": [
+                {
+                    "queue": "ubq",
+                    "mode": "throughput",
+                    "ops_per_sec": 100.0,
+                    "push_elapsed_ns": 11,
+                    "pop_elapsed_ns": 17,
+                },
+                {
+                    "queue": "segqueue",
+                    "mode": "fill_drain",
+                    "ops_per_sec": 50.0,
+                    "fill_elapsed_ns": 23,
+                    "drain_elapsed_ns": 29,
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            rows = list(load_records(path))
+
+        by_mode = {(mode, label): value for _machine, mode, _scenario, label, value in rows}
+        self.assertEqual(
+            11.0,
+            by_mode[("throughput_push_elapsed", "ubq_balanced,8,127,crossbeam")],
+        )
+        self.assertEqual(
+            17.0,
+            by_mode[("throughput_pop_elapsed", "ubq_balanced,8,127,crossbeam")],
+        )
+        self.assertEqual(23.0, by_mode[("fill_drain_fill_elapsed", "segqueue")])
+        self.assertEqual(29.0, by_mode[("fill_drain_drain_elapsed", "segqueue")])
 
 
 if __name__ == "__main__":
