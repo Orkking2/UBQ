@@ -352,6 +352,9 @@ pub enum Mode {
     DataLatency,
     Fairness,
     FillDrain,
+    AppLogFanIn,
+    AppPipeline,
+    AppTaskRoundtrip,
 }
 
 impl Mode {
@@ -362,6 +365,9 @@ impl Mode {
             Mode::DataLatency => "data_latency",
             Mode::Fairness => "fairness",
             Mode::FillDrain => "fill_drain",
+            Mode::AppLogFanIn => "app_log_fan_in",
+            Mode::AppPipeline => "app_pipeline",
+            Mode::AppTaskRoundtrip => "app_task_roundtrip",
         }
     }
 
@@ -374,7 +380,17 @@ impl Mode {
             "data_latency" | "data-latency" => Some(Self::DataLatency),
             "fairness" => Some(Self::Fairness),
             "fill_drain" | "fill-drain" => Some(Self::FillDrain),
+            "app_log_fan_in" | "app-log-fan-in" => Some(Self::AppLogFanIn),
+            "app_pipeline" | "app-pipeline" => Some(Self::AppPipeline),
+            "app_task_roundtrip" | "app-task-roundtrip" => Some(Self::AppTaskRoundtrip),
             _ => None,
+        }
+    }
+
+    fn extra_threads(self) -> usize {
+        match self {
+            Mode::AppPipeline => 1,
+            _ => 0,
         }
     }
 }
@@ -518,7 +534,10 @@ impl JobSpec {
     }
 
     pub fn thread_budget(&self) -> usize {
-        self.scenario.total_threads()
+        self.scenario
+            .total_threads()
+            .checked_add(self.mode.extra_threads())
+            .unwrap_or_else(|| panic!("job thread budget overflow"))
     }
 
     pub fn sort_key(&self) -> (std::cmp::Reverse<usize>, String, usize, String, u64, String) {
@@ -1194,7 +1213,13 @@ fn wcq_mode_supported(
         // Fill-drain mode is unaffected: the queue is fully loaded before any
         // consumer runs, so the ring never wraps during the fill phase, and
         // concurrency on head/tail is minimal during the drain phase.
-        Mode::Throughput | Mode::ComplexThroughput | Mode::DataLatency | Mode::Fairness => false,
+        Mode::Throughput
+        | Mode::ComplexThroughput
+        | Mode::DataLatency
+        | Mode::Fairness
+        | Mode::AppLogFanIn
+        | Mode::AppPipeline
+        | Mode::AppTaskRoundtrip => false,
         Mode::FillDrain => {
             let Ok(total_items) =
                 usize::try_from(total_items(items_per_producer, scenario.producers))
@@ -1617,6 +1642,21 @@ pub fn build_direct_matrix_plan(
                 WCQ_MAX_THREADS
             ));
         }
+        for &mode in modes {
+            let required_threads = scenario
+                .total_threads()
+                .checked_add(mode.extra_threads())
+                .ok_or_else(|| "scenario thread count overflow".to_string())?;
+            if required_threads > available_parallelism {
+                return Err(format!(
+                    "scenario {} mode {} requires {} threads but available_parallelism is {}",
+                    scenario.name,
+                    mode.name(),
+                    required_threads,
+                    available_parallelism
+                ));
+            }
+        }
     }
     if repeats == 0 {
         return Err("repeats must be > 0".to_string());
@@ -1876,6 +1916,21 @@ pub fn make_ubq_job_factory<Q: BenchQueue>(
         Mode::FillDrain => {
             bench_fill_drain_for::<Q>(&queue_name, &run_scenario, items_per_producer, core_offset)
         }
+        Mode::AppLogFanIn => bench_app_log_fan_in_for::<Q>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppPipeline => {
+            bench_app_pipeline_for::<Q>(&queue_name, &run_scenario, items_per_producer, core_offset)
+        }
+        Mode::AppTaskRoundtrip => bench_app_task_roundtrip_for::<Q>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
     });
     JobFactory { spec, run }
 }
@@ -1930,6 +1985,24 @@ pub fn make_segqueue_job_factory(
             items_per_producer,
             core_offset,
         ),
+        Mode::AppLogFanIn => bench_app_log_fan_in_for::<SegQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppPipeline => bench_app_pipeline_for::<SegQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppTaskRoundtrip => bench_app_task_roundtrip_for::<SegQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
     });
     JobFactory { spec, run }
 }
@@ -1979,6 +2052,24 @@ pub fn make_concurrent_queue_job_factory(
             core_offset,
         ),
         Mode::FillDrain => bench_fill_drain_for::<ConcurrentQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppLogFanIn => bench_app_log_fan_in_for::<ConcurrentQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppPipeline => bench_app_pipeline_for::<ConcurrentQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppTaskRoundtrip => bench_app_task_roundtrip_for::<ConcurrentQueue<u64>>(
             &queue_name,
             &run_scenario,
             items_per_producer,
@@ -2048,6 +2139,29 @@ pub fn make_lfqueue_job_factory(
                 items_per_producer,
                 core_offset,
             ),
+            Mode::AppLogFanIn => bench_app_log_fan_in_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppPipeline => bench_app_pipeline_with_queues(
+                queue_handle,
+                LfQueueBenchQueue::new(segment_size),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppTaskRoundtrip => bench_app_task_roundtrip_with_queues(
+                queue_handle,
+                LfQueueBenchQueue::new(segment_size),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
         }
     });
     JobFactory { spec, run }
@@ -2106,6 +2220,29 @@ fn make_wcq_job_factory_typed<const CAPACITY: usize>(
             ),
             Mode::FillDrain => bench_fill_drain_with_queue(
                 queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppLogFanIn => bench_app_log_fan_in_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppPipeline => bench_app_pipeline_with_queues(
+                queue_handle,
+                WcqBenchQueue::<CAPACITY>::new(),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppTaskRoundtrip => bench_app_task_roundtrip_with_queues(
+                queue_handle,
+                WcqBenchQueue::<CAPACITY>::new(),
                 &queue_name,
                 &run_scenario,
                 items_per_producer,
@@ -2232,6 +2369,29 @@ pub fn make_fastfifo_job_factory(
             ),
             Mode::FillDrain => bench_fill_drain_with_queue(
                 queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppLogFanIn => bench_app_log_fan_in_with_queue(
+                queue_handle,
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppPipeline => bench_app_pipeline_with_queues(
+                queue_handle,
+                RbbqBenchQueue::new(&run_scenario, items_per_producer, block_size),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppTaskRoundtrip => bench_app_task_roundtrip_with_queues(
+                queue_handle,
+                RbbqBenchQueue::new(&run_scenario, items_per_producer, block_size),
                 &queue_name,
                 &run_scenario,
                 items_per_producer,
@@ -3543,6 +3703,491 @@ fn deterministic_busy(thread_id: usize, op_index: u64) {
     }
 }
 
+struct AppRecord {
+    created_ns: u64,
+    id: u64,
+    hash: u64,
+}
+
+fn app_record_ptr(record: AppRecord) -> u64 {
+    Box::into_raw(Box::new(record)) as usize as u64
+}
+
+unsafe fn app_record_from_ptr(ptr: u64) -> Box<AppRecord> {
+    unsafe { Box::from_raw(ptr as usize as *mut AppRecord) }
+}
+
+fn app_hash(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn app_work(thread_id: usize, record_id: u64) -> u64 {
+    let mixed = app_hash(record_id ^ ((thread_id as u64) << 32));
+    deterministic_busy(thread_id, mixed);
+    app_hash(mixed)
+}
+
+fn bench_app_log_fan_in_for<Q: BenchQueue>(
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    bench_app_log_fan_in_with_queue(
+        Q::new_queue(),
+        queue_name,
+        scenario,
+        items_per_producer,
+        core_offset,
+    )
+}
+
+fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
+    queue_handle: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    let total_items = total_items(items_per_producer, scenario.producers);
+    let total_threads = scenario.total_threads();
+    let ready = Arc::new(Barrier::new(total_threads + 1));
+    let start_gate = Arc::new(Barrier::new(total_threads + 1));
+    let start = Arc::new(OnceLock::new());
+    let producer_max = Arc::new(AtomicU64::new(0));
+    let consumer_max = Arc::new(AtomicU64::new(0));
+    let consumed_total = Arc::new(AtomicU64::new(0));
+    let latency_total = Arc::new(AtomicU64::new(0));
+    let producer_count = scenario.producers;
+
+    let mut producer_handles = Vec::with_capacity(scenario.producers);
+    for producer_id in 0..scenario.producers {
+        let queue_thread = queue_handle.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let producer_max = producer_max.clone();
+        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        producer_handles.push(thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            let base = (producer_id as u64)
+                .checked_mul(items_per_producer)
+                .expect("item count overflow");
+            for offset in 0..items_per_producer {
+                let id = base.checked_add(offset).expect("item count overflow");
+                let created_ns = start.elapsed().as_nanos() as u64;
+                let hash = app_work(producer_id, id);
+                queue_thread.send_value(app_record_ptr(AppRecord {
+                    created_ns,
+                    id,
+                    hash,
+                }));
+            }
+            producer_max.fetch_max(start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        }));
+    }
+
+    let mut consumer_handles = Vec::with_capacity(scenario.consumers);
+    for consumer_id in 0..scenario.consumers {
+        let queue_thread = queue_handle.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let consumer_max = consumer_max.clone();
+        let consumed_total = consumed_total.clone();
+        let latency_total = latency_total.clone();
+        let core_id = bench_core_ids()
+            .get(core_offset + scenario.producers + consumer_id)
+            .copied();
+        consumer_handles.push(thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            loop {
+                let ptr = queue_thread.recv_value();
+                if ptr == SENTINEL {
+                    break;
+                }
+                let now_ns = start.elapsed().as_nanos() as u64;
+                let record = unsafe { app_record_from_ptr(ptr) };
+                let digest = app_work(producer_count + consumer_id, record.id ^ record.hash);
+                std::hint::black_box(digest);
+                latency_total.fetch_add(
+                    now_ns.saturating_sub(record.created_ns),
+                    AtomicOrdering::Relaxed,
+                );
+                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            consumer_max.fetch_max(start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        }));
+    }
+
+    ready.wait();
+    start.set(Instant::now()).ok();
+    start_gate.wait();
+
+    for handle in producer_handles {
+        handle.join().expect("producer join failed");
+    }
+    let sentinel_sender = queue_handle.thread_handle();
+    for _ in 0..scenario.consumers {
+        sentinel_sender.send_value(SENTINEL);
+    }
+    for handle in consumer_handles {
+        handle.join().expect("consumer join failed");
+    }
+
+    let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
+    BenchRecord {
+        queue: queue_name.to_string(),
+        mode: Mode::AppLogFanIn.name().to_string(),
+        items_per_producer,
+        total_items,
+        consumed_items: consumed,
+        elapsed_ns,
+        ops_per_sec: throughput_ops(consumed, elapsed_ns),
+        push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
+        pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
+        fill_elapsed_ns: None,
+        drain_elapsed_ns: None,
+        avg_data_latency_ns: average_latency_ns(&latency_total, consumed),
+        producer_fairness_ratio: None,
+        consumer_fairness_ratio: None,
+    }
+}
+
+fn bench_app_pipeline_for<Q: BenchQueue>(
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    bench_app_pipeline_with_queues(
+        Q::new_queue(),
+        Q::new_queue(),
+        queue_name,
+        scenario,
+        items_per_producer,
+        core_offset,
+    )
+}
+
+fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
+    stage1: Arc<Q>,
+    stage2: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    let total_items = total_items(items_per_producer, scenario.producers);
+    let total_threads = scenario
+        .total_threads()
+        .checked_add(1)
+        .expect("pipeline thread count overflow");
+    let ready = Arc::new(Barrier::new(total_threads + 1));
+    let start_gate = Arc::new(Barrier::new(total_threads + 1));
+    let start = Arc::new(OnceLock::new());
+    let producer_max = Arc::new(AtomicU64::new(0));
+    let collector_end = Arc::new(AtomicU64::new(0));
+    let consumed_total = Arc::new(AtomicU64::new(0));
+    let latency_total = Arc::new(AtomicU64::new(0));
+    let producer_count = scenario.producers;
+    let consumer_count = scenario.consumers;
+
+    let mut producer_handles = Vec::with_capacity(scenario.producers);
+    for producer_id in 0..scenario.producers {
+        let queue_thread = stage1.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let producer_max = producer_max.clone();
+        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        producer_handles.push(thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            let base = (producer_id as u64)
+                .checked_mul(items_per_producer)
+                .expect("item count overflow");
+            for offset in 0..items_per_producer {
+                let id = base.checked_add(offset).expect("item count overflow");
+                let created_ns = start.elapsed().as_nanos() as u64;
+                queue_thread.send_value(app_record_ptr(AppRecord {
+                    created_ns,
+                    id,
+                    hash: app_work(producer_id, id),
+                }));
+            }
+            producer_max.fetch_max(start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        }));
+    }
+
+    let mut worker_handles = Vec::with_capacity(scenario.consumers);
+    for worker_id in 0..scenario.consumers {
+        let input_thread = stage1.thread_handle();
+        let output_thread = stage2.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let core_id = bench_core_ids()
+            .get(core_offset + producer_count + worker_id)
+            .copied();
+        worker_handles.push(thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let _start: Instant = *start.get().expect("start set");
+            loop {
+                let ptr = input_thread.recv_value();
+                if ptr == SENTINEL {
+                    break;
+                }
+                let mut record = unsafe { app_record_from_ptr(ptr) };
+                record.hash ^= app_work(producer_count + worker_id, record.id);
+                output_thread.send_value(Box::into_raw(record) as usize as u64);
+            }
+        }));
+    }
+
+    let collector = {
+        let output_thread = stage2.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let collector_end = collector_end.clone();
+        let consumed_total = consumed_total.clone();
+        let latency_total = latency_total.clone();
+        let core_id = bench_core_ids()
+            .get(core_offset + scenario.producers + scenario.consumers)
+            .copied();
+        thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            for _ in 0..total_items {
+                let ptr = output_thread.recv_value();
+                let now_ns = start.elapsed().as_nanos() as u64;
+                let record = unsafe { app_record_from_ptr(ptr) };
+                std::hint::black_box(record.hash);
+                latency_total.fetch_add(
+                    now_ns.saturating_sub(record.created_ns),
+                    AtomicOrdering::Relaxed,
+                );
+                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            collector_end.store(start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        })
+    };
+
+    ready.wait();
+    start.set(Instant::now()).ok();
+    start_gate.wait();
+
+    for handle in producer_handles {
+        handle.join().expect("producer join failed");
+    }
+    let sentinel_sender = stage1.thread_handle();
+    for _ in 0..consumer_count {
+        sentinel_sender.send_value(SENTINEL);
+    }
+    for handle in worker_handles {
+        handle.join().expect("worker join failed");
+    }
+    collector.join().expect("collector join failed");
+
+    let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
+    BenchRecord {
+        queue: queue_name.to_string(),
+        mode: Mode::AppPipeline.name().to_string(),
+        items_per_producer,
+        total_items,
+        consumed_items: consumed,
+        elapsed_ns,
+        ops_per_sec: throughput_ops(consumed, elapsed_ns),
+        push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
+        pop_elapsed_ns: Some(collector_end.load(AtomicOrdering::Relaxed)),
+        fill_elapsed_ns: None,
+        drain_elapsed_ns: None,
+        avg_data_latency_ns: average_latency_ns(&latency_total, consumed),
+        producer_fairness_ratio: None,
+        consumer_fairness_ratio: None,
+    }
+}
+
+fn bench_app_task_roundtrip_for<Q: BenchQueue>(
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    bench_app_task_roundtrip_with_queues(
+        Q::new_queue(),
+        Q::new_queue(),
+        queue_name,
+        scenario,
+        items_per_producer,
+        core_offset,
+    )
+}
+
+fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
+    request_queue: Arc<Q>,
+    response_queue: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    let total_items = total_items(items_per_producer, scenario.producers);
+    let total_threads = scenario.total_threads();
+    let ready = Arc::new(Barrier::new(total_threads + 1));
+    let start_gate = Arc::new(Barrier::new(total_threads + 1));
+    let start = Arc::new(OnceLock::new());
+    let client_max = Arc::new(AtomicU64::new(0));
+    let worker_max = Arc::new(AtomicU64::new(0));
+    let consumed_total = Arc::new(AtomicU64::new(0));
+    let latency_total = Arc::new(AtomicU64::new(0));
+
+    let mut worker_handles = Vec::with_capacity(scenario.consumers);
+    for worker_id in 0..scenario.consumers {
+        let request_thread = request_queue.thread_handle();
+        let response_thread = response_queue.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let worker_max = worker_max.clone();
+        let core_id = bench_core_ids()
+            .get(core_offset + scenario.producers + worker_id)
+            .copied();
+        worker_handles.push(thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            loop {
+                let ptr = request_thread.recv_value();
+                if ptr == SENTINEL {
+                    break;
+                }
+                let mut record = unsafe { app_record_from_ptr(ptr) };
+                record.hash ^= app_work(worker_id, record.id);
+                response_thread.send_value(Box::into_raw(record) as usize as u64);
+            }
+            worker_max.fetch_max(start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        }));
+    }
+
+    let mut client_handles = Vec::with_capacity(scenario.producers);
+    for client_id in 0..scenario.producers {
+        let request_thread = request_queue.thread_handle();
+        let response_thread = response_queue.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let client_max = client_max.clone();
+        let consumed_total = consumed_total.clone();
+        let latency_total = latency_total.clone();
+        let core_id = bench_core_ids().get(core_offset + client_id).copied();
+        client_handles.push(thread::spawn(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            let base = (client_id as u64)
+                .checked_mul(items_per_producer)
+                .expect("item count overflow");
+            for offset in 0..items_per_producer {
+                let id = base.checked_add(offset).expect("item count overflow");
+                let created_ns = start.elapsed().as_nanos() as u64;
+                request_thread.send_value(app_record_ptr(AppRecord {
+                    created_ns,
+                    id,
+                    hash: app_work(client_id, id),
+                }));
+                let ptr = response_thread.recv_value();
+                let now_ns = start.elapsed().as_nanos() as u64;
+                let record = unsafe { app_record_from_ptr(ptr) };
+                std::hint::black_box(record.hash);
+                latency_total.fetch_add(
+                    now_ns.saturating_sub(record.created_ns),
+                    AtomicOrdering::Relaxed,
+                );
+                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            client_max.fetch_max(start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        }));
+    }
+
+    ready.wait();
+    start.set(Instant::now()).ok();
+    start_gate.wait();
+
+    for handle in client_handles {
+        handle.join().expect("client join failed");
+    }
+    let sentinel_sender = request_queue.thread_handle();
+    for _ in 0..scenario.consumers {
+        sentinel_sender.send_value(SENTINEL);
+    }
+    for handle in worker_handles {
+        handle.join().expect("worker join failed");
+    }
+
+    let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
+    BenchRecord {
+        queue: queue_name.to_string(),
+        mode: Mode::AppTaskRoundtrip.name().to_string(),
+        items_per_producer,
+        total_items,
+        consumed_items: consumed,
+        elapsed_ns,
+        ops_per_sec: throughput_ops(consumed, elapsed_ns),
+        push_elapsed_ns: Some(client_max.load(AtomicOrdering::Relaxed)),
+        pop_elapsed_ns: Some(worker_max.load(AtomicOrdering::Relaxed)),
+        fill_elapsed_ns: None,
+        drain_elapsed_ns: None,
+        avg_data_latency_ns: average_latency_ns(&latency_total, consumed),
+        producer_fairness_ratio: None,
+        consumer_fairness_ratio: None,
+    }
+}
+
+fn average_latency_ns(latency_total: &AtomicU64, consumed: u64) -> Option<f64> {
+    if consumed == 0 {
+        None
+    } else {
+        Some(latency_total.load(AtomicOrdering::Relaxed) as f64 / consumed as f64)
+    }
+}
+
 fn bench_complex_throughput_for<Q: BenchQueue>(
     queue_name: &str,
     scenario: &ScenarioConfig,
@@ -4456,6 +5101,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_application_metric_modes() {
+        assert_eq!(Mode::parse("app_log_fan_in"), Some(Mode::AppLogFanIn));
+        assert_eq!(Mode::parse("app-log-fan-in"), Some(Mode::AppLogFanIn));
+        assert_eq!(Mode::parse("app_pipeline"), Some(Mode::AppPipeline));
+        assert_eq!(Mode::parse("app-pipeline"), Some(Mode::AppPipeline));
+        assert_eq!(
+            Mode::parse("app_task_roundtrip"),
+            Some(Mode::AppTaskRoundtrip)
+        );
+        assert_eq!(
+            Mode::parse("app-task-roundtrip"),
+            Some(Mode::AppTaskRoundtrip)
+        );
+    }
+
+    #[test]
+    fn application_modes_complete_small_segqueue_runs() {
+        for scenario in [ScenarioConfig::new(1, 1), ScenarioConfig::new(2, 2)] {
+            for mode in [Mode::AppLogFanIn, Mode::AppPipeline, Mode::AppTaskRoundtrip] {
+                let record = match mode {
+                    Mode::AppLogFanIn => {
+                        bench_app_log_fan_in_for::<SegQueue<u64>>("segqueue", &scenario, 32, 0)
+                    }
+                    Mode::AppPipeline => {
+                        bench_app_pipeline_for::<SegQueue<u64>>("segqueue", &scenario, 32, 0)
+                    }
+                    Mode::AppTaskRoundtrip => {
+                        bench_app_task_roundtrip_for::<SegQueue<u64>>("segqueue", &scenario, 32, 0)
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(record.mode, mode.name());
+                assert_eq!(record.consumed_items, record.total_items);
+                assert!(record.ops_per_sec.is_some());
+                assert!(record.avg_data_latency_ns.is_some());
+                assert!(record.push_elapsed_ns.is_some());
+                assert!(record.pop_elapsed_ns.is_some());
+            }
+        }
+    }
+
+    #[test]
     fn direct_plan_expands_fastfifo_block_variants() {
         let plan = build_direct_matrix_plan(
             "local",
@@ -4509,6 +5196,39 @@ mod tests {
             labels,
             vec!["lfqueue_32", "lfqueue_256", "wcq_4096", "wcq_65536"]
         );
+    }
+
+    #[test]
+    fn direct_plan_schedules_application_modes_but_excludes_wcq() {
+        let plan = build_direct_matrix_plan(
+            "local",
+            PathBuf::from(DEFAULT_RUNS_DIR),
+            8,
+            &[QueueKind::SegQueue, QueueKind::LfQueue, QueueKind::Wcq],
+            &[],
+            &[],
+            &[32],
+            &[4096],
+            &[ScenarioConfig::new(2, 2)],
+            &[Mode::AppLogFanIn, Mode::AppPipeline, Mode::AppTaskRoundtrip],
+            &[1],
+            1,
+            false,
+        )
+        .expect("plan");
+        let keys = expected_keys_for_bundle(&plan, &plan.bundles[0]);
+        assert_eq!(keys.len(), 6);
+        assert!(keys.iter().all(|key| !key.queue_label.starts_with("wcq_")));
+        for mode in [Mode::AppLogFanIn, Mode::AppPipeline, Mode::AppTaskRoundtrip] {
+            assert!(
+                keys.iter()
+                    .any(|key| key.mode == mode && key.queue_label == "segqueue")
+            );
+            assert!(
+                keys.iter()
+                    .any(|key| key.mode == mode && key.queue_label == "lfqueue_32")
+            );
+        }
     }
 
     #[test]

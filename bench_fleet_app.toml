@@ -1,0 +1,28 @@
+[defaults]
+runs_dir = "bench_results/runs"
+plot_out_dir = "bench_results/plots"
+remote_repo_dir = "~/UBQ"
+remote_runs_dir = "bench_results/runs"
+
+# Synthetic application-level queue experiments. These model common application
+# communication patterns while still isolating queue behavior.
+queues = ["ubq", "segqueue", "concurrent-queue", "rbbq", "lfqueue"]
+modes = ["app_log_fan_in", "app_pipeline", "app_task_roundtrip"]
+items_per_producer = [100000]
+repeats = 3
+fastfifo_block_sizes = [64, 256, 1024, 4096]
+lfqueue_segment_sizes = [32, 256, 1024]
+scenarios = ["1p1c", "4p1c", "1p4c", "4p4c", "8p8c", "16p16c"]
+ubq_labels = ["balanced,8,127,crossbeam"]
+
+[machines.local]
+local = true
+machine_label = "local"
+
+[machines.lab]
+host = "lab"
+machine_label = "lab"
+
+[machines.hebrides]
+host = "hebrides"
+machine_label = "hebrides"

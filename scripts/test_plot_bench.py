@@ -225,6 +225,12 @@ class MetricExtractionTest(unittest.TestCase):
                     "fill_elapsed_ns": 23,
                     "drain_elapsed_ns": 29,
                 },
+                {
+                    "queue": "concurrent-queue",
+                    "mode": "app_log_fan_in",
+                    "ops_per_sec": 75.0,
+                    "avg_data_latency_ns": 31,
+                },
             ],
         }
 
@@ -244,6 +250,11 @@ class MetricExtractionTest(unittest.TestCase):
         )
         self.assertEqual(23.0, by_mode[("fill_drain_fill_elapsed", "segqueue")])
         self.assertEqual(29.0, by_mode[("fill_drain_drain_elapsed", "segqueue")])
+        self.assertEqual(75.0, by_mode[("app_log_fan_in", "concurrent-queue")])
+        self.assertEqual(
+            31.0,
+            by_mode[("app_log_fan_in_data_latency", "concurrent-queue")],
+        )
 
 
 class ScenarioFamilyTest(unittest.TestCase):

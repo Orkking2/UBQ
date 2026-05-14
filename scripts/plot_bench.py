@@ -130,13 +130,17 @@ def mode_sort_key(name: str):
         "fairness_throughput": 5,
         "fairness": 6,
         "fill_drain": 7,
-        "mutable_placeholder": 8,
+        "app_log_fan_in": 8,
+        "app_pipeline": 9,
+        "app_task_roundtrip": 10,
+        "mutable_placeholder": 11,
     }
     derived_suffixes = {
         "push_elapsed": 1,
         "pop_elapsed": 2,
         "fill_elapsed": 3,
         "drain_elapsed": 4,
+        "data_latency": 5,
     }
     for suffix, suffix_priority in derived_suffixes.items():
         marker = f"_{suffix}"
@@ -148,6 +152,8 @@ def mode_sort_key(name: str):
 
 def metric_column(mode: str):
     if mode == "data_latency":
+        return "avg_data_latency_ns"
+    if mode.endswith("_data_latency"):
         return "avg_data_latency_ns"
     if mode in ("producer_fairness", "consumer_fairness", "fairness"):
         return "fairness_ratio"
@@ -165,6 +171,8 @@ def metric_column(mode: str):
 def metric_axis_label(mode: str):
     if mode == "data_latency":
         return "Average data latency (ns)"
+    if mode.endswith("_data_latency"):
+        return "Average data latency (ns)"
     if mode in ("producer_fairness", "consumer_fairness", "fairness"):
         return "Fairness ratio (max/min)"
     if mode.endswith(("_push_elapsed", "_pop_elapsed", "_fill_elapsed", "_drain_elapsed")):
@@ -174,6 +182,8 @@ def metric_axis_label(mode: str):
 
 def metric_file_slug(mode: str):
     if mode == "data_latency":
+        return "data_latency"
+    if mode.endswith("_data_latency"):
         return "data_latency"
     if mode in ("producer_fairness", "consumer_fairness", "fairness"):
         return mode
@@ -190,6 +200,9 @@ def source_mode_display_name(mode: str):
         "data_latency": "data latency",
         "fairness": "fairness",
         "fill_drain": "fill/drain",
+        "app_log_fan_in": "app log fan-in",
+        "app_pipeline": "app pipeline",
+        "app_task_roundtrip": "app task roundtrip",
     }
     return names.get(mode, mode.replace("_", " "))
 
@@ -203,12 +216,16 @@ def metric_display_name(mode: str):
         "consumer_fairness": "consumer fairness",
         "fairness_throughput": "fairness throughput",
         "fill_drain": "fill/drain throughput",
+        "app_log_fan_in": "app log fan-in throughput",
+        "app_pipeline": "app pipeline throughput",
+        "app_task_roundtrip": "app task roundtrip throughput",
     }
     for suffix, label in (
         ("push_elapsed", "push elapsed"),
         ("pop_elapsed", "pop elapsed"),
         ("fill_elapsed", "fill elapsed"),
         ("drain_elapsed", "drain elapsed"),
+        ("data_latency", "data latency"),
     ):
         marker = f"_{suffix}"
         if mode.endswith(marker):
@@ -221,7 +238,15 @@ def metric_lower_is_better(mode: str):
     return (
         mode == "data_latency"
         or mode in ("producer_fairness", "consumer_fairness", "fairness")
-        or mode.endswith(("_push_elapsed", "_pop_elapsed", "_fill_elapsed", "_drain_elapsed"))
+        or mode.endswith(
+            (
+                "_push_elapsed",
+                "_pop_elapsed",
+                "_fill_elapsed",
+                "_drain_elapsed",
+                "_data_latency",
+            )
+        )
     )
 
 
@@ -623,6 +648,8 @@ def load_records(path: Path):
             )
         else:
             metric_specs.append((mode, "ops_per_sec"))
+            if mode.startswith("app_"):
+                metric_specs.append((f"{mode}_data_latency", "avg_data_latency_ns"))
 
         for suffix, field in (
             ("push_elapsed", "push_elapsed_ns"),
@@ -740,7 +767,7 @@ def error_value(stats, error_bars: str):
 def format_metric_value(mode: str, value: float):
     if mode in ("producer_fairness", "consumer_fairness", "fairness"):
         return f"{value:,.3f}"
-    if mode == "data_latency" or mode.endswith(("_push_elapsed", "_pop_elapsed", "_fill_elapsed", "_drain_elapsed")):
+    if mode == "data_latency" or mode.endswith(("_push_elapsed", "_pop_elapsed", "_fill_elapsed", "_drain_elapsed", "_data_latency")):
         return f"{value:,.0f} ns"
     return f"{value:,.0f}"
 

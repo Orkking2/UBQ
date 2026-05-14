@@ -136,6 +136,32 @@ For BBQ ATC 2022-style microbenchmarks, the scenario parser also accepts
 [docs/bbq_atc22_reproduction.md](docs/bbq_atc22_reproduction.md) and
 `bench_fleet_bbq_atc22.toml` for the ready-to-run suite.
 
+The harness also includes synthetic application-level queue experiments. These
+are still controlled benchmarks, not full production workload models, but they
+exercise common application communication patterns. See
+[docs/application_benchmarks.md](docs/application_benchmarks.md) for notes on
+how to interpret them:
+
+- `app_log_fan_in`: producers emit boxed log/event records into one shared
+  queue while consumers hash and free them.
+- `app_pipeline`: ingress threads feed a first queue, worker threads transform
+  records into a second queue, and one collector drains completions.
+- `app_task_roundtrip`: client threads submit one in-flight request at a time
+  to worker threads and receive completions through a shared response queue.
+
+Run the application-level suite:
+
+```bash
+cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue --bin bench_matrix -- \
+  --machine-label local \
+  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue \
+  --ubq-label balanced,8,127,crossbeam \
+  --scenarios 1p1c,4p1c,1p4c,4p4c,8p8c,16p16c \
+  --modes app_log_fan_in,app_pipeline,app_task_roundtrip \
+  --items-per-producer 100000 \
+  --repeats 3
+```
+
 Run the frontier search on one machine:
 
 ```bash
