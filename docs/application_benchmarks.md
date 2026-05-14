@@ -19,6 +19,12 @@ These modes use the existing v2 JSON schema. Throughput is stored in
 `ops_per_sec`, average latency in `avg_data_latency_ns`, and producer/consumer
 elapsed timing in `push_elapsed_ns` and `pop_elapsed_ns`.
 
+Each scheduled queue sample has a watchdog timeout. The default is 300 seconds
+per sample and can be overridden with `UBQ_BENCH_JOB_TIMEOUT_SECS`. If a queue
+hangs or panics, the scheduler still writes a result record for that sample with
+`status` set to `timed_out` or `failed`, no throughput value, and a
+`failure_reason`, then continues evaluating the remaining queues.
+
 Run the configured fleet:
 
 ```bash

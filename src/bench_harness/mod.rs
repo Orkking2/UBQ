@@ -54,6 +54,7 @@ const DEFAULT_FASTFIFO_BLOCK_SIZES: [usize; 4] = [64, 256, 1024, 4096];
 const RBBQ_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "bench_wcq")]
 const WCQ_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_BENCH_JOB_TIMEOUT_SECS: u64 = 300;
 const UBQ_POOL_VALUES: [u8; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
 const UBQ_BLOCK_VALUES: [u16; 8] = [31, 63, 127, 255, 511, 1023, 2047, 4095];
 const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
@@ -62,6 +63,59 @@ const DEFAULT_WCQ_CAPACITIES: [usize; 3] = [4096, 65536, 1048576];
 const SUPPORTED_WCQ_CAPACITIES: [usize; 8] =
     [256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304];
 const WCQ_MAX_THREADS: usize = 256;
+
+thread_local! {
+    static BENCH_JOB_DEADLINE: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn bench_job_timeout() -> Duration {
+    std::env::var("UBQ_BENCH_JOB_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_BENCH_JOB_TIMEOUT_SECS))
+}
+
+fn current_bench_job_deadline() -> Option<Instant> {
+    BENCH_JOB_DEADLINE.with(std::cell::Cell::get)
+}
+
+fn with_bench_job_deadline<T>(deadline: Option<Instant>, f: impl FnOnce() -> T) -> T {
+    struct DeadlineGuard(Option<Instant>);
+
+    impl Drop for DeadlineGuard {
+        fn drop(&mut self) {
+            BENCH_JOB_DEADLINE.with(|slot| slot.set(self.0));
+        }
+    }
+
+    BENCH_JOB_DEADLINE.with(|slot| {
+        let previous = slot.replace(deadline);
+        let _guard = DeadlineGuard(previous);
+        f()
+    })
+}
+
+fn check_bench_job_deadline(operation: &str) {
+    let Some(deadline) = current_bench_job_deadline() else {
+        return;
+    };
+    assert!(
+        Instant::now() < deadline,
+        "benchmark job timed out while {operation}"
+    );
+}
+
+fn spawn_bench_thread<F, T>(f: F) -> thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let deadline = current_bench_job_deadline();
+    thread::spawn(move || with_bench_job_deadline(deadline, f))
+}
 
 pub trait BenchQueueOps: Send + Sync + 'static {
     fn send_value(&self, value: u64);
@@ -110,12 +164,14 @@ where
     A: Send + Sync + 'static,
 {
     fn send_value(&self, value: u64) {
+        check_bench_job_deadline("pushing to UBQ");
         self.push(value);
     }
 
     fn recv_value(&self) -> u64 {
         let backoff = Backoff::new();
         loop {
+            check_bench_job_deadline("popping from UBQ");
             if let Some(value) = self.pop() {
                 return value;
             }
@@ -137,12 +193,14 @@ where
 
 impl BenchQueueOps for SegQueue<u64> {
     fn send_value(&self, value: u64) {
+        check_bench_job_deadline("pushing to SegQueue");
         self.push(value);
     }
 
     fn recv_value(&self) -> u64 {
         let backoff = Backoff::new();
         loop {
+            check_bench_job_deadline("popping from SegQueue");
             if let Some(value) = self.pop() {
                 return value;
             }
@@ -159,12 +217,14 @@ impl BenchQueue for SegQueue<u64> {
 
 impl BenchQueueOps for ConcurrentQueue<u64> {
     fn send_value(&self, value: u64) {
+        check_bench_job_deadline("pushing to concurrent-queue");
         self.push(value).expect("send failed");
     }
 
     fn recv_value(&self) -> u64 {
         let backoff = Backoff::new();
         loop {
+            check_bench_job_deadline("popping from concurrent-queue");
             match self.pop() {
                 Ok(value) => return value,
                 Err(PopError::Empty) => {}
@@ -198,12 +258,14 @@ impl LfQueueBenchQueue {
 #[cfg(feature = "bench_lfqueue")]
 impl BenchQueueOps for LfQueueBenchQueue {
     fn send_value(&self, value: u64) {
+        check_bench_job_deadline("pushing to lfqueue");
         self.inner.enqueue(value);
     }
 
     fn recv_value(&self) -> u64 {
         let backoff = Backoff::new();
         loop {
+            check_bench_job_deadline("popping from lfqueue");
             if let Some(value) = self.inner.dequeue() {
                 return value;
             }
@@ -273,6 +335,7 @@ impl<const CAPACITY: usize> BenchQueueThreadOps for WcqThreadHandle<CAPACITY> {
         let deadline = Instant::now() + WCQ_WAIT_TIMEOUT;
         let backoff = Backoff::new();
         loop {
+            check_bench_job_deadline("pushing to wCQ");
             if self.queue.inner.enqueue(self.handle, value).is_ok() {
                 return;
             }
@@ -284,6 +347,7 @@ impl<const CAPACITY: usize> BenchQueueThreadOps for WcqThreadHandle<CAPACITY> {
     fn recv_value(&self) -> u64 {
         let backoff = Backoff::new();
         loop {
+            check_bench_job_deadline("popping from wCQ");
             if let Some(value) = self.queue.inner.dequeue(self.handle) {
                 return value;
             }
@@ -323,6 +387,7 @@ impl BenchQueueOps for RbbqBenchQueue {
         let deadline = Instant::now() + RBBQ_WAIT_TIMEOUT;
         let backoff = Backoff::new();
         loop {
+            check_bench_job_deadline("pushing to RBBQ");
             if self.inner.push(value).is_ok() {
                 return;
             }
@@ -335,6 +400,7 @@ impl BenchQueueOps for RbbqBenchQueue {
         let deadline = Instant::now() + RBBQ_WAIT_TIMEOUT;
         let backoff = Backoff::new();
         loop {
+            check_bench_job_deadline("popping from RBBQ");
             if let Ok(value) = self.inner.pop() {
                 return value;
             }
@@ -643,6 +709,24 @@ pub struct OutputMeta {
     pub ubq_block_size: Option<u16>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchRecordStatus {
+    Completed,
+    Failed,
+    TimedOut,
+}
+
+impl BenchRecordStatus {
+    fn completed() -> Self {
+        Self::Completed
+    }
+}
+
+fn is_completed_status(status: &BenchRecordStatus) -> bool {
+    matches!(status, BenchRecordStatus::Completed)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BenchRecord {
     pub queue: String,
@@ -667,6 +751,21 @@ pub struct BenchRecord {
     pub producer_fairness_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consumer_fairness_ratio: Option<f64>,
+    #[serde(
+        default = "BenchRecordStatus::completed",
+        skip_serializing_if = "is_completed_status"
+    )]
+    pub status: BenchRecordStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ns: Option<u64>,
+}
+
+impl BenchRecord {
+    fn completed(&self) -> bool {
+        self.status == BenchRecordStatus::Completed
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2452,8 +2551,24 @@ pub fn run_embedded_scheduler(plan: MatrixPlan, factories: Vec<JobFactory>) -> R
 fn execute_job_factories(
     plan: &MatrixPlan,
     cache: &ExistingRunsIndex,
+    pending: Vec<JobFactory>,
+    available_parallelism: usize,
+) -> Result<(BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>), String> {
+    execute_job_factories_with_timeout(
+        plan,
+        cache,
+        pending,
+        available_parallelism,
+        bench_job_timeout(),
+    )
+}
+
+fn execute_job_factories_with_timeout(
+    plan: &MatrixPlan,
+    cache: &ExistingRunsIndex,
     mut pending: Vec<JobFactory>,
     available_parallelism: usize,
+    job_timeout: Duration,
 ) -> Result<(BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>), String> {
     for job in &pending {
         if job.spec.thread_budget() > available_parallelism {
@@ -2482,71 +2597,93 @@ fn execute_job_factories(
         .build()
         .map_err(|err| format!("failed to build scheduler runtime: {err}"))?;
 
-    // Each task returns (key, Option<record>, budget).
-    // A None record means the spawn_blocking closure panicked.
+    // Each task returns (key, record, budget). Panics and timeouts become
+    // failed records so one bad queue does not abort the whole batch.
     let execution_result: Result<(BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>), String> =
         runtime.block_on(async {
             let mut results = BTreeMap::new();
-            let mut running: JoinSet<Result<(SampleKey, Option<BenchRecord>, usize), String>> =
+            let mut running: JoinSet<Result<(SampleKey, BenchRecord, usize), String>> =
                 JoinSet::new();
             let mut used_threads = 0_usize;
             let mut completed = 0_usize;
-            let mut crashed_job: Option<(String, String)> = None;
-            let mut stop_scheduling = false;
 
             while !pending.is_empty() || !running.is_empty() {
                 let mut started = false;
-                if !stop_scheduling {
-                    loop {
-                        let Some(index) = pending.iter().position(|job| {
-                            can_start_job(&job.spec, used_threads, available_parallelism)
-                        }) else {
-                            break;
-                        };
-                        let job = pending.remove(index);
-                        let key = SampleKey::from_job(&job.spec);
-                        let budget = job.spec.thread_budget();
-                        used_threads += budget;
-                        started = true;
-                        progress_line(format!(
-                            "scheduler: start {} scenario={} repeat={} mode={} items={} threads={} active={}/{} pending={}",
-                            job.spec.queue_label(),
-                            job.spec.scenario.name.as_str(),
-                            job.spec.repeat_index,
-                            job.spec.mode.name(),
-                            job.spec.items_per_producer,
-                            budget,
-                            used_threads,
-                            available_parallelism,
-                            pending.len()
-                        ));
-                        let core_offset = used_threads - budget;
-                        running.spawn(async move {
-                            let handle = tokio::task::spawn_blocking(move || (job.run)(core_offset));
-                            match handle.await {
-                                Ok(record) => Ok((key, Some(record), budget)),
-                                Err(err) if err.is_panic() => {
-                                    Ok((key, None, budget))
-                                }
-                                Err(err) => {
-                                    Err(format!("benchmark task join failed: {err}"))
-                                }
-                            }
+                loop {
+                    let Some(index) = pending
+                        .iter()
+                        .position(|job| can_start_job(&job.spec, used_threads, available_parallelism))
+                    else {
+                        break;
+                    };
+                    let job = pending.remove(index);
+                    let key = SampleKey::from_job(&job.spec);
+                    let budget = job.spec.thread_budget();
+                    used_threads += budget;
+                    started = true;
+                    progress_line(format!(
+                        "scheduler: start {} scenario={} repeat={} mode={} items={} threads={} active={}/{} pending={}",
+                        job.spec.queue_label(),
+                        job.spec.scenario.name.as_str(),
+                        job.spec.repeat_index,
+                        job.spec.mode.name(),
+                        job.spec.items_per_producer,
+                        budget,
+                        used_threads,
+                        available_parallelism,
+                        pending.len()
+                    ));
+                    let core_offset = used_threads - budget;
+                    running.spawn(async move {
+                        let timeout_ns = job_timeout.as_nanos() as u64;
+                        let started_at = Instant::now();
+                        let deadline = started_at.checked_add(job_timeout);
+                        let timeout_spec = job.spec.clone();
+                        let panic_spec = job.spec.clone();
+                        let handle = tokio::task::spawn_blocking(move || {
+                            with_bench_job_deadline(deadline, || (job.run)(core_offset))
                         });
-                    }
+                        match tokio::time::timeout(job_timeout, handle).await {
+                            Ok(Ok(record)) => Ok((key, record, budget)),
+                            Ok(Err(err)) if err.is_panic() => {
+                                let elapsed_ns = started_at.elapsed().as_nanos() as u64;
+                                let reason = panic_payload_message(err.into_panic());
+                                let record = failed_bench_record(
+                                    &panic_spec,
+                                    BenchRecordStatus::Failed,
+                                    reason,
+                                    elapsed_ns,
+                                    None,
+                                );
+                                Ok((key, record, budget))
+                            }
+                            Ok(Err(err)) => Err(format!("benchmark task join failed: {err}")),
+                            Err(_) => {
+                                let elapsed_ns = started_at.elapsed().as_nanos() as u64;
+                                let record = failed_bench_record(
+                                    &timeout_spec,
+                                    BenchRecordStatus::TimedOut,
+                                    format!("benchmark job exceeded {}s timeout", job_timeout.as_secs()),
+                                    elapsed_ns,
+                                    Some(timeout_ns),
+                                );
+                                Ok((key, record, budget))
+                            }
+                        }
+                    });
                 }
 
-                if running.is_empty() && !pending.is_empty() && !stop_scheduling {
+                if running.is_empty() && !pending.is_empty() {
                     return Err("scheduler stalled with pending work".to_string());
                 }
 
-                if !started || pending.is_empty() || stop_scheduling {
+                if !started || pending.is_empty() {
                     if let Some(joined) = running.join_next().await {
-                        let (key, maybe_record, budget) =
+                        let (key, record, budget) =
                             joined.map_err(|err| format!("scheduler task failed: {err}"))??;
                         used_threads = used_threads.saturating_sub(budget);
-                        if let Some(record) = maybe_record {
-                            completed += 1;
+                        completed += 1;
+                        if record.completed() {
                             progress_line(format!(
                                 "scheduler: done {} scenario={} repeat={} mode={} items={} active={}/{} completed={}/{}",
                                 key.queue_label.as_str(),
@@ -2559,29 +2696,35 @@ fn execute_job_factories(
                                 completed,
                                 total_jobs
                             ));
-                            writer.submit(key.clone(), record.clone())?;
-                            results.insert(key, record);
                         } else {
-                            // Panic caught: record crash, drain remaining running tasks.
                             progress_line(format!(
-                                "scheduler: panic in {} scenario={} repeat={} — stopping new jobs",
+                                "scheduler: {} {} scenario={} repeat={} mode={} items={} active={}/{} completed={}/{} reason={}",
+                                match &record.status {
+                                    BenchRecordStatus::Completed => "done",
+                                    BenchRecordStatus::Failed => "failed",
+                                    BenchRecordStatus::TimedOut => "timed out",
+                                },
                                 key.queue_label.as_str(),
                                 key.scenario.as_str(),
                                 key.repeat_index,
+                                key.mode.name(),
+                                key.items_per_producer,
+                                used_threads,
+                                available_parallelism,
+                                completed,
+                                total_jobs,
+                                record.failure_reason.as_deref().unwrap_or("unknown")
                             ));
-                            if crashed_job.is_none() && key.queue_label.starts_with("ubq_") {
-                                crashed_job =
-                                    Some((key.queue_label.clone(), key.scenario.clone()));
-                            }
-                            stop_scheduling = true;
-                            pending.clear();
                         }
+                        writer.submit(key.clone(), record.clone())?;
+                        results.insert(key, record);
                     }
                 }
             }
 
-            Ok((results, crashed_job))
+            Ok((results, None))
         });
+    runtime.shutdown_timeout(Duration::from_secs(1));
     let is_fully_complete = matches!(&execution_result, Ok((_, None)));
     let writer_result = writer.close(is_fully_complete);
     match (execution_result, writer_result) {
@@ -3605,7 +3748,7 @@ fn bench_throughput_with_queue<Q: BenchQueueHandleFactory>(
         let start = start.clone();
         let producer_max = producer_max.clone();
         let core_id = bench_core_ids().get(core_offset + producer_id).copied();
-        producer_handles.push(thread::spawn(move || {
+        producer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -3635,7 +3778,7 @@ fn bench_throughput_with_queue<Q: BenchQueueHandleFactory>(
         let core_id = bench_core_ids()
             .get(core_offset + scenario.producers + consumer_id)
             .copied();
-        consumer_handles.push(thread::spawn(move || {
+        consumer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -3688,6 +3831,9 @@ fn bench_throughput_with_queue<Q: BenchQueueHandleFactory>(
         avg_data_latency_ns: None,
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
+        status: BenchRecordStatus::Completed,
+        failure_reason: None,
+        timeout_ns: None,
     }
 }
 
@@ -3772,7 +3918,7 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
         let start = start.clone();
         let producer_max = producer_max.clone();
         let core_id = bench_core_ids().get(core_offset + producer_id).copied();
-        producer_handles.push(thread::spawn(move || {
+        producer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -3808,7 +3954,7 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
         let core_id = bench_core_ids()
             .get(core_offset + scenario.producers + consumer_id)
             .copied();
-        consumer_handles.push(thread::spawn(move || {
+        consumer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -3866,6 +4012,9 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
         avg_data_latency_ns: average_latency_ns(&latency_total, consumed),
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
+        status: BenchRecordStatus::Completed,
+        failure_reason: None,
+        timeout_ns: None,
     }
 }
 
@@ -3916,7 +4065,7 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
         let start = start.clone();
         let producer_max = producer_max.clone();
         let core_id = bench_core_ids().get(core_offset + producer_id).copied();
-        producer_handles.push(thread::spawn(move || {
+        producer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -3949,7 +4098,7 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
         let core_id = bench_core_ids()
             .get(core_offset + producer_count + worker_id)
             .copied();
-        worker_handles.push(thread::spawn(move || {
+        worker_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -3979,7 +4128,7 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
         let core_id = bench_core_ids()
             .get(core_offset + scenario.producers + scenario.consumers)
             .copied();
-        thread::spawn(move || {
+        spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -4034,6 +4183,9 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
         avg_data_latency_ns: average_latency_ns(&latency_total, consumed),
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
+        status: BenchRecordStatus::Completed,
+        failure_reason: None,
+        timeout_ns: None,
     }
 }
 
@@ -4082,7 +4234,7 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
         let core_id = bench_core_ids()
             .get(core_offset + scenario.producers + worker_id)
             .copied();
-        worker_handles.push(thread::spawn(move || {
+        worker_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -4113,7 +4265,7 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
         let consumed_total = consumed_total.clone();
         let latency_total = latency_total.clone();
         let core_id = bench_core_ids().get(core_offset + client_id).copied();
-        client_handles.push(thread::spawn(move || {
+        client_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -4177,6 +4329,9 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
         avg_data_latency_ns: average_latency_ns(&latency_total, consumed),
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
+        status: BenchRecordStatus::Completed,
+        failure_reason: None,
+        timeout_ns: None,
     }
 }
 
@@ -4228,7 +4383,7 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
         let start = start.clone();
         let producer_max = producer_max.clone();
         let core_id = bench_core_ids().get(core_offset + producer_id).copied();
-        producer_handles.push(thread::spawn(move || {
+        producer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -4260,7 +4415,7 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
         let core_id = bench_core_ids()
             .get(core_offset + scenario.producers + consumer_id)
             .copied();
-        consumer_handles.push(thread::spawn(move || {
+        consumer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -4316,6 +4471,9 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
         avg_data_latency_ns: None,
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
+        status: BenchRecordStatus::Completed,
+        failure_reason: None,
+        timeout_ns: None,
     }
 }
 
@@ -4360,7 +4518,7 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
         let start = start.clone();
         let producer_max = producer_max.clone();
         let core_id = bench_core_ids().get(core_offset + producer_id).copied();
-        producer_handles.push(thread::spawn(move || {
+        producer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -4392,7 +4550,7 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
         let core_id = bench_core_ids()
             .get(core_offset + scenario.producers + consumer_id)
             .copied();
-        consumer_handles.push(thread::spawn(move || {
+        consumer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -4454,6 +4612,9 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
         avg_data_latency_ns,
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
+        status: BenchRecordStatus::Completed,
+        failure_reason: None,
+        timeout_ns: None,
     }
 }
 
@@ -4492,7 +4653,7 @@ fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
         let start_gate = start_gate.clone();
         let start = start.clone();
         let core_id = bench_core_ids().get(core_offset + producer_id).copied();
-        producer_handles.push(thread::spawn(move || -> u64 {
+        producer_handles.push(spawn_bench_thread(move || -> u64 {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -4519,7 +4680,7 @@ fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
         let core_id = bench_core_ids()
             .get(core_offset + scenario.producers + consumer_id)
             .copied();
-        consumer_handles.push(thread::spawn(move || -> (u64, u64) {
+        consumer_handles.push(spawn_bench_thread(move || -> (u64, u64) {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -4582,6 +4743,9 @@ fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
         avg_data_latency_ns: None,
         producer_fairness_ratio: fairness_ratio(&producer_rates),
         consumer_fairness_ratio: fairness_ratio(&consumer_rates),
+        status: BenchRecordStatus::Completed,
+        failure_reason: None,
+        timeout_ns: None,
     }
 }
 
@@ -4637,6 +4801,9 @@ fn bench_fill_drain_with_queue<Q: BenchQueueHandleFactory>(
         avg_data_latency_ns: None,
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
+        status: BenchRecordStatus::Completed,
+        failure_reason: None,
+        timeout_ns: None,
     }
 }
 
@@ -4660,6 +4827,51 @@ fn throughput_ops(consumed: u64, elapsed_ns: u64) -> Option<f64> {
     }
 }
 
+fn record_queue_name_for_spec(spec: &JobSpec) -> String {
+    match spec.queue {
+        QueueKind::Ubq => QueueKind::Ubq.name().to_string(),
+        _ => spec.queue_label(),
+    }
+}
+
+fn failed_bench_record(
+    spec: &JobSpec,
+    status: BenchRecordStatus,
+    reason: String,
+    elapsed_ns: u64,
+    timeout_ns: Option<u64>,
+) -> BenchRecord {
+    BenchRecord {
+        queue: record_queue_name_for_spec(spec),
+        mode: spec.mode.name().to_string(),
+        items_per_producer: spec.items_per_producer,
+        total_items: total_items(spec.items_per_producer, spec.scenario.producers),
+        consumed_items: 0,
+        elapsed_ns,
+        ops_per_sec: None,
+        push_elapsed_ns: None,
+        pop_elapsed_ns: None,
+        fill_elapsed_ns: None,
+        drain_elapsed_ns: None,
+        avg_data_latency_ns: None,
+        producer_fairness_ratio: None,
+        consumer_fairness_ratio: None,
+        status,
+        failure_reason: Some(reason),
+        timeout_ns,
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "benchmark job panicked".to_string()
+    }
+}
+
 fn run_producers_only_for<Q: BenchQueueHandleFactory>(
     queue_handle: &Arc<Q>,
     producers: usize,
@@ -4679,7 +4891,7 @@ fn run_producers_only_for<Q: BenchQueueHandleFactory>(
         let start = start.clone();
         let max_end = max_end.clone();
         let core_id = bench_core_ids().get(core_offset + producer_id).copied();
-        handles.push(thread::spawn(move || {
+        handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -4727,7 +4939,7 @@ fn run_consumers_only_for<Q: BenchQueueHandleFactory>(
         let max_end = max_end.clone();
         let consumed_total = consumed_total.clone();
         let core_id = bench_core_ids().get(core_offset + consumer_id).copied();
-        handles.push(thread::spawn(move || {
+        handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -5009,6 +5221,9 @@ mod tests {
             avg_data_latency_ns: None,
             producer_fairness_ratio: None,
             consumer_fairness_ratio: None,
+            status: BenchRecordStatus::Completed,
+            failure_reason: None,
+            timeout_ns: None,
         }
     }
 
@@ -5326,12 +5541,16 @@ mod tests {
                 avg_data_latency_ns: None,
                 producer_fairness_ratio: None,
                 consumer_fairness_ratio: None,
+                status: BenchRecordStatus::Completed,
+                failure_reason: None,
+                timeout_ns: None,
             }],
         };
         let json = serde_json::to_string(&output).expect("json");
         assert!(!json.contains("null"));
         assert!(!json.contains("ubq_label"));
         assert!(!json.contains("fill_elapsed_ns"));
+        assert!(!json.contains("status"));
     }
 
     #[test]
@@ -5548,6 +5767,102 @@ mod tests {
     }
 
     #[test]
+    fn execute_job_factories_records_timeout_and_continues() {
+        let root =
+            std::env::temp_dir().join(format!("ubq_timeout_record_test_{}", now_unix_nanos()));
+        let runs_dir = root.join("runs");
+        fs::create_dir_all(&runs_dir).expect("mkdir");
+
+        let scenario = ScenarioConfig::new(1, 1);
+        let plan = MatrixPlan {
+            plan_schema_version: PLAN_SCHEMA_VERSION,
+            machine_label: "local".to_string(),
+            runs_dir: runs_dir.clone(),
+            available_parallelism: 4,
+            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
+            fastfifo_block_sizes: Vec::new(),
+            lfqueue_segment_sizes: Vec::new(),
+            wcq_capacities: Vec::new(),
+            bundles: vec![PlanBundle {
+                scenario: scenario.clone(),
+                repeat_index: 1,
+                ubq_label: None,
+                modes: vec![Mode::Throughput],
+                items_per_producer_values: vec![1],
+            }],
+            reuse_existing: false,
+        };
+
+        let slow_spec = JobSpec {
+            scenario: scenario.clone(),
+            repeat_index: 1,
+            mode: Mode::Throughput,
+            items_per_producer: 1,
+            queue: QueueKind::SegQueue,
+            ubq_label: None,
+            fastfifo_block_size: None,
+            lfqueue_segment_size: None,
+            wcq_capacity: None,
+        };
+        let fast_spec = JobSpec {
+            queue: QueueKind::ConcurrentQueue,
+            ..slow_spec.clone()
+        };
+        let pending = vec![
+            JobFactory {
+                spec: slow_spec.clone(),
+                run: Arc::new(move |_| {
+                    std::thread::sleep(Duration::from_millis(80));
+                    test_record("segqueue", Mode::Throughput, 1)
+                }),
+            },
+            JobFactory {
+                spec: fast_spec.clone(),
+                run: Arc::new(move |_| test_record("concurrent-queue", Mode::Throughput, 1)),
+            },
+        ];
+
+        let (executed, crashed) = execute_job_factories_with_timeout(
+            &plan,
+            &ExistingRunsIndex::default(),
+            pending,
+            plan.available_parallelism,
+            Duration::from_millis(10),
+        )
+        .expect("execute");
+
+        assert!(crashed.is_none());
+        let slow_key = SampleKey::from_job(&slow_spec);
+        let fast_key = SampleKey::from_job(&fast_spec);
+        let slow_record = executed.get(&slow_key).expect("timeout record");
+        assert_eq!(slow_record.status, BenchRecordStatus::TimedOut);
+        assert!(
+            slow_record
+                .failure_reason
+                .as_deref()
+                .unwrap()
+                .contains("timeout")
+        );
+        assert!(slow_record.ops_per_sec.is_none());
+        assert_eq!(
+            executed.get(&fast_key).expect("fast record").status,
+            BenchRecordStatus::Completed
+        );
+
+        let loaded = load_existing_runs(&runs_dir, "local").expect("load");
+        assert_eq!(
+            loaded
+                .records
+                .get(&slow_key)
+                .expect("persisted timeout")
+                .status,
+            BenchRecordStatus::TimedOut
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn frontier_bootstraps_seed_across_all_scenarios() {
         let config = FrontierConfig {
             machine_label: "local".to_string(),
@@ -5597,6 +5912,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -5622,6 +5940,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -5647,6 +5968,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
         }
@@ -5706,6 +6030,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -5731,6 +6058,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -5756,6 +6086,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
         }
@@ -5879,6 +6212,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -5904,6 +6240,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -5929,6 +6268,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -5954,6 +6296,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
         }
@@ -6041,6 +6386,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -6066,6 +6414,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -6091,6 +6442,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
         }
@@ -6155,6 +6509,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -6180,6 +6537,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
             index.records.insert(
@@ -6205,6 +6565,9 @@ mod tests {
                     avg_data_latency_ns: None,
                     producer_fairness_ratio: None,
                     consumer_fairness_ratio: None,
+                    status: BenchRecordStatus::Completed,
+                    failure_reason: None,
+                    timeout_ns: None,
                 },
             );
         }
