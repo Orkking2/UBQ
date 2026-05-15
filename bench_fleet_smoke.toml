@@ -1,0 +1,21 @@
+[defaults]
+runs_dir = "bench_results/runs"
+plot_out_dir = "bench_results/plots"
+remote_repo_dir = "~/UBQ"
+remote_runs_dir = "bench_results/runs"
+queues = ["ubq", "segqueue", "concurrent-queue", "lfqueue"]
+modes = ["throughput"]
+items_per_producer = [100000]
+repeats = 1
+lfqueue_segment_sizes = [1024]
+scenarios = [
+  "1p1c",
+  "4p4c",
+  "8p8c",
+  "64p64c",
+]
+ubq_labels = ["balanced,8,127,crossbeam"]
+
+[machines.hebrides]
+host = "hebrides"
+machine_label = "hebrides"
