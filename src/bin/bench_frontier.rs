@@ -5,7 +5,7 @@ use ubq::bench_harness::{
     DEFAULT_RUNS_DIR, FrontierConfig, QueueKind, build_direct_matrix_plan,
     detect_available_parallelism, frontier_search, parse_fastfifo_block_sizes,
     parse_items_per_producer, parse_lfqueue_segment_sizes, parse_modes, parse_queue_kinds,
-    parse_scenarios, parse_wcq_capacities,
+    parse_scenarios_with_parallelism, parse_wcq_capacities,
 };
 
 #[derive(Parser, Debug)]
@@ -74,7 +74,12 @@ fn main() {
         if baseline_queues.is_empty() {
             return Err("frontier search requires at least one baseline queue".to_string());
         }
-        let scenarios = parse_scenarios(args.scenarios.as_deref())?;
+        let available_parallelism = match args.parallelism {
+            Some(value) => value,
+            None => detect_available_parallelism()?,
+        };
+        let scenarios =
+            parse_scenarios_with_parallelism(args.scenarios.as_deref(), available_parallelism)?;
         let modes = parse_modes(args.modes.as_deref())?;
         let items = parse_items_per_producer(args.items_per_producer.as_deref())?;
         let fastfifo_block_sizes =
@@ -82,10 +87,6 @@ fn main() {
         let lfqueue_segment_sizes =
             parse_lfqueue_segment_sizes(args.lfqueue_segment_sizes.as_deref())?;
         let wcq_capacities = parse_wcq_capacities(args.wcq_capacities.as_deref())?;
-        let available_parallelism = match args.parallelism {
-            Some(value) => value,
-            None => detect_available_parallelism()?,
-        };
         let mut runnable_scenarios = Vec::new();
         let mut skipped_scenarios = Vec::new();
         for scenario in scenarios {

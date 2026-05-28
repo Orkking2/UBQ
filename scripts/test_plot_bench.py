@@ -10,6 +10,7 @@ from scripts.plot_bench import (
     load_records,
     queue_metadata,
     scenario_family,
+    scenario_line_labels,
     write_immediate_variant_csv,
 )
 
@@ -172,6 +173,45 @@ class ImmediateWinnerVariantReportTest(unittest.TestCase):
         self.assertEqual([], report["missing_required_labels"])
 
 
+class ScenarioLineLabelsTest(unittest.TestCase):
+    def test_max_series_retains_per_scenario_ubq_winners(self):
+        baseline_entries = {
+            "segqueue": stats(10),
+            "concurrent-queue": stats(10),
+            "fastfifo_64": stats(10),
+            "fastfifo_256": stats(10),
+            "fastfifo_1024": stats(10),
+            "fastfifo_4096": stats(10),
+            "lfqueue_32": stats(10),
+            "lfqueue_256": stats(10),
+            "lfqueue_1024": stats(10),
+        }
+        first_ubq_winner = "ubq_balanced,0,255,crossbeam"
+        second_ubq_winner = "ubq_balanced,8,255,crossbeam"
+        non_winning_ubq = "ubq_balanced,64,255,crossbeam"
+        entries_by_scenario = {
+            "2p1c": {
+                **baseline_entries,
+                first_ubq_winner: stats(300),
+                second_ubq_winner: stats(200),
+                non_winning_ubq: stats(100),
+            },
+            "4p1c": {
+                **baseline_entries,
+                first_ubq_winner: stats(1),
+                second_ubq_winner: stats(400),
+                non_winning_ubq: stats(100),
+            },
+        }
+
+        labels = scenario_line_labels(entries_by_scenario, 10, "app_log_mpsc_file")
+
+        self.assertGreater(len(labels), 10)
+        self.assertIn(first_ubq_winner, labels)
+        self.assertIn(second_ubq_winner, labels)
+        self.assertNotIn(non_winning_ubq, labels)
+
+
 class PublicationQueuePlotTest(unittest.TestCase):
     def test_publication_queue_labels_sort_after_existing_baselines(self):
         labels = [
@@ -231,6 +271,13 @@ class MetricExtractionTest(unittest.TestCase):
                     "ops_per_sec": 75.0,
                     "avg_data_latency_ns": 31,
                 },
+                {
+                    "queue": "segqueue",
+                    "mode": "app_log_mpsc_file",
+                    "ops_per_sec": 91.0,
+                    "producer_ops_per_sec": 123.0,
+                    "consumer_ops_per_sec": 89.0,
+                },
             ],
         }
 
@@ -254,6 +301,15 @@ class MetricExtractionTest(unittest.TestCase):
         self.assertEqual(
             31.0,
             by_mode[("app_log_fan_in_data_latency", "concurrent-queue")],
+        )
+        self.assertEqual(91.0, by_mode[("app_log_mpsc_file", "segqueue")])
+        self.assertEqual(
+            123.0,
+            by_mode[("app_log_mpsc_file_producer_throughput", "segqueue")],
+        )
+        self.assertEqual(
+            89.0,
+            by_mode[("app_log_mpsc_file_consumer_throughput", "segqueue")],
         )
 
 

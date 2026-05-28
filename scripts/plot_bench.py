@@ -133,7 +133,8 @@ def mode_sort_key(name: str):
         "app_log_fan_in": 8,
         "app_pipeline": 9,
         "app_task_roundtrip": 10,
-        "mutable_placeholder": 11,
+        "app_log_mpsc_file": 11,
+        "mutable_placeholder": 12,
     }
     derived_suffixes = {
         "push_elapsed": 1,
@@ -141,6 +142,8 @@ def mode_sort_key(name: str):
         "fill_elapsed": 3,
         "drain_elapsed": 4,
         "data_latency": 5,
+        "producer_throughput": 6,
+        "consumer_throughput": 7,
     }
     for suffix, suffix_priority in derived_suffixes.items():
         marker = f"_{suffix}"
@@ -155,6 +158,10 @@ def metric_column(mode: str):
         return "avg_data_latency_ns"
     if mode.endswith("_data_latency"):
         return "avg_data_latency_ns"
+    if mode.endswith("_producer_throughput"):
+        return "producer_ops_per_sec"
+    if mode.endswith("_consumer_throughput"):
+        return "consumer_ops_per_sec"
     if mode in ("producer_fairness", "consumer_fairness", "fairness"):
         return "fairness_ratio"
     if mode.endswith("_push_elapsed"):
@@ -173,6 +180,10 @@ def metric_axis_label(mode: str):
         return "Average data latency (ns)"
     if mode.endswith("_data_latency"):
         return "Average data latency (ns)"
+    if mode.endswith("_producer_throughput"):
+        return "Producer ops/sec"
+    if mode.endswith("_consumer_throughput"):
+        return "Consumer ops/sec"
     if mode in ("producer_fairness", "consumer_fairness", "fairness"):
         return "Fairness ratio (max/min)"
     if mode.endswith(("_push_elapsed", "_pop_elapsed", "_fill_elapsed", "_drain_elapsed")):
@@ -185,6 +196,10 @@ def metric_file_slug(mode: str):
         return "data_latency"
     if mode.endswith("_data_latency"):
         return "data_latency"
+    if mode.endswith("_producer_throughput"):
+        return "producer_throughput"
+    if mode.endswith("_consumer_throughput"):
+        return "consumer_throughput"
     if mode in ("producer_fairness", "consumer_fairness", "fairness"):
         return mode
     for suffix in ("push_elapsed", "pop_elapsed", "fill_elapsed", "drain_elapsed"):
@@ -203,6 +218,7 @@ def source_mode_display_name(mode: str):
         "app_log_fan_in": "app log fan-in",
         "app_pipeline": "app pipeline",
         "app_task_roundtrip": "app task roundtrip",
+        "app_log_mpsc_file": "app log MPSC file",
     }
     return names.get(mode, mode.replace("_", " "))
 
@@ -219,6 +235,7 @@ def metric_display_name(mode: str):
         "app_log_fan_in": "app log fan-in throughput",
         "app_pipeline": "app pipeline throughput",
         "app_task_roundtrip": "app task roundtrip throughput",
+        "app_log_mpsc_file": "app log MPSC file throughput",
     }
     for suffix, label in (
         ("push_elapsed", "push elapsed"),
@@ -226,6 +243,8 @@ def metric_display_name(mode: str):
         ("fill_elapsed", "fill elapsed"),
         ("drain_elapsed", "drain elapsed"),
         ("data_latency", "data latency"),
+        ("producer_throughput", "producer throughput"),
+        ("consumer_throughput", "consumer throughput"),
     ):
         marker = f"_{suffix}"
         if mode.endswith(marker):
@@ -648,7 +667,14 @@ def load_records(path: Path):
             )
         else:
             metric_specs.append((mode, "ops_per_sec"))
-            if mode.startswith("app_"):
+            if mode == "app_log_mpsc_file":
+                metric_specs.extend(
+                    (
+                        (f"{mode}_producer_throughput", "producer_ops_per_sec"),
+                        (f"{mode}_consumer_throughput", "consumer_ops_per_sec"),
+                    )
+                )
+            elif mode.startswith("app_"):
                 metric_specs.append((f"{mode}_data_latency", "avg_data_latency_ns"))
 
         for suffix, field in (
@@ -776,6 +802,21 @@ def average_ops_per_sec(values):
     return sum(values) / len(values) if values else 0.0
 
 
+def per_scenario_winning_ubq_labels(entries_by_scenario, mode: str):
+    winners = set()
+    for scenario, entries in entries_by_scenario.items():
+        ubq_entries = {}
+        for label, stats in entries.items():
+            parsed = parse_ubq_variant(label)
+            if parsed is None or not ubq_params_valid_for_scenario(parsed, scenario):
+                continue
+            ubq_entries[label] = stats
+        if not ubq_entries:
+            continue
+        winners.add(labels_by_metric(ubq_entries, mode)[0])
+    return winners
+
+
 def scenario_line_labels(entries_by_scenario, max_series: int, mode: str):
     label_samples = {}
     label_coverage = {}
@@ -798,7 +839,15 @@ def scenario_line_labels(entries_by_scenario, max_series: int, mode: str):
     )
     if max_series <= 0:
         return labels
-    return labels[:max_series]
+
+    selected = labels[:max_series]
+    selected_set = set(selected)
+    winning_ubq_labels = per_scenario_winning_ubq_labels(entries_by_scenario, mode)
+    for label in labels:
+        if label in winning_ubq_labels and label not in selected_set:
+            selected.append(label)
+            selected_set.add(label)
+    return selected
 
 
 def write_scenario_line_csv(out_path: Path, mode: str, scenarios, labels, entries_by_scenario):
@@ -997,7 +1046,7 @@ def main():
         "--max-line-series",
         type=int,
         default=10,
-        help="Maximum configs shown in per-machine scenario line charts; <=0 shows all (default: 10)",
+        help="Maximum configs shown in per-machine scenario line charts before adding per-scenario UBQ winners; <=0 shows all (default: 10)",
     )
     args = parser.parse_args()
 

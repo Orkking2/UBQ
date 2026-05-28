@@ -49,6 +49,22 @@ pub const BBQ_ATC22_X86_88T_SCENARIO_SUITE: &str = "bbq-atc22-x86-88t";
 pub const BBQ_ATC22_OVERSUB_X86_12T_SCENARIO_SUITE: &str = "bbq-atc22-oversub-x86-12t";
 
 const SENTINEL: u64 = u64::MAX;
+const LOG_SENTINEL_META: u64 = u64::MAX;
+const LOG_SINK_BUFFER_CAPACITY: usize = 1024 * 1024;
+const LOG_SINK_FLUSH_THRESHOLD: usize = 256 * 1024;
+const LOG_SINK_MAX_RECORD_BYTES: usize = 256;
+const LOG_PRODUCER_ID_MASK: u64 = 0x00ff_ffff;
+const LOG_SEQUENCE_MASK: u64 = 0xffff_ffff;
+const LOG_MESSAGES: [&str; 8] = [
+    "accepted client connection",
+    "parsed request headers",
+    "loaded tenant configuration",
+    "queued background task",
+    "completed cache lookup",
+    "serialized response body",
+    "updated metric counter",
+    "released request context",
+];
 const DEFAULT_FASTFIFO_BLOCK_SIZES: [usize; 4] = [64, 256, 1024, 4096];
 #[cfg(feature = "bench_fastfifo")]
 const RBBQ_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -115,6 +131,95 @@ where
 {
     let deadline = current_bench_job_deadline();
     thread::spawn(move || with_bench_job_deadline(deadline, f))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogRecord {
+    pub message: &'static str,
+    pub meta: u64,
+}
+
+impl LogRecord {
+    fn sentinel() -> Self {
+        Self {
+            message: "",
+            meta: LOG_SENTINEL_META,
+        }
+    }
+
+    fn is_sentinel(self) -> bool {
+        self.meta == LOG_SENTINEL_META
+    }
+}
+
+fn pack_log_meta(level: u8, producer_id: usize, sequence: u64) -> u64 {
+    let producer_id = u64::try_from(producer_id).expect("producer id must fit u64");
+    assert!(
+        producer_id <= LOG_PRODUCER_ID_MASK,
+        "producer id is too large"
+    );
+    assert!(sequence <= LOG_SEQUENCE_MASK, "log sequence is too large");
+    ((level as u64) << 56) | (producer_id << 32) | sequence
+}
+
+fn unpack_log_level(meta: u64) -> u8 {
+    (meta >> 56) as u8
+}
+
+fn unpack_log_producer_id(meta: u64) -> u64 {
+    (meta >> 32) & LOG_PRODUCER_ID_MASK
+}
+
+fn unpack_log_sequence(meta: u64) -> u64 {
+    meta & LOG_SEQUENCE_MASK
+}
+
+fn log_record_for(producer_id: usize, sequence: u64) -> LogRecord {
+    let message_index = (producer_id ^ sequence as usize) & (LOG_MESSAGES.len() - 1);
+    LogRecord {
+        message: LOG_MESSAGES[message_index],
+        meta: pack_log_meta((producer_id as u8) & 0x7, producer_id, sequence),
+    }
+}
+
+pub trait LogQueueOps: Send + Sync + 'static {
+    fn send_log(&self, record: LogRecord);
+    fn recv_log(&self) -> LogRecord;
+}
+
+pub trait LogQueueThreadOps: Send + 'static {
+    fn send_log(&self, record: LogRecord);
+    fn recv_log(&self) -> LogRecord;
+}
+
+impl<Q: LogQueueOps> LogQueueThreadOps for Arc<Q> {
+    fn send_log(&self, record: LogRecord) {
+        (**self).send_log(record);
+    }
+
+    fn recv_log(&self) -> LogRecord {
+        (**self).recv_log()
+    }
+}
+
+pub trait LogQueueHandleFactory: Send + Sync + 'static {
+    type ThreadHandle: LogQueueThreadOps;
+
+    fn log_thread_handle(self: &Arc<Self>) -> Self::ThreadHandle;
+}
+
+impl<Q: LogQueueOps> LogQueueHandleFactory for Q {
+    type ThreadHandle = Arc<Q>;
+
+    fn log_thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
+        self.clone()
+    }
+}
+
+pub trait LogQueue: LogQueueOps {
+    fn new_log_queue() -> Arc<Self>
+    where
+        Self: Sized;
 }
 
 pub trait BenchQueueOps: Send + Sync + 'static {
@@ -191,6 +296,40 @@ where
     }
 }
 
+impl<B, const POOL: usize, const BLOCK: usize, A> LogQueueOps
+    for ConfiguredUBQ<LogRecord, B, POOL, BLOCK, A>
+where
+    B: backoff::BackoffPolicy + 'static,
+    A: Send + Sync + 'static,
+{
+    fn send_log(&self, record: LogRecord) {
+        check_bench_job_deadline("pushing log record to UBQ");
+        self.push(record);
+    }
+
+    fn recv_log(&self) -> LogRecord {
+        let backoff = Backoff::new();
+        loop {
+            check_bench_job_deadline("popping log record from UBQ");
+            if let Some(record) = self.pop() {
+                return record;
+            }
+            backoff.snooze();
+        }
+    }
+}
+
+impl<B, const POOL: usize, const BLOCK: usize, A> LogQueue
+    for ConfiguredUBQ<LogRecord, B, POOL, BLOCK, A>
+where
+    B: backoff::BackoffPolicy + 'static,
+    A: Send + Sync + 'static,
+{
+    fn new_log_queue() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+}
+
 impl BenchQueueOps for SegQueue<u64> {
     fn send_value(&self, value: u64) {
         check_bench_job_deadline("pushing to SegQueue");
@@ -211,6 +350,30 @@ impl BenchQueueOps for SegQueue<u64> {
 
 impl BenchQueue for SegQueue<u64> {
     fn new_queue() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+}
+
+impl LogQueueOps for SegQueue<LogRecord> {
+    fn send_log(&self, record: LogRecord) {
+        check_bench_job_deadline("pushing log record to SegQueue");
+        self.push(record);
+    }
+
+    fn recv_log(&self) -> LogRecord {
+        let backoff = Backoff::new();
+        loop {
+            check_bench_job_deadline("popping log record from SegQueue");
+            if let Some(record) = self.pop() {
+                return record;
+            }
+            backoff.snooze();
+        }
+    }
+}
+
+impl LogQueue for SegQueue<LogRecord> {
+    fn new_log_queue() -> Arc<Self> {
         Arc::new(Self::new())
     }
 }
@@ -237,6 +400,32 @@ impl BenchQueueOps for ConcurrentQueue<u64> {
 
 impl BenchQueue for ConcurrentQueue<u64> {
     fn new_queue() -> Arc<Self> {
+        Arc::new(Self::unbounded())
+    }
+}
+
+impl LogQueueOps for ConcurrentQueue<LogRecord> {
+    fn send_log(&self, record: LogRecord) {
+        check_bench_job_deadline("pushing log record to concurrent-queue");
+        self.push(record).expect("send failed");
+    }
+
+    fn recv_log(&self) -> LogRecord {
+        let backoff = Backoff::new();
+        loop {
+            check_bench_job_deadline("popping log record from concurrent-queue");
+            match self.pop() {
+                Ok(record) => return record,
+                Err(PopError::Empty) => {}
+                Err(PopError::Closed) => panic!("recv failed: queue closed"),
+            }
+            backoff.snooze();
+        }
+    }
+}
+
+impl LogQueue for ConcurrentQueue<LogRecord> {
+    fn new_log_queue() -> Arc<Self> {
         Arc::new(Self::unbounded())
     }
 }
@@ -268,6 +457,39 @@ impl BenchQueueOps for LfQueueBenchQueue {
             check_bench_job_deadline("popping from lfqueue");
             if let Some(value) = self.inner.dequeue() {
                 return value;
+            }
+            backoff.snooze();
+        }
+    }
+}
+
+#[cfg(feature = "bench_lfqueue")]
+struct LogLfQueueBenchQueue {
+    inner: LfUnboundedQueue<LogRecord>,
+}
+
+#[cfg(feature = "bench_lfqueue")]
+impl LogLfQueueBenchQueue {
+    fn new(segment_size: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: LfUnboundedQueue::with_segment_size(segment_size),
+        })
+    }
+}
+
+#[cfg(feature = "bench_lfqueue")]
+impl LogQueueOps for LogLfQueueBenchQueue {
+    fn send_log(&self, record: LogRecord) {
+        check_bench_job_deadline("pushing log record to lfqueue");
+        self.inner.enqueue(record);
+    }
+
+    fn recv_log(&self) -> LogRecord {
+        let backoff = Backoff::new();
+        loop {
+            check_bench_job_deadline("popping log record from lfqueue");
+            if let Some(record) = self.inner.dequeue() {
+                return record;
             }
             backoff.snooze();
         }
@@ -410,6 +632,60 @@ impl BenchQueueOps for RbbqBenchQueue {
     }
 }
 
+#[cfg(feature = "bench_fastfifo")]
+struct LogRbbqBenchQueue {
+    inner: FastFifo<LogRecord>,
+}
+
+#[cfg(feature = "bench_fastfifo")]
+impl LogRbbqBenchQueue {
+    fn new(scenario: &ScenarioConfig, items_per_producer: u64, block_size: usize) -> Arc<Self> {
+        let total_items = usize::try_from(total_items(items_per_producer, scenario.producers))
+            .expect("total items must fit usize for RBBQ capacity");
+        let required_capacity = total_items
+            .checked_add(scenario.consumers)
+            .and_then(|value| value.checked_add(block_size))
+            .expect("RBBQ required capacity overflow");
+        let num_blocks = required_capacity
+            .div_ceil(block_size)
+            .checked_add(2)
+            .expect("RBBQ block count overflow")
+            .max(2);
+        Arc::new(Self {
+            inner: FastFifo::new(num_blocks, block_size),
+        })
+    }
+}
+
+#[cfg(feature = "bench_fastfifo")]
+impl LogQueueOps for LogRbbqBenchQueue {
+    fn send_log(&self, record: LogRecord) {
+        let deadline = Instant::now() + RBBQ_WAIT_TIMEOUT;
+        let backoff = Backoff::new();
+        loop {
+            check_bench_job_deadline("pushing log record to RBBQ");
+            if self.inner.push(record).is_ok() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out pushing to RBBQ");
+            backoff.snooze();
+        }
+    }
+
+    fn recv_log(&self) -> LogRecord {
+        let deadline = Instant::now() + RBBQ_WAIT_TIMEOUT;
+        let backoff = Backoff::new();
+        loop {
+            check_bench_job_deadline("popping log record from RBBQ");
+            if let Ok(record) = self.inner.pop() {
+                return record;
+            }
+            assert!(Instant::now() < deadline, "timed out popping from RBBQ");
+            backoff.snooze();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
@@ -421,6 +697,7 @@ pub enum Mode {
     AppLogFanIn,
     AppPipeline,
     AppTaskRoundtrip,
+    AppLogMpscFile,
 }
 
 impl Mode {
@@ -434,6 +711,7 @@ impl Mode {
             Mode::AppLogFanIn => "app_log_fan_in",
             Mode::AppPipeline => "app_pipeline",
             Mode::AppTaskRoundtrip => "app_task_roundtrip",
+            Mode::AppLogMpscFile => "app_log_mpsc_file",
         }
     }
 
@@ -449,6 +727,7 @@ impl Mode {
             "app_log_fan_in" | "app-log-fan-in" => Some(Self::AppLogFanIn),
             "app_pipeline" | "app-pipeline" => Some(Self::AppPipeline),
             "app_task_roundtrip" | "app-task-roundtrip" => Some(Self::AppTaskRoundtrip),
+            "app_log_mpsc_file" | "app-log-mpsc-file" => Some(Self::AppLogMpscFile),
             _ => None,
         }
     }
@@ -737,6 +1016,14 @@ pub struct BenchRecord {
     pub elapsed_ns: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ops_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer_ops_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumer_ops_per_sec: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flush_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub push_elapsed_ns: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1088,10 +1375,40 @@ fn expand_family_range(
     Ok(true)
 }
 
-fn expand_scenario_selector(token: &str) -> Result<Vec<ScenarioConfig>, String> {
+fn machine_mpsc_scenarios(available_parallelism: usize) -> Result<Vec<ScenarioConfig>, String> {
+    if available_parallelism < 2 {
+        return Err("mpsc:machine requires available_parallelism >= 2".to_string());
+    }
+    let max_producers = available_parallelism - 1;
+    let mut producers = Vec::new();
+    let mut value = 1usize;
+    while value <= max_producers {
+        producers.push(value);
+        value = value
+            .checked_mul(2)
+            .ok_or_else(|| "mpsc:machine producer count overflow".to_string())?;
+    }
+    if producers.last().copied() != Some(max_producers) {
+        producers.push(max_producers);
+    }
+    Ok(producers
+        .into_iter()
+        .map(|count| ScenarioConfig::new(count, 1))
+        .collect())
+}
+
+fn expand_scenario_selector_with_parallelism(
+    token: &str,
+    machine_parallelism: Option<usize>,
+) -> Result<Vec<ScenarioConfig>, String> {
     let normalized = token.trim().to_ascii_lowercase();
     if normalized == "spsc" {
         return Ok(vec![ScenarioConfig::new(1, 1)]);
+    }
+    if normalized == "mpsc:machine" {
+        let parallelism = machine_parallelism
+            .ok_or_else(|| "mpsc:machine requires detected machine parallelism".to_string())?;
+        return machine_mpsc_scenarios(parallelism);
     }
     if normalized == BBQ_ATC22_X86_88T_SCENARIO_SUITE {
         let mut out = vec![ScenarioConfig::new(1, 1)];
@@ -1125,7 +1442,10 @@ fn expand_scenario_selector(token: &str) -> Result<Vec<ScenarioConfig>, String> 
     Ok(vec![parsed])
 }
 
-pub fn parse_scenarios(raw: Option<&str>) -> Result<Vec<ScenarioConfig>, String> {
+fn parse_scenarios_inner(
+    raw: Option<&str>,
+    machine_parallelism: Option<usize>,
+) -> Result<Vec<ScenarioConfig>, String> {
     let source = raw.map(parse_csv_list).unwrap_or_else(|| {
         DEFAULT_SCENARIOS
             .iter()
@@ -1135,7 +1455,7 @@ pub fn parse_scenarios(raw: Option<&str>) -> Result<Vec<ScenarioConfig>, String>
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for token in source {
-        for parsed in expand_scenario_selector(&token)? {
+        for parsed in expand_scenario_selector_with_parallelism(&token, machine_parallelism)? {
             if seen.insert(parsed.name.clone()) {
                 out.push(parsed);
             }
@@ -1143,6 +1463,17 @@ pub fn parse_scenarios(raw: Option<&str>) -> Result<Vec<ScenarioConfig>, String>
     }
     out.sort_by_key(|scenario| (scenario.total_threads(), scenario.name.clone()));
     Ok(out)
+}
+
+pub fn parse_scenarios(raw: Option<&str>) -> Result<Vec<ScenarioConfig>, String> {
+    parse_scenarios_inner(raw, None)
+}
+
+pub fn parse_scenarios_with_parallelism(
+    raw: Option<&str>,
+    available_parallelism: usize,
+) -> Result<Vec<ScenarioConfig>, String> {
+    parse_scenarios_inner(raw, Some(available_parallelism))
 }
 
 pub fn parse_modes(raw: Option<&str>) -> Result<Vec<Mode>, String> {
@@ -1286,6 +1617,17 @@ fn wcq_queue_label(capacity: usize) -> String {
     format!("wcq_{capacity}")
 }
 
+fn validate_mode_for_scenario(mode: Mode, scenario: &ScenarioConfig) -> Result<(), String> {
+    if mode == Mode::AppLogMpscFile && scenario.consumers != 1 {
+        return Err(format!(
+            "mode {} requires exactly one consumer, got scenario {}",
+            mode.name(),
+            scenario.name
+        ));
+    }
+    Ok(())
+}
+
 fn wcq_mode_supported(
     mode: Mode,
     capacity: usize,
@@ -1318,7 +1660,8 @@ fn wcq_mode_supported(
         | Mode::Fairness
         | Mode::AppLogFanIn
         | Mode::AppPipeline
-        | Mode::AppTaskRoundtrip => false,
+        | Mode::AppTaskRoundtrip
+        | Mode::AppLogMpscFile => false,
         Mode::FillDrain => {
             let Ok(total_items) =
                 usize::try_from(total_items(items_per_producer, scenario.producers))
@@ -1706,23 +2049,17 @@ pub fn build_direct_matrix_plan(
     } else {
         Vec::new()
     };
-    let normalized_ubq_labels = if include_ubq {
-        let mut parsed_labels = Vec::with_capacity(ubq_labels.len());
+    let parsed_ubq_labels = if include_ubq {
+        let mut parsed = Vec::with_capacity(ubq_labels.len());
         for label in ubq_labels {
-            parsed_labels.push(parse_ubq_label(label, true)?);
+            parsed.push(parse_ubq_label(label, true)?);
         }
-        for scenario in scenarios {
-            for label in &parsed_labels {
-                validate_ubq_label_for_scenario(label, scenario)?;
-            }
-        }
-        parsed_labels
-            .into_iter()
-            .map(|label| label.text())
-            .collect::<Vec<_>>()
+        parsed
     } else {
         Vec::new()
     };
+    let normalized_ubq_labels: Vec<String> =
+        parsed_ubq_labels.iter().map(|label| label.text()).collect();
     for scenario in scenarios {
         if scenario.total_threads() > available_parallelism {
             return Err(format!(
@@ -1742,6 +2079,7 @@ pub fn build_direct_matrix_plan(
             ));
         }
         for &mode in modes {
+            validate_mode_for_scenario(mode, scenario)?;
             let required_threads = scenario
                 .total_threads()
                 .checked_add(mode.extra_threads())
@@ -1765,7 +2103,12 @@ pub fn build_direct_matrix_plan(
     for scenario in scenarios {
         for repeat_index in 1..=repeats {
             if include_ubq {
-                for normalized in &normalized_ubq_labels {
+                for (normalized, parsed) in
+                    normalized_ubq_labels.iter().zip(parsed_ubq_labels.iter())
+                {
+                    if !is_valid_ubq_label_for_scenario(parsed, scenario) {
+                        continue;
+                    }
                     bundles.push(PlanBundle {
                         scenario: scenario.clone(),
                         repeat_index,
@@ -1973,7 +2316,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
     out
 }
 
-pub fn make_ubq_job_factory<Q: BenchQueue>(
+pub fn make_ubq_job_factory<Q: BenchQueue, L: LogQueue>(
     label: &str,
     scenario: ScenarioConfig,
     repeat_index: usize,
@@ -2025,6 +2368,12 @@ pub fn make_ubq_job_factory<Q: BenchQueue>(
             bench_app_pipeline_for::<Q>(&queue_name, &run_scenario, items_per_producer, core_offset)
         }
         Mode::AppTaskRoundtrip => bench_app_task_roundtrip_for::<Q>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppLogMpscFile => bench_app_log_mpsc_file_for::<L>(
             &queue_name,
             &run_scenario,
             items_per_producer,
@@ -2102,6 +2451,12 @@ pub fn make_segqueue_job_factory(
             items_per_producer,
             core_offset,
         ),
+        Mode::AppLogMpscFile => bench_app_log_mpsc_file_for::<SegQueue<LogRecord>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
     });
     JobFactory { spec, run }
 }
@@ -2169,6 +2524,12 @@ pub fn make_concurrent_queue_job_factory(
             core_offset,
         ),
         Mode::AppTaskRoundtrip => bench_app_task_roundtrip_for::<ConcurrentQueue<u64>>(
+            &queue_name,
+            &run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppLogMpscFile => bench_app_log_mpsc_file_for::<ConcurrentQueue<LogRecord>>(
             &queue_name,
             &run_scenario,
             items_per_producer,
@@ -2261,6 +2622,13 @@ pub fn make_lfqueue_job_factory(
                 items_per_producer,
                 core_offset,
             ),
+            Mode::AppLogMpscFile => bench_app_log_mpsc_file_with_queue(
+                LogLfQueueBenchQueue::new(segment_size),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
         }
     });
     JobFactory { spec, run }
@@ -2346,6 +2714,14 @@ fn make_wcq_job_factory_typed<const CAPACITY: usize>(
                 &run_scenario,
                 items_per_producer,
                 core_offset,
+            ),
+            Mode::AppLogMpscFile => failed_runtime_bench_record(
+                &queue_name,
+                Mode::AppLogMpscFile,
+                &run_scenario,
+                items_per_producer,
+                "wCQ does not support app_log_mpsc_file in this harness".to_string(),
+                0,
             ),
         }
     });
@@ -2496,6 +2872,13 @@ pub fn make_fastfifo_job_factory(
                 items_per_producer,
                 core_offset,
             ),
+            Mode::AppLogMpscFile => bench_app_log_mpsc_file_with_queue(
+                LogRbbqBenchQueue::new(&run_scenario, items_per_producer, block_size),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
         }
     });
     JobFactory { spec, run }
@@ -2640,35 +3023,49 @@ fn execute_job_factories_with_timeout(
                         let deadline = started_at.checked_add(job_timeout);
                         let timeout_spec = job.spec.clone();
                         let panic_spec = job.spec.clone();
-                        let handle = tokio::task::spawn_blocking(move || {
+                        let mut handle = tokio::task::spawn_blocking(move || {
                             with_bench_job_deadline(deadline, || (job.run)(core_offset))
                         });
-                        match tokio::time::timeout(job_timeout, handle).await {
-                            Ok(Ok(record)) => Ok((key, record, budget)),
-                            Ok(Err(err)) if err.is_panic() => {
-                                let elapsed_ns = started_at.elapsed().as_nanos() as u64;
-                                let reason = panic_payload_message(err.into_panic());
-                                let record = failed_bench_record(
-                                    &panic_spec,
-                                    BenchRecordStatus::Failed,
-                                    reason,
-                                    elapsed_ns,
-                                    None,
-                                );
-                                Ok((key, record, budget))
-                            }
-                            Ok(Err(err)) => Err(format!("benchmark task join failed: {err}")),
+                        let mut timed_out = false;
+                        let join_result = match tokio::time::timeout(job_timeout, &mut handle).await
+                        {
+                            Ok(result) => result,
                             Err(_) => {
+                                timed_out = true;
+                                handle.await
+                            }
+                        };
+                        match join_result {
+                            Ok(_record) if timed_out => {
                                 let elapsed_ns = started_at.elapsed().as_nanos() as u64;
                                 let record = failed_bench_record(
                                     &timeout_spec,
                                     BenchRecordStatus::TimedOut,
-                                    format!("benchmark job exceeded {}s timeout", job_timeout.as_secs()),
+                                    format!(
+                                        "benchmark job exceeded {}s timeout",
+                                        job_timeout.as_secs()
+                                    ),
                                     elapsed_ns,
                                     Some(timeout_ns),
                                 );
                                 Ok((key, record, budget))
                             }
+                            Ok(record) => Ok((key, record, budget)),
+                            Err(err) if err.is_panic() => {
+                                let elapsed_ns = started_at.elapsed().as_nanos() as u64;
+                                let reason = panic_payload_message(err.into_panic());
+                                let (status, timeout) =
+                                    status_and_timeout_for_failure(&reason, elapsed_ns);
+                                let record = failed_bench_record(
+                                    &panic_spec,
+                                    status,
+                                    reason,
+                                    elapsed_ns,
+                                    timeout,
+                                );
+                                Ok((key, record, budget))
+                            }
+                            Err(err) => Err(format!("benchmark task join failed: {err}")),
                         }
                     });
                 }
@@ -3165,8 +3562,9 @@ fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
                 )
                 .expect("valid label");
                 out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_ubq_job_factory::<{}>(\"{}\", {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
-                    ubq_type_expr(&label),
+                    "    jobs.push(bench_harness::make_ubq_job_factory::<{}, {}>(\"{}\", {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
+                    ubq_type_expr(&label, "u64"),
+                    ubq_type_expr(&label, "bench_harness::LogRecord"),
                     label.text(),
                     spec.repeat_index,
                     spec.mode,
@@ -3191,7 +3589,7 @@ fn progress_line(message: impl AsRef<str>) {
     let _ = io::stdout().flush();
 }
 
-fn ubq_type_expr(label: &UbqLabel) -> String {
+fn ubq_type_expr(label: &UbqLabel, value_type: &str) -> String {
     let backoff_ty = match label.backoff.as_str() {
         "crossbeam" => "backoff::Crossbeam",
         "yield" => "backoff::Yield",
@@ -3209,7 +3607,7 @@ fn ubq_type_expr(label: &UbqLabel) -> String {
         _ => panic!("unsupported block size {}", label.block),
     };
     format!(
-        "ConfiguredUBQ<u64, {backoff_ty}, {}, {}, {align_ty}>",
+        "ConfiguredUBQ<{value_type}, {backoff_ty}, {}, {}, {align_ty}>",
         label.pool, label.block
     )
 }
@@ -3801,15 +4199,26 @@ fn bench_throughput_with_queue<Q: BenchQueueHandleFactory>(
     start.set(Instant::now()).ok();
     start_gate.wait();
 
-    for handle in producer_handles {
-        handle.join().expect("producer join failed");
+    let mut failure_reason = None;
+    if let Err(err) = join_bench_threads(producer_handles, "producer") {
+        failure_reason.get_or_insert(err);
     }
-    let sentinel_sender = queue_handle.thread_handle();
-    for _ in 0..scenario.consumers {
-        sentinel_sender.send_value(SENTINEL);
+    if let Err(err) = send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name) {
+        failure_reason.get_or_insert(err);
     }
-    for handle in consumer_handles {
-        handle.join().expect("consumer join failed");
+    if let Err(err) = join_bench_threads(consumer_handles, "consumer") {
+        failure_reason.get_or_insert(err);
+    }
+    if let Some(reason) = failure_reason {
+        let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+        return failed_runtime_bench_record(
+            queue_name,
+            Mode::Throughput,
+            scenario,
+            items_per_producer,
+            reason,
+            elapsed_ns,
+        );
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
@@ -3824,6 +4233,10 @@ fn bench_throughput_with_queue<Q: BenchQueueHandleFactory>(
         consumed_items: consumed,
         elapsed_ns,
         ops_per_sec,
+        producer_ops_per_sec: None,
+        consumer_ops_per_sec: None,
+        written_bytes: None,
+        flush_count: None,
         push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
         pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
         fill_elapsed_ns: None,
@@ -3846,6 +4259,255 @@ fn deterministic_busy(thread_id: usize, op_index: u64) {
     let iterations = (value % 101) as usize;
     for _ in 0..iterations {
         std::hint::spin_loop();
+    }
+}
+
+struct LogSink {
+    file: fs::File,
+    buffer: Vec<u8>,
+    written_bytes: u64,
+    flush_count: u64,
+}
+
+impl LogSink {
+    fn new(
+        queue_name: &str,
+        scenario: &ScenarioConfig,
+        items_per_producer: u64,
+    ) -> io::Result<Self> {
+        let dir = Path::new("target").join("bench-log-sink");
+        fs::create_dir_all(&dir)?;
+        let file_name = format!(
+            "{}_{}_{}_{}.log",
+            sanitize_name(queue_name),
+            scenario.name,
+            items_per_producer,
+            now_unix_nanos()
+        );
+        Ok(Self {
+            file: fs::File::create(dir.join(file_name))?,
+            buffer: Vec::with_capacity(LOG_SINK_BUFFER_CAPACITY),
+            written_bytes: 0,
+            flush_count: 0,
+        })
+    }
+
+    fn write_record(&mut self, record: LogRecord) -> io::Result<()> {
+        if self.buffer.capacity().saturating_sub(self.buffer.len()) < LOG_SINK_MAX_RECORD_BYTES {
+            self.flush_buffer()?;
+        }
+        let before = self.buffer.len();
+        append_log_record_line(&mut self.buffer, record);
+        debug_assert!(self.buffer.len() - before <= LOG_SINK_MAX_RECORD_BYTES);
+        if self.buffer.len() >= LOG_SINK_FLUSH_THRESHOLD {
+            self.flush_buffer()?;
+        }
+        Ok(())
+    }
+
+    fn flush_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(&self.buffer)?;
+        self.written_bytes = self
+            .written_bytes
+            .checked_add(self.buffer.len() as u64)
+            .expect("written byte count overflow");
+        self.buffer.clear();
+        self.flush_count = self
+            .flush_count
+            .checked_add(1)
+            .expect("flush count overflow");
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<(u64, u64)> {
+        self.flush_buffer()?;
+        self.file.flush()?;
+        Ok((self.written_bytes, self.flush_count))
+    }
+}
+
+fn append_log_record_line(out: &mut Vec<u8>, record: LogRecord) {
+    out.extend_from_slice(b"level=");
+    append_decimal_u64(out, unpack_log_level(record.meta) as u64);
+    out.extend_from_slice(b" producer=");
+    append_decimal_u64(out, unpack_log_producer_id(record.meta));
+    out.extend_from_slice(b" seq=");
+    append_decimal_u64(out, unpack_log_sequence(record.meta));
+    out.extend_from_slice(b" message=");
+    out.extend_from_slice(record.message.as_bytes());
+    out.push(b'\n');
+}
+
+fn append_decimal_u64(out: &mut Vec<u8>, mut value: u64) {
+    let mut buf = [0u8; 20];
+    let mut index = buf.len();
+    loop {
+        index -= 1;
+        buf[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&buf[index..]);
+}
+
+fn bench_app_log_mpsc_file_for<Q: LogQueue>(
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    bench_app_log_mpsc_file_with_queue(
+        Q::new_log_queue(),
+        queue_name,
+        scenario,
+        items_per_producer,
+        core_offset,
+    )
+}
+
+fn bench_app_log_mpsc_file_with_queue<Q: LogQueueHandleFactory>(
+    queue_handle: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    if let Err(reason) = validate_mode_for_scenario(Mode::AppLogMpscFile, scenario) {
+        return failed_runtime_bench_record(
+            queue_name,
+            Mode::AppLogMpscFile,
+            scenario,
+            items_per_producer,
+            reason,
+            0,
+        );
+    }
+
+    let total_items = total_items(items_per_producer, scenario.producers);
+    let total_threads = scenario.total_threads();
+    let ready = Arc::new(Barrier::new(total_threads + 1));
+    let start_gate = Arc::new(Barrier::new(total_threads + 1));
+    let start = Arc::new(OnceLock::new());
+    let producer_max = Arc::new(AtomicU64::new(0));
+
+    let mut producer_handles = Vec::with_capacity(scenario.producers);
+    for producer_id in 0..scenario.producers {
+        let queue_thread = queue_handle.log_thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let producer_max = producer_max.clone();
+        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        producer_handles.push(spawn_bench_thread(move || {
+            if let Some(id) = core_id {
+                core_affinity::set_for_current(id);
+            }
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            for sequence in 0..items_per_producer {
+                queue_thread.send_log(log_record_for(producer_id, sequence));
+            }
+            producer_max.fetch_max(start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+        }));
+    }
+
+    let queue_thread = queue_handle.log_thread_handle();
+    let ready_consumer = ready.clone();
+    let start_gate_consumer = start_gate.clone();
+    let start_consumer = start.clone();
+    let queue_name_consumer = queue_name.to_string();
+    let scenario_consumer = scenario.clone();
+    let core_id = bench_core_ids()
+        .get(core_offset + scenario.producers)
+        .copied();
+    let consumer_handle = spawn_bench_thread(move || -> (u64, u64, u64, u64) {
+        if let Some(id) = core_id {
+            core_affinity::set_for_current(id);
+        }
+        let mut sink = LogSink::new(&queue_name_consumer, &scenario_consumer, items_per_producer)
+            .expect("failed to create log sink");
+        ready_consumer.wait();
+        start_gate_consumer.wait();
+        let start: Instant = *start_consumer.get().expect("start set");
+        let mut consumed = 0u64;
+        loop {
+            let record = queue_thread.recv_log();
+            if record.is_sentinel() {
+                break;
+            }
+            sink.write_record(record)
+                .expect("failed to write log record");
+            consumed = consumed.checked_add(1).expect("consumed count overflow");
+        }
+        let (written_bytes, flush_count) = sink.finish().expect("failed to flush log sink");
+        let end_ns = start.elapsed().as_nanos() as u64;
+        (end_ns, consumed, written_bytes, flush_count)
+    });
+
+    ready.wait();
+    start.set(Instant::now()).ok();
+    start_gate.wait();
+
+    let mut failure_reason = None;
+    if let Err(err) = join_bench_threads(producer_handles, "producer") {
+        failure_reason.get_or_insert(err);
+    }
+    if let Err(err) = send_log_sentinel(queue_handle.log_thread_handle(), queue_name) {
+        failure_reason.get_or_insert(err);
+    }
+    let consumer_result = match join_bench_thread(consumer_handle, "consumer") {
+        Ok(value) => Some(value),
+        Err(err) => {
+            failure_reason.get_or_insert(err);
+            None
+        }
+    };
+    if let Some(reason) = failure_reason {
+        let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+        return failed_runtime_bench_record(
+            queue_name,
+            Mode::AppLogMpscFile,
+            scenario,
+            items_per_producer,
+            reason,
+            elapsed_ns,
+        );
+    }
+
+    let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+    let producer_elapsed_ns = producer_max.load(AtomicOrdering::Relaxed);
+    let (consumer_elapsed_ns, consumed, written_bytes, flush_count) =
+        consumer_result.expect("consumer completed");
+    let consumer_ops_per_sec = throughput_ops(consumed, consumer_elapsed_ns);
+
+    BenchRecord {
+        queue: queue_name.to_string(),
+        mode: Mode::AppLogMpscFile.name().to_string(),
+        items_per_producer,
+        total_items,
+        consumed_items: consumed,
+        elapsed_ns,
+        ops_per_sec: consumer_ops_per_sec,
+        producer_ops_per_sec: throughput_ops(total_items, producer_elapsed_ns),
+        consumer_ops_per_sec,
+        written_bytes: Some(written_bytes),
+        flush_count: Some(flush_count),
+        push_elapsed_ns: Some(producer_elapsed_ns),
+        pop_elapsed_ns: Some(consumer_elapsed_ns),
+        fill_elapsed_ns: None,
+        drain_elapsed_ns: None,
+        avg_data_latency_ns: None,
+        producer_fairness_ratio: None,
+        consumer_fairness_ratio: None,
+        status: BenchRecordStatus::Completed,
+        failure_reason: None,
+        timeout_ns: None,
     }
 }
 
@@ -3984,15 +4646,26 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
     start.set(Instant::now()).ok();
     start_gate.wait();
 
-    for handle in producer_handles {
-        handle.join().expect("producer join failed");
+    let mut failure_reason = None;
+    if let Err(err) = join_bench_threads(producer_handles, "producer") {
+        failure_reason.get_or_insert(err);
     }
-    let sentinel_sender = queue_handle.thread_handle();
-    for _ in 0..scenario.consumers {
-        sentinel_sender.send_value(SENTINEL);
+    if let Err(err) = send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name) {
+        failure_reason.get_or_insert(err);
     }
-    for handle in consumer_handles {
-        handle.join().expect("consumer join failed");
+    if let Err(err) = join_bench_threads(consumer_handles, "consumer") {
+        failure_reason.get_or_insert(err);
+    }
+    if let Some(reason) = failure_reason {
+        let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+        return failed_runtime_bench_record(
+            queue_name,
+            Mode::AppLogFanIn,
+            scenario,
+            items_per_producer,
+            reason,
+            elapsed_ns,
+        );
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
@@ -4005,6 +4678,10 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
         consumed_items: consumed,
         elapsed_ns,
         ops_per_sec: throughput_ops(consumed, elapsed_ns),
+        producer_ops_per_sec: None,
+        consumer_ops_per_sec: None,
+        written_bytes: None,
+        flush_count: None,
         push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
         pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
         fill_elapsed_ns: None,
@@ -4154,17 +4831,30 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
     start.set(Instant::now()).ok();
     start_gate.wait();
 
-    for handle in producer_handles {
-        handle.join().expect("producer join failed");
+    let mut failure_reason = None;
+    if let Err(err) = join_bench_threads(producer_handles, "producer") {
+        failure_reason.get_or_insert(err);
     }
-    let sentinel_sender = stage1.thread_handle();
-    for _ in 0..consumer_count {
-        sentinel_sender.send_value(SENTINEL);
+    if let Err(err) = send_sentinels(stage1.thread_handle(), consumer_count, queue_name) {
+        failure_reason.get_or_insert(err);
     }
-    for handle in worker_handles {
-        handle.join().expect("worker join failed");
+    if let Err(err) = join_bench_threads(worker_handles, "worker") {
+        failure_reason.get_or_insert(err);
     }
-    collector.join().expect("collector join failed");
+    if let Err(err) = join_bench_thread(collector, "collector") {
+        failure_reason.get_or_insert(err);
+    }
+    if let Some(reason) = failure_reason {
+        let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+        return failed_runtime_bench_record(
+            queue_name,
+            Mode::AppPipeline,
+            scenario,
+            items_per_producer,
+            reason,
+            elapsed_ns,
+        );
+    }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
     let consumed = consumed_total.load(AtomicOrdering::Relaxed);
@@ -4176,6 +4866,10 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
         consumed_items: consumed,
         elapsed_ns,
         ops_per_sec: throughput_ops(consumed, elapsed_ns),
+        producer_ops_per_sec: None,
+        consumer_ops_per_sec: None,
+        written_bytes: None,
+        flush_count: None,
         push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
         pop_elapsed_ns: Some(collector_end.load(AtomicOrdering::Relaxed)),
         fill_elapsed_ns: None,
@@ -4301,15 +4995,30 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
     start.set(Instant::now()).ok();
     start_gate.wait();
 
-    for handle in client_handles {
-        handle.join().expect("client join failed");
+    let mut failure_reason = None;
+    if let Err(err) = join_bench_threads(client_handles, "client") {
+        failure_reason.get_or_insert(err);
     }
-    let sentinel_sender = request_queue.thread_handle();
-    for _ in 0..scenario.consumers {
-        sentinel_sender.send_value(SENTINEL);
+    if let Err(err) = send_sentinels(
+        request_queue.thread_handle(),
+        scenario.consumers,
+        queue_name,
+    ) {
+        failure_reason.get_or_insert(err);
     }
-    for handle in worker_handles {
-        handle.join().expect("worker join failed");
+    if let Err(err) = join_bench_threads(worker_handles, "worker") {
+        failure_reason.get_or_insert(err);
+    }
+    if let Some(reason) = failure_reason {
+        let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+        return failed_runtime_bench_record(
+            queue_name,
+            Mode::AppTaskRoundtrip,
+            scenario,
+            items_per_producer,
+            reason,
+            elapsed_ns,
+        );
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
@@ -4322,6 +5031,10 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
         consumed_items: consumed,
         elapsed_ns,
         ops_per_sec: throughput_ops(consumed, elapsed_ns),
+        producer_ops_per_sec: None,
+        consumer_ops_per_sec: None,
+        written_bytes: None,
+        flush_count: None,
         push_elapsed_ns: Some(client_max.load(AtomicOrdering::Relaxed)),
         pop_elapsed_ns: Some(worker_max.load(AtomicOrdering::Relaxed)),
         fill_elapsed_ns: None,
@@ -4441,15 +5154,26 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
     start.set(Instant::now()).ok();
     start_gate.wait();
 
-    for handle in producer_handles {
-        handle.join().expect("producer join failed");
+    let mut failure_reason = None;
+    if let Err(err) = join_bench_threads(producer_handles, "producer") {
+        failure_reason.get_or_insert(err);
     }
-    let sentinel_sender = queue_handle.thread_handle();
-    for _ in 0..scenario.consumers {
-        sentinel_sender.send_value(SENTINEL);
+    if let Err(err) = send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name) {
+        failure_reason.get_or_insert(err);
     }
-    for handle in consumer_handles {
-        handle.join().expect("consumer join failed");
+    if let Err(err) = join_bench_threads(consumer_handles, "consumer") {
+        failure_reason.get_or_insert(err);
+    }
+    if let Some(reason) = failure_reason {
+        let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+        return failed_runtime_bench_record(
+            queue_name,
+            Mode::ComplexThroughput,
+            scenario,
+            items_per_producer,
+            reason,
+            elapsed_ns,
+        );
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
@@ -4464,6 +5188,10 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
         consumed_items: consumed,
         elapsed_ns,
         ops_per_sec,
+        producer_ops_per_sec: None,
+        consumer_ops_per_sec: None,
+        written_bytes: None,
+        flush_count: None,
         push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
         pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
         fill_elapsed_ns: None,
@@ -4577,15 +5305,26 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
     start.set(Instant::now()).ok();
     start_gate.wait();
 
-    for handle in producer_handles {
-        handle.join().expect("producer join failed");
+    let mut failure_reason = None;
+    if let Err(err) = join_bench_threads(producer_handles, "producer") {
+        failure_reason.get_or_insert(err);
     }
-    let sentinel_sender = queue_handle.thread_handle();
-    for _ in 0..scenario.consumers {
-        sentinel_sender.send_value(SENTINEL);
+    if let Err(err) = send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name) {
+        failure_reason.get_or_insert(err);
     }
-    for handle in consumer_handles {
-        handle.join().expect("consumer join failed");
+    if let Err(err) = join_bench_threads(consumer_handles, "consumer") {
+        failure_reason.get_or_insert(err);
+    }
+    if let Some(reason) = failure_reason {
+        let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+        return failed_runtime_bench_record(
+            queue_name,
+            Mode::DataLatency,
+            scenario,
+            items_per_producer,
+            reason,
+            elapsed_ns,
+        );
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
@@ -4605,6 +5344,10 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
         consumed_items: consumed,
         elapsed_ns,
         ops_per_sec,
+        producer_ops_per_sec: None,
+        consumer_ops_per_sec: None,
+        written_bytes: None,
+        flush_count: None,
         push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
         pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
         fill_elapsed_ns: None,
@@ -4703,17 +5446,34 @@ fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
     start.set(Instant::now()).ok();
     start_gate.wait();
 
-    let mut producer_end_ns = Vec::with_capacity(scenario.producers);
-    for handle in producer_handles {
-        producer_end_ns.push(handle.join().expect("producer join failed"));
+    let mut failure_reason = None;
+    let producer_end_ns = match join_bench_threads(producer_handles, "producer") {
+        Ok(values) => values,
+        Err(err) => {
+            failure_reason.get_or_insert(err);
+            Vec::new()
+        }
+    };
+    if let Err(err) = send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name) {
+        failure_reason.get_or_insert(err);
     }
-    let sentinel_sender = queue_handle.thread_handle();
-    for _ in 0..scenario.consumers {
-        sentinel_sender.send_value(SENTINEL);
-    }
-    let mut consumer_results = Vec::with_capacity(scenario.consumers);
-    for handle in consumer_handles {
-        consumer_results.push(handle.join().expect("consumer join failed"));
+    let consumer_results = match join_bench_threads(consumer_handles, "consumer") {
+        Ok(values) => values,
+        Err(err) => {
+            failure_reason.get_or_insert(err);
+            Vec::new()
+        }
+    };
+    if let Some(reason) = failure_reason {
+        let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
+        return failed_runtime_bench_record(
+            queue_name,
+            Mode::Fairness,
+            scenario,
+            items_per_producer,
+            reason,
+            elapsed_ns,
+        );
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
@@ -4736,6 +5496,10 @@ fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
         consumed_items: consumed,
         elapsed_ns,
         ops_per_sec,
+        producer_ops_per_sec: None,
+        consumer_ops_per_sec: None,
+        written_bytes: None,
+        flush_count: None,
         push_elapsed_ns: producer_end_ns.iter().copied().max(),
         pop_elapsed_ns: consumer_results.iter().map(|(end_ns, _)| *end_ns).max(),
         fill_elapsed_ns: None,
@@ -4794,6 +5558,10 @@ fn bench_fill_drain_with_queue<Q: BenchQueueHandleFactory>(
         consumed_items: consumed,
         elapsed_ns,
         ops_per_sec,
+        producer_ops_per_sec: None,
+        consumer_ops_per_sec: None,
+        written_bytes: None,
+        flush_count: None,
         push_elapsed_ns: None,
         pop_elapsed_ns: None,
         fill_elapsed_ns: Some(fill_elapsed.as_nanos() as u64),
@@ -4849,6 +5617,10 @@ fn failed_bench_record(
         consumed_items: 0,
         elapsed_ns,
         ops_per_sec: None,
+        producer_ops_per_sec: None,
+        consumer_ops_per_sec: None,
+        written_bytes: None,
+        flush_count: None,
         push_elapsed_ns: None,
         pop_elapsed_ns: None,
         fill_elapsed_ns: None,
@@ -4860,6 +5632,110 @@ fn failed_bench_record(
         failure_reason: Some(reason),
         timeout_ns,
     }
+}
+
+fn status_and_timeout_for_failure(
+    reason: &str,
+    elapsed_ns: u64,
+) -> (BenchRecordStatus, Option<u64>) {
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("timed out") || normalized.contains("timeout") {
+        (BenchRecordStatus::TimedOut, Some(elapsed_ns))
+    } else {
+        (BenchRecordStatus::Failed, None)
+    }
+}
+
+fn failed_runtime_bench_record(
+    queue_name: &str,
+    mode: Mode,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    reason: String,
+    elapsed_ns: u64,
+) -> BenchRecord {
+    let (status, timeout_ns) = status_and_timeout_for_failure(&reason, elapsed_ns);
+    BenchRecord {
+        queue: queue_name.to_string(),
+        mode: mode.name().to_string(),
+        items_per_producer,
+        total_items: total_items(items_per_producer, scenario.producers),
+        consumed_items: 0,
+        elapsed_ns,
+        ops_per_sec: None,
+        producer_ops_per_sec: None,
+        consumer_ops_per_sec: None,
+        written_bytes: None,
+        flush_count: None,
+        push_elapsed_ns: None,
+        pop_elapsed_ns: None,
+        fill_elapsed_ns: None,
+        drain_elapsed_ns: None,
+        avg_data_latency_ns: None,
+        producer_fairness_ratio: None,
+        consumer_fairness_ratio: None,
+        status,
+        failure_reason: Some(reason),
+        timeout_ns,
+    }
+}
+
+fn join_bench_thread<T>(handle: thread::JoinHandle<T>, role: &str) -> Result<T, String> {
+    handle
+        .join()
+        .map_err(|payload| format!("{role} join failed: {}", panic_payload_message(payload)))
+}
+
+fn join_bench_threads<T>(
+    handles: Vec<thread::JoinHandle<T>>,
+    role: &str,
+) -> Result<Vec<T>, String> {
+    let mut values = Vec::with_capacity(handles.len());
+    let mut first_error = None;
+    for handle in handles {
+        match join_bench_thread(handle, role) {
+            Ok(value) => values.push(value),
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(values),
+    }
+}
+
+fn send_sentinels<T: BenchQueueThreadOps>(
+    sender: T,
+    consumers: usize,
+    queue_name: &str,
+) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        for _ in 0..consumers {
+            sender.send_value(SENTINEL);
+        }
+    }))
+    .map_err(|payload| {
+        format!(
+            "sending sentinels to {queue_name} failed: {}",
+            panic_payload_message(payload)
+        )
+    })
+}
+
+fn send_log_sentinel<T: LogQueueThreadOps>(sender: T, queue_name: &str) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        sender.send_log(LogRecord::sentinel());
+    }))
+    .map_err(|payload| {
+        format!(
+            "sending log sentinel to {queue_name} failed: {}",
+            panic_payload_message(payload)
+        )
+    })
 }
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
@@ -4913,8 +5789,8 @@ fn run_producers_only_for<Q: BenchQueueHandleFactory>(
     ready.wait();
     start.set(Instant::now()).ok();
     start_gate.wait();
-    for handle in handles {
-        handle.join().expect("producer join failed");
+    if let Err(err) = join_bench_threads(handles, "producer") {
+        panic!("{err}");
     }
     Duration::from_nanos(max_end.load(AtomicOrdering::Relaxed))
 }
@@ -4961,8 +5837,8 @@ fn run_consumers_only_for<Q: BenchQueueHandleFactory>(
     ready.wait();
     start.set(Instant::now()).ok();
     start_gate.wait();
-    for handle in handles {
-        handle.join().expect("consumer join failed");
+    if let Err(err) = join_bench_threads(handles, "consumer") {
+        panic!("{err}");
     }
     (
         Duration::from_nanos(max_end.load(AtomicOrdering::Relaxed)),
@@ -5214,6 +6090,10 @@ mod tests {
             consumed_items: items_per_producer,
             elapsed_ns: 1,
             ops_per_sec: Some(items_per_producer as f64),
+            producer_ops_per_sec: None,
+            consumer_ops_per_sec: None,
+            written_bytes: None,
+            flush_count: None,
             push_elapsed_ns: None,
             pop_elapsed_ns: None,
             fill_elapsed_ns: None,
@@ -5329,6 +6209,85 @@ mod tests {
             Mode::parse("app-task-roundtrip"),
             Some(Mode::AppTaskRoundtrip)
         );
+        assert_eq!(Mode::parse("app_log_mpsc_file"), Some(Mode::AppLogMpscFile));
+        assert_eq!(Mode::parse("app-log-mpsc-file"), Some(Mode::AppLogMpscFile));
+    }
+
+    #[test]
+    fn parses_machine_mpsc_scenarios_with_reserved_writer() {
+        let names_16 = parse_scenarios_with_parallelism(Some("mpsc:machine"), 16)
+            .expect("machine scenarios")
+            .into_iter()
+            .map(|scenario| scenario.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names_16, vec!["1p1c", "2p1c", "4p1c", "8p1c", "15p1c"]);
+
+        let names_160 = parse_scenarios_with_parallelism(Some("mpsc:machine"), 160)
+            .expect("machine scenarios")
+            .into_iter()
+            .map(|scenario| scenario.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names_160,
+            vec![
+                "1p1c", "2p1c", "4p1c", "8p1c", "16p1c", "32p1c", "64p1c", "128p1c", "159p1c"
+            ]
+        );
+    }
+
+    #[test]
+    fn app_log_mpsc_file_requires_one_consumer() {
+        let err = build_direct_matrix_plan(
+            "local",
+            PathBuf::from(DEFAULT_RUNS_DIR),
+            8,
+            &[QueueKind::SegQueue],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[ScenarioConfig::new(2, 2)],
+            &[Mode::AppLogMpscFile],
+            &[1],
+            1,
+            false,
+        )
+        .expect_err("expected MPSC validation error");
+        assert!(err.contains("exactly one consumer"));
+    }
+
+    #[test]
+    fn log_meta_roundtrips_and_writer_renders_line() {
+        let record = LogRecord {
+            message: "static message",
+            meta: pack_log_meta(3, 42, 99),
+        };
+        assert_eq!(unpack_log_level(record.meta), 3);
+        assert_eq!(unpack_log_producer_id(record.meta), 42);
+        assert_eq!(unpack_log_sequence(record.meta), 99);
+
+        let mut out = Vec::with_capacity(LOG_SINK_MAX_RECORD_BYTES);
+        append_log_record_line(&mut out, record);
+        assert_eq!(
+            std::str::from_utf8(&out).expect("utf8"),
+            "level=3 producer=42 seq=99 message=static message\n"
+        );
+    }
+
+    #[test]
+    fn app_log_mpsc_file_completes_small_segqueue_run() {
+        let scenario = ScenarioConfig::new(2, 1);
+        let record =
+            bench_app_log_mpsc_file_for::<SegQueue<LogRecord>>("segqueue", &scenario, 16, 0);
+        assert_eq!(record.mode, Mode::AppLogMpscFile.name());
+        assert_eq!(record.consumed_items, record.total_items);
+        assert!(record.ops_per_sec.is_some());
+        assert!(record.producer_ops_per_sec.is_some());
+        assert!(record.consumer_ops_per_sec.is_some());
+        assert!(record.written_bytes.is_some_and(|value| value > 0));
+        assert!(record.flush_count.is_some_and(|value| value > 0));
+        assert!(record.push_elapsed_ns.is_some());
+        assert!(record.pop_elapsed_ns.is_some());
     }
 
     #[test]
@@ -5490,8 +6449,10 @@ mod tests {
     }
 
     #[test]
-    fn direct_plan_rejects_blocks_below_producer_count() {
-        let err = build_direct_matrix_plan(
+    fn direct_plan_skips_labels_incompatible_with_scenario() {
+        // block=63 is too small for 64 producers — the incompatible combo must be
+        // silently skipped rather than aborting the whole matrix.
+        let plan = build_direct_matrix_plan(
             "local",
             PathBuf::from(DEFAULT_RUNS_DIR),
             128,
@@ -5506,9 +6467,11 @@ mod tests {
             1,
             false,
         )
-        .expect_err("expected validation error");
-        assert!(err.contains("64p1c"));
-        assert!(err.contains("block size 63"));
+        .expect("plan must succeed even when some labels are incompatible with some scenarios");
+        assert!(
+            plan.bundles.is_empty(),
+            "no bundles should be emitted for the incompatible (block=63, 64p1c) pair"
+        );
     }
 
     #[test]
@@ -5534,6 +6497,10 @@ mod tests {
                 consumed_items: 1,
                 elapsed_ns: 1,
                 ops_per_sec: Some(1.0),
+                producer_ops_per_sec: None,
+                consumer_ops_per_sec: None,
+                written_bytes: None,
+                flush_count: None,
                 push_elapsed_ns: None,
                 pop_elapsed_ns: None,
                 fill_elapsed_ns: None,
@@ -5905,6 +6872,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 10,
                     ops_per_sec: Some(10.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -5933,6 +6904,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 9,
                     ops_per_sec: Some(9.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -5961,6 +6936,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 20,
                     ops_per_sec: Some(20.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6023,6 +7002,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 10,
                     ops_per_sec: Some(30.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6051,6 +7034,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 11,
                     ops_per_sec: Some(29.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6079,6 +7066,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 20,
                     ops_per_sec: Some(20.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6205,6 +7196,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 10,
                     ops_per_sec: Some(10.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6233,6 +7228,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 11,
                     ops_per_sec: Some(9.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6261,6 +7260,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 20,
                     ops_per_sec: Some(20.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6289,6 +7292,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 15,
                     ops_per_sec: Some(25.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6379,6 +7386,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 10,
                     ops_per_sec: Some(10.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6407,6 +7418,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 11,
                     ops_per_sec: Some(11.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6435,6 +7450,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 20,
                     ops_per_sec: Some(20.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6502,6 +7521,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 10,
                     ops_per_sec: Some(10.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6530,6 +7553,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 11,
                     ops_per_sec: Some(11.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,
@@ -6558,6 +7585,10 @@ mod tests {
                     consumed_items: 1,
                     elapsed_ns: 20,
                     ops_per_sec: Some(20.0),
+                    producer_ops_per_sec: None,
+                    consumer_ops_per_sec: None,
+                    written_bytes: None,
+                    flush_count: None,
                     push_elapsed_ns: None,
                     pop_elapsed_ns: None,
                     fill_elapsed_ns: None,

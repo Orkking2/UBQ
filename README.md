@@ -114,6 +114,9 @@ The plotting scripts also emit `queue_metadata.csv` files that map queue labels
 back to their implementation family and publication lineage, so paper-backed
 baselines remain identifiable in aggregate plots.
 
+For a presentation-oriented preview run and the full BSC-CNS paper run, see
+[`docs/bsc_cns_presentation_runbook.md`](docs/bsc_cns_presentation_runbook.md).
+
 Run an explicit direct matrix:
 
 ```bash

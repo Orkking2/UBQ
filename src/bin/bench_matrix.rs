@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use ubq::bench_harness::{
     DEFAULT_RUNS_DIR, MatrixPlan, build_direct_matrix_plan, detect_available_parallelism,
     parse_fastfifo_block_sizes, parse_items_per_producer, parse_lfqueue_segment_sizes, parse_modes,
-    parse_queue_kinds, parse_scenarios, parse_wcq_capacities, run_matrix_plan_in_process,
+    parse_queue_kinds, parse_scenarios_with_parallelism, parse_wcq_capacities,
+    run_matrix_plan_in_process,
 };
 
 #[derive(Parser, Debug)]
@@ -78,7 +79,14 @@ fn main() {
                         .as_deref()
                         .unwrap_or("ubq,segqueue,concurrent-queue"),
                 )?;
-                let scenarios = parse_scenarios(args.scenarios.as_deref())?;
+                let available_parallelism = match args.parallelism {
+                    Some(value) => value,
+                    None => detect_available_parallelism()?,
+                };
+                let all_scenarios = parse_scenarios_with_parallelism(
+                    args.scenarios.as_deref(),
+                    available_parallelism,
+                )?;
                 let modes = parse_modes(args.modes.as_deref())?;
                 let items = parse_items_per_producer(args.items_per_producer.as_deref())?;
                 let fastfifo_block_sizes =
@@ -86,10 +94,21 @@ fn main() {
                 let lfqueue_segment_sizes =
                     parse_lfqueue_segment_sizes(args.lfqueue_segment_sizes.as_deref())?;
                 let wcq_capacities = parse_wcq_capacities(args.wcq_capacities.as_deref())?;
-                let available_parallelism = match args.parallelism {
-                    Some(value) => value,
-                    None => detect_available_parallelism()?,
-                };
+                let scenarios: Vec<_> = all_scenarios
+                    .into_iter()
+                    .filter(|s| {
+                        let ok = s.total_threads() <= available_parallelism;
+                        if !ok {
+                            eprintln!(
+                                "scenario {} requires {} threads but available_parallelism is {}",
+                                s.name,
+                                s.total_threads(),
+                                available_parallelism
+                            );
+                        }
+                        ok
+                    })
+                    .collect();
                 build_direct_matrix_plan(
                     machine_label,
                     args.runs_dir.clone(),

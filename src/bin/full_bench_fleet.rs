@@ -79,6 +79,7 @@ struct FleetDefaults {
     fastfifo_block_sizes: Option<Vec<usize>>,
     lfqueue_segment_sizes: Option<Vec<usize>>,
     wcq_capacities: Option<Vec<usize>>,
+    bench_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -117,6 +118,13 @@ struct FleetRuntime {
     sync_repo: bool,
     dry_run: bool,
     frontier_args: Vec<String>,
+    bench_mode: BenchMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BenchMode {
+    Frontier,
+    Matrix,
 }
 
 #[derive(Clone, Debug)]
@@ -577,9 +585,13 @@ fn make_frontier_base_args(
     }
     frontier_args.push("--repeats".to_string());
     frontier_args.push(runtime.repeats.to_string());
-    for seed_label in &runtime.ubq_labels {
-        frontier_args.push("--seed-label".to_string());
-        frontier_args.push(seed_label.clone());
+    let label_flag = match runtime.bench_mode {
+        BenchMode::Frontier => "--seed-label",
+        BenchMode::Matrix => "--ubq-label",
+    };
+    for label in &runtime.ubq_labels {
+        frontier_args.push(label_flag.to_string());
+        frontier_args.push(label.clone());
     }
     if !runtime.fastfifo_block_sizes.is_empty() {
         frontier_args.push("--rbbq-block-sizes".to_string());
@@ -665,6 +677,10 @@ fn cargo_feature_arg(runtime: &FleetRuntime) -> String {
 fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -> Vec<String> {
     let runs_dir = runtime.runs_dir.display().to_string();
     let features = cargo_feature_arg(runtime);
+    let bin = match runtime.bench_mode {
+        BenchMode::Frontier => "bench_frontier",
+        BenchMode::Matrix => "bench_matrix",
+    };
     let mut cmd = vec![
         "cargo".to_string(),
         "run".to_string(),
@@ -673,7 +689,7 @@ fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -
         "--features".to_string(),
         features,
         "--bin".to_string(),
-        "bench_frontier".to_string(),
+        bin.to_string(),
         "--".to_string(),
     ];
     cmd.extend(make_frontier_base_args(
@@ -684,9 +700,13 @@ fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -
     cmd
 }
 
-/// Build the shell payload (no SSH wrapper) for running bench_frontier on a remote machine.
+/// Build the shell payload (no SSH wrapper) for running bench_frontier/bench_matrix on a remote machine.
 fn build_remote_bench_payload(runtime: &FleetRuntime, machine: &ResolvedMachine) -> String {
     let features = cargo_feature_arg(runtime);
+    let bin = match runtime.bench_mode {
+        BenchMode::Frontier => "bench_frontier",
+        BenchMode::Matrix => "bench_matrix",
+    };
     let mut inner = vec![
         "cargo".to_string(),
         "run".to_string(),
@@ -695,7 +715,7 @@ fn build_remote_bench_payload(runtime: &FleetRuntime, machine: &ResolvedMachine)
         "--features".to_string(),
         features,
         "--bin".to_string(),
-        "bench_frontier".to_string(),
+        bin.to_string(),
         "--".to_string(),
     ];
     inner.extend(make_frontier_base_args(
@@ -937,7 +957,7 @@ fn run_remote_machine_via_tmux(
         println!("  replaying log from start — all previous output follows:");
     } else {
         println!(
-            "  launching bench_frontier on {} via tmux session '{}'",
+            "  launching bench on {} via tmux session '{}'",
             machine.host, session
         );
         let bench_payload = build_remote_bench_payload(runtime, machine);
@@ -1075,7 +1095,7 @@ fn run_machine(runtime: Arc<FleetRuntime>, machine: ResolvedMachine) -> MachineR
                 if code == 0 {
                     Ok(())
                 } else {
-                    Err(format!("local bench_frontier failed with exit code {code}"))
+                    Err(format!("local bench failed with exit code {code}"))
                 }
             },
         )
@@ -1171,6 +1191,10 @@ fn run(args: Args) -> Result<i32, String> {
         .repeats
         .unwrap_or_else(|| defaults.repeats.unwrap_or(1));
     let ubq_labels = defaults.ubq_labels.clone().unwrap_or_default();
+    let bench_mode = match defaults.bench_mode.as_deref().unwrap_or("frontier") {
+        "matrix" => BenchMode::Matrix,
+        _ => BenchMode::Frontier,
+    };
     let fastfifo_block_sizes = defaults
         .fastfifo_block_sizes
         .clone()
@@ -1203,6 +1227,7 @@ fn run(args: Args) -> Result<i32, String> {
         sync_repo: !args.no_sync_repo,
         dry_run: args.dry_run,
         frontier_args: args.frontier_args.clone(),
+        bench_mode,
     });
 
     let mut resolved = Vec::new();
@@ -1224,7 +1249,13 @@ fn run(args: Args) -> Result<i32, String> {
     );
     println!("Local runs dir: {}", runtime.runs_dir.display());
     println!("Plot out dir: {}", runtime.plot_out_dir.display());
-    println!("Mode: frontier search");
+    println!(
+        "Mode: {}",
+        match runtime.bench_mode {
+            BenchMode::Frontier => "frontier search",
+            BenchMode::Matrix => "direct ubq matrix",
+        }
+    );
     println!("Repeats: {}", runtime.repeats);
     if !runtime.frontier_args.is_empty() {
         println!(
@@ -1343,6 +1374,7 @@ mod tests {
             sync_repo: true,
             dry_run: true,
             frontier_args: vec!["--parallelism=16".to_string()],
+            bench_mode: BenchMode::Frontier,
         }
     }
 

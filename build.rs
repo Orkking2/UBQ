@@ -63,11 +63,14 @@ fn main() {
             for &(block, align_ty) in BLOCK_ALIGN {
                 for &(backoff_name, backoff_ty) in BACKOFF_INFO {
                     let label_str = format!("{},{},{},{}", preset, pool, block, backoff_name);
-                    let type_expr =
+                    let value_type_expr =
                         format!("ConfiguredUBQ<u64, {backoff_ty}, {pool}, {block}, {align_ty}>");
+                    let log_type_expr = format!(
+                        "ConfiguredUBQ<LogRecord, {backoff_ty}, {pool}, {block}, {align_ty}>"
+                    );
                     writeln!(
                         code,
-                        "        {:?} => Some(make_ubq_job_factory::<{type_expr}>(label, scenario, repeat_index, mode, items_per_producer)),",
+                        "        {:?} => Some(make_ubq_job_factory::<{value_type_expr}, {log_type_expr}>(label, scenario, repeat_index, mode, items_per_producer)),",
                         label_str,
                     )
                     .unwrap();
