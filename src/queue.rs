@@ -3,18 +3,16 @@ use crate::{
     backoff::{BackoffPolicy, Crossbeam},
     block::{Block, DEFAULT_BLOCK_SIZE, SKIP, WRITE},
 };
-use crossbeam_utils::CachePadded;
-use std::{
+use alloc::{boxed::Box, sync::Arc};
+use core::{
     array, fmt,
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::DerefMut,
     ptr::{null_mut, with_exposed_provenance_mut},
-    sync::{
-        Arc,
-        atomic::{AtomicPtr, AtomicUsize, Ordering, fence},
-    },
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence},
 };
+use crossbeam_utils::CachePadded;
 
 /// Default number of pooled blocks retained by [`crate::UBQ`].
 pub const DEFAULT_POOL_SIZE: usize = 1;
@@ -265,7 +263,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
                 .or_else(|| {
                     self.pool
                         .iter()
-                        .find_map(|slot| (!slot.load(Ordering::Relaxed).is_null()).then_some(slot))
+                        .find(|slot| !slot.load(Ordering::Relaxed).is_null())
                         .map(|slot| slot.swap(null_mut(), Ordering::AcqRel))
                 })
                 .unwrap_or_else(|| Box::into_raw(Block::new_zeroed()));
@@ -390,6 +388,14 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         }
 
         out.or_else(|| self.pop())
+    }
+}
+
+impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A> Default
+    for ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 

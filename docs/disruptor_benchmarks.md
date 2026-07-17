@@ -25,7 +25,7 @@ created, so there is no per-item variant dispatch inside the benchmark loop.
 ## Build UBQ JNI
 
 ```bash
-cargo build --release --features jni
+cargo rustc --release --lib --crate-type cdylib --features jni
 ```
 
 The dynamic library is emitted under `target/release` as `libubq.dylib` on
@@ -35,7 +35,7 @@ To include the same RBBQ/FastFifo backend used by this repository's Rust
 benchmark harness, build with:
 
 ```bash
-cargo build --release --features jni,bench_fastfifo
+cargo rustc --release --lib --crate-type cdylib --features jni,bench_fastfifo
 ```
 
 ## Java Wrapper

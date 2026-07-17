@@ -1,5 +1,6 @@
 use crate::align::A4096;
-use std::{
+use alloc::boxed::Box;
+use core::{
     cell::UnsafeCell,
     mem::{MaybeUninit, align_of, size_of},
     ptr::null_mut,
@@ -47,7 +48,7 @@ impl<T, const BLOCK_SIZE: usize, A> Block<T, BLOCK_SIZE, A> {
         let encoded_index_limit = BLOCK_SIZE * 2 + 1;
 
         assert!(
-            encoded_index_limit <= align_of::<Self>() - 1,
+            encoded_index_limit < align_of::<Self>(),
             "block alignment does not leave enough low bits for pointer tagging"
         );
     };

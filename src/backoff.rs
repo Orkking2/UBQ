@@ -1,7 +1,5 @@
 //! Backoff policies used to specialize UBQ's retry loops.
 
-use std::thread::yield_now;
-
 /// A backoff policy used by UBQ retry loops.
 pub trait BackoffPolicy: Sized {
     /// Creates a new backoff state for the current operation.
@@ -42,6 +40,9 @@ impl BackoffPolicy for Crossbeam {
 }
 
 /// Minimal backoff policy that yields on `snooze` and does nothing on `spin`.
+///
+/// Without the `std` feature, `snooze` uses [`core::hint::spin_loop`] because
+/// there is no host scheduler to yield to.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Yield;
 
@@ -56,6 +57,10 @@ impl BackoffPolicy for Yield {
 
     #[inline]
     fn snooze(&self) {
-        yield_now();
+        #[cfg(feature = "std")]
+        std::thread::yield_now();
+
+        #[cfg(not(feature = "std"))]
+        core::hint::spin_loop();
     }
 }

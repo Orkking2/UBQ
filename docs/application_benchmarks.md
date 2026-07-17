@@ -28,7 +28,7 @@ hangs or panics, the scheduler still writes a result record for that sample with
 Run the configured fleet:
 
 ```bash
-cargo run --release --bin full_bench_fleet -- \
+cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --config bench_fleet_app.toml \
   --machines local \
   --repeats 3

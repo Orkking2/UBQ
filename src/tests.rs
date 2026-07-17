@@ -1,13 +1,14 @@
 use std::{
     fmt::Debug,
     hint::black_box,
+    println,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self},
     time::Instant,
-    usize,
+    vec::Vec,
 };
 
 use crate::{BLOCK_LENGTH, ConfiguredUBQ, UBQ, align, backoff, ubq};
@@ -15,7 +16,7 @@ use crate::{BLOCK_LENGTH, ConfiguredUBQ, UBQ, align, backoff, ubq};
 #[test]
 fn drop_releases_all_enqueued_values() {
     let token = Arc::new(());
-    let n = (BLOCK_LENGTH as usize * 3) + 7;
+    let n = (BLOCK_LENGTH * 3) + 7;
 
     for _ in 0..16 {
         let q = UBQ::new();

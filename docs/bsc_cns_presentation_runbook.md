@@ -58,7 +58,7 @@ Run the hebrides preview from a networked shell where that host resolves.
 Use the small preview config when you need a fast presentation dry run:
 
 ```bash
-cargo run --release --bin full_bench_fleet -- \
+cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --config bench_fleet_preview.toml \
   --machines local \
   --plot-partial \
@@ -68,7 +68,7 @@ cargo run --release --bin full_bench_fleet -- \
 For hebrides:
 
 ```bash
-cargo run --release --bin full_bench_fleet -- \
+cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --config bench_fleet_preview.toml \
   --machines hebrides \
   --plot-partial
@@ -91,7 +91,7 @@ Preview output locations:
 On the BSC-CNS machine, clone or update this repository, then run:
 
 ```bash
-cargo run --release --bin full_bench_fleet -- \
+cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --config bench_fleet_bsc_cns.toml \
   --machines bsc-cns \
   --repeats 3 \
@@ -110,7 +110,7 @@ This uses:
 If the full run is too long, first run the preview config on BSC-CNS:
 
 ```bash
-cargo run --release --bin full_bench_fleet -- \
+cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --config bench_fleet_preview.toml \
   --machines bsc-cns \
   --plot-partial \

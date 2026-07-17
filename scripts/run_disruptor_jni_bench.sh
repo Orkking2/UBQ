@@ -200,7 +200,7 @@ if [[ "$needs_native" -eq 1 ]]; then
     features="jni,bench_fastfifo"
   fi
   log "Building libubq with features: $features"
-  cargo build --release --features "$features"
+  cargo rustc --release --lib --crate-type cdylib --features "$features"
 fi
 
 cat > "$run_dir/metadata.txt" <<META

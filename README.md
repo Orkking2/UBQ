@@ -23,7 +23,7 @@ Add UBQ to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ubq = "2"
+ubq = "5"
 ```
 
 ### Basic example
@@ -68,6 +68,21 @@ for h in handles { h.join().unwrap(); }
 
 See the full API reference on [docs.rs](https://docs.rs/ubq).
 
+### `no_std + alloc`
+
+UBQ supports `no_std` targets that provide heap allocation and native 8-bit
+and pointer-width atomics:
+
+```toml
+[dependencies]
+ubq = { version = "5", default-features = false }
+```
+
+The final application must install a global allocator. UBQ remains unbounded,
+so a push may allocate a new aligned block; applications with a fixed memory
+budget must enforce their own queue-depth limit. In `no_std` builds the built-in
+backoff policies spin instead of yielding to an operating-system scheduler.
+
 ## How it works
 
 TODO
@@ -80,7 +95,13 @@ RBBQ/BBQ, `lfqueue`/LSCQ, and wCQ variants) in
 `1p1c`, `4p1c`, `1p4c`, `4p4c`, `8p1c`, `8p4c`, `8p8c`, `1p8c`, `4p8c`,
 `16p1c`, `1p16c`, `8p16c`, `16p8c`, `16p16c`, `32p1c`, `1p32c`, `16p32c`,
 `32p16c`, `32p32c`, `64p1c`, `1p64c`, `32p64c`, `64p32c`, and `64p64c`
-scenarios. The v2 harness has two layers:
+scenarios.
+
+The Rust benchmark harness and binaries are isolated behind the `bench_tools`
+feature. Benchmark-specific features such as `bench_registry`, `bench_rbbq`,
+`bench_lfqueue`, and `bench_wcq` enable it automatically.
+
+The v2 harness has two layers:
 
 - `bench_matrix`: direct matrix execution. It dispatches through the
   precompiled benchmark registry and writes v2 JSON files under
@@ -180,7 +201,7 @@ cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq
 Run the configured fleet search:
 
 ```bash
-cargo run --release --bin full_bench_fleet -- \
+cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --machines local,lab,hebrides \
   --repeats 3
 ```
@@ -245,40 +266,11 @@ Per-scenario UBQ outputs also emit a companion CSV named
 winner-adjacent variant, including the matching `pool=0` no-pool comparison, as
 `present` or `missing`.
 
-### UBQ label variants
-
-UBQ variant knobs are compile-time feature flags:
-- version: `ubq_v3`, `ubq_v4`, `ubq_v5`, `ubq_v6`, `ubq_v7`
-- pool size: `ubq_pool_1`, `ubq_pool_2`, `ubq_pool_4`, `ubq_pool_8`, `ubq_pool_16`, `ubq_pool_32`, `ubq_pool_64` (`ubq_v6` is no-pool)
-- block length: `ubq_block_31`, `ubq_block_63`, `ubq_block_127`, `ubq_block_255`, `ubq_block_511`, `ubq_block_1023`, `ubq_block_2047`, `ubq_block_4095`
-- backoff mode: default crossbeam backoff, or `ubq_backoff_cq` (label suffix `,b`)
+The standalone benchmark target can be inspected with:
 
 ```bash
-# Example: v5,8,1023
-cargo bench --bench ubq_bench --features ubq_v5,ubq_pool_8,ubq_block_1023 -- \
-  --ubq-label v5,8,1023 \
-  --machine-label local \
-  --out bench_results/ubq_v5_8_1023.json
-
-# Example with concurrency-queue-style backoff: v5,8,1023,b
-cargo bench --bench ubq_bench --features ubq_v5,ubq_pool_8,ubq_block_1023,ubq_backoff_cq -- \
-  --ubq-label v5,8,1023,b \
-  --machine-label local \
-  --out bench_results/ubq_v5_8_1023_b.json
+cargo bench --bench ubq_bench --features bench_tools -- --help
 ```
-
-## Loom model checking
-
-UBQ includes opt-in [loom](https://crates.io/crates/loom) tests for
-deterministic interleaving exploration of high-contention block-boundary
-scenarios:
-
-```bash
-LOOM_MAX_PREEMPTIONS=3 cargo test --features loom --test loom_ubq
-```
-
-By default, the scenario runner caps model exploration at 200 permutations for
-practical runtime; override with `LOOM_MAX_PERMUTATIONS`.
 
 ## License
 

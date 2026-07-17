@@ -1265,7 +1265,7 @@ fn total_items(items_per_producer: u64, producers: usize) -> u64 {
     let total = items_per_producer
         .checked_mul(producers as u64)
         .unwrap_or_else(|| die("total items overflow"));
-    if total >= SENTINEL {
+    if total == SENTINEL {
         die("total items must be < u64::MAX");
     }
     total

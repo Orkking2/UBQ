@@ -7,7 +7,7 @@
 //! capacity.
 //!
 //! [`UBQ<T>`] itself is not clonable. To share it across threads, wrap it in
-//! [`Arc<UBQ<T>>`](std::sync::Arc), then clone the `Arc`.
+//! [`Arc<UBQ<T>>`](alloc::sync::Arc), then clone the `Arc`.
 //!
 //! Neither [`UBQ::push`] nor [`UBQ::pop`] ever parks the calling thread.  Both
 //! operations are *lock-free*: producers and consumers make progress independently.
@@ -47,16 +47,36 @@
 //! slot to guarantee it reads only fully-committed writes.
 //!
 //! Ordering and invariants are documented inline near the transitions they govern.
+//!
+//! # `no_std`
+//!
+//! Disable default features to use UBQ in a `no_std + alloc` environment. The
+//! final application must provide a global allocator, and the target must have
+//! native 8-bit and pointer-width atomic operations.
+//!
+//! ```toml
+//! [dependencies]
+//! ubq = { version = "5", default-features = false }
+//! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
+
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod align;
 pub mod backoff;
+#[cfg(feature = "bench_tools")]
 pub mod bench_harness;
 pub(crate) mod block;
 #[cfg(feature = "jni")]
 mod jni;
 pub(crate) mod queue;
+
+#[cfg(not(all(target_has_atomic = "8", target_has_atomic = "ptr")))]
+compile_error!("ubq requires native 8-bit and pointer-width atomic operations");
 
 #[cfg(test)]
 mod tests;

@@ -107,7 +107,7 @@ cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq
 Fleet run:
 
 ```bash
-cargo run --release --bin full_bench_fleet -- \
+cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --config bench_fleet_bbq_atc22.toml \
   --machines local,lab,hebrides \
   --repeats 3

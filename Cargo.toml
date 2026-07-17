@@ -1,48 +1,79 @@
 [package]
 name = "ubq"
-version = "4.0.0"
+version = "5.0.0"
 edition = "2024"
+rust-version = "1.92"
 build = "build.rs"
-description = "Lock-free unbounded MPMC queue backed by a linked ring of fixed-size blocks."
+autobins = false
+description = "Lock-free unbounded MPMC queue with no_std + alloc support."
 license = "MIT"
 readme = "README.md"
 documentation = "https://docs.rs/ubq"
+repository = "https://github.com/Orkking2/UBQ"
 keywords = ["queue", "mpmc", "lock-free", "concurrent", "channel"]
-categories = ["concurrency", "data-structures"]
+categories = ["concurrency", "data-structures", "no-std"]
 
 [lib]
 bench = false
-crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-concurrent-queue = "2"
-core_affinity = "0.8"
-crossbeam-queue = "0.3"
-crossbeam-utils = "0.8.21"
+concurrent-queue = { version = "2", optional = true }
+core_affinity = { version = "0.8", optional = true }
+crossbeam-queue = { version = "0.3", optional = true }
+crossbeam-utils = { version = "0.8.21", default-features = false }
 lfqueue = { version = "0.8.1", optional = true }
 rbbq = { version = "0.1.0", optional = true }
-serde = { version = "1", features = ["derive"] }
-clap = { version = "4", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["rt", "sync", "time"] }
-toml = "0.8"
+serde = { version = "1", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
+toml = { version = "0.8", optional = true }
 wcq = { version = "0.1.0", optional = true }
 
 [features]
-default = []
-jni = []
-ubq_debug = []
-bench_small = []
-bench_medium = []
-bench_large = []
-bench_fastfifo = ["dep:rbbq"]
+default = ["std"]
+std = ["crossbeam-utils/std"]
+jni = ["std"]
+bench_tools = [
+    "std",
+    "dep:clap",
+    "dep:concurrent-queue",
+    "dep:core_affinity",
+    "dep:crossbeam-queue",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tokio",
+    "dep:toml",
+]
+bench_fastfifo = ["bench_tools", "dep:rbbq"]
 bench_rbbq = ["bench_fastfifo"]
-bench_lfqueue = ["dep:lfqueue"]
-bench_wcq = ["dep:wcq"]
+bench_lfqueue = ["bench_tools", "dep:lfqueue"]
+bench_wcq = ["bench_tools", "dep:wcq"]
 # Compile the full static UBQ variant registry (928 monomorphizations).
 # Required for bench_frontier and bench_matrix to run in-process.
-bench_registry = []
+bench_registry = ["bench_tools"]
+
+[[bin]]
+name = "bench_frontier"
+path = "src/bin/bench_frontier.rs"
+required-features = ["bench_tools"]
+
+[[bin]]
+name = "bench_matrix"
+path = "src/bin/bench_matrix.rs"
+required-features = ["bench_tools"]
+
+[[bin]]
+name = "full_bench_fleet"
+path = "src/bin/full_bench_fleet.rs"
+required-features = ["bench_tools"]
+
+[[bin]]
+name = "io_uring_queue_bench"
+path = "src/bin/io_uring_queue_bench.rs"
+required-features = ["bench_tools"]
 
 [[bench]]
 name = "ubq_bench"
 harness = false
+required-features = ["bench_tools"]

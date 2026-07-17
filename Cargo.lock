@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "ubq"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "clap",
  "concurrent-queue",
