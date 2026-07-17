@@ -209,6 +209,13 @@ Generate plots manually (PNG + CSV when `matplotlib` is installed, CSV-only othe
 # Render plots from all JSON files under bench_results/runs recursively.
 ./.venv/bin/python scripts/plot_runs_folder.py --runs-dir bench_results/runs --out-dir bench_results/plots
 
+# Render PNGs from existing generated CSV machine folders and emit merged paper figures.
+./.venv/bin/python scripts/plot_bench.py \
+  --csv-dir bench_results/plots/grace/csv \
+  --csv-dir bench_results/plots/hebrides/csv \
+  --csv-dir bench_results/plots/mn5/csv \
+  --out-dir bench_results/plots
+
 # Optional: cap how many configs appear in the per-machine scaling line chart.
 ./.venv/bin/python scripts/plot_runs_folder.py --runs-dir bench_results/runs --out-dir bench_results/plots --max-line-series 10
 ```
@@ -223,6 +230,9 @@ Outputs are grouped by `meta.machine_label` and mode, e.g.:
 - `bench_results/plots/hebrides/csv/throughput/1p1c_throughput.csv`
 - `bench_results/plots/hebrides/csv/throughput/scenarios_line_throughput.csv`
 - `bench_results/plots/hebrides/csv/throughput/queue_metadata.csv`
+- `bench_results/plots/grace/throughput/mpsc_line_throughput.png`
+- `bench_results/plots/paper/mpsc_producer_throughput.png`
+- `bench_results/plots/paper/mpsc_push_elapsed_log.png`
 
 When records contain the newer timing fields, the plotter also emits derived
 metric folders such as `throughput_push_elapsed`,

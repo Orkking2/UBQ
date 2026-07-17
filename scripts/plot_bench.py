@@ -36,6 +36,44 @@ BASELINE_QUEUE_PRIORITY = {
     "concurrent-queue": 1,
 }
 LINE_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "*")
+THROUGHPUT_SPEEDUP_BASELINES = (
+    ("segqueue", "SegQueue", lambda label: label == "segqueue"),
+    ("bbq", "best BBQ", lambda label: queue_metadata(label)["family"] == "RBBQ/BBQ"),
+    ("lscq", "best LSCQ", lambda label: queue_metadata(label)["family"] == "LSCQ"),
+)
+PUBLICATION_SERIES = (
+    ("segqueue", lambda label: label == "segqueue"),
+    ("concurrent-queue", lambda label: label == "concurrent-queue"),
+    ("BBQ", lambda label: queue_metadata(label)["family"] == "RBBQ/BBQ"),
+    ("LSCQ", lambda label: queue_metadata(label)["family"] == "LSCQ"),
+    ("wCQ", lambda label: queue_metadata(label)["family"] == "wCQ"),
+    ("UBQ", lambda label: queue_metadata(label)["family"] == "UBQ"),
+)
+FAMILY_DISPLAY_LABELS = {
+    "RBBQ/BBQ": "BBQ",
+}
+MACHINE_ORDER = {
+    "grace": 0,
+    "hebrides": 1,
+    "mn5": 2,
+}
+MACHINE_DISPLAY_LABELS = {
+    "grace": "Grace",
+    "hebrides": "N1",
+    "mn5": "Xeon",
+}
+PUBLICATION_MACHINE_KEYS = frozenset(MACHINE_DISPLAY_LABELS)
+PUBLICATION_MPSC_FIGURES = (
+    (
+        "app_log_mpsc_file_producer_throughput",
+        "mpsc_producer_throughput.png",
+    ),
+    (
+        "app_log_mpsc_file_push_elapsed",
+        "mpsc_push_elapsed_log.png",
+    ),
+)
+PUBLICATION_TIME_SCALE = 1_000_000.0
 
 
 def collect_run_jsons(runs_dir: Path):
@@ -94,6 +132,16 @@ def scaling_scenario_sort_key(name: str):
         producers, consumers = threads
         return (0, producers + consumers, scenario)
     return (1, scenario)
+
+
+def machine_sort_key(name: str):
+    normalized = str(name).strip().lower()
+    return (MACHINE_ORDER.get(normalized, 99), normalized)
+
+
+def machine_display_label(name: str):
+    normalized = str(name).strip().lower()
+    return MACHINE_DISPLAY_LABELS.get(normalized, str(name))
 
 
 def scenario_family(name: str):
@@ -189,6 +237,28 @@ def metric_axis_label(mode: str):
     if mode.endswith(("_push_elapsed", "_pop_elapsed", "_fill_elapsed", "_drain_elapsed")):
         return "Elapsed time (ns)"
     return "Ops/sec"
+
+
+def publication_metric_axis_label(mode: str):
+    if mode.endswith("_push_elapsed"):
+        return "Elapsed time (ms)"
+    return metric_axis_label(mode)
+
+
+def publication_metric_column(mode: str):
+    if mode.endswith("_push_elapsed"):
+        return "push_elapsed_ms"
+    return metric_column(mode)
+
+
+def publication_metric_value(mode: str, value: float):
+    if mode.endswith("_push_elapsed"):
+        return value / PUBLICATION_TIME_SCALE
+    return value
+
+
+def scenario_line_uses_log_y(mode: str):
+    return mode.endswith("_push_elapsed")
 
 
 def metric_file_slug(mode: str):
@@ -308,12 +378,19 @@ def baseline_queue_priority(label: str):
 
 def display_label(label: str):
     if label.startswith("fastfifo_"):
-        return f"RBBQ/BBQ {label[len('fastfifo_'):]}"
+        return f"BBQ {label[len('fastfifo_'):]}"
     if label.startswith("lfqueue_"):
         return f"LSCQ {label[len('lfqueue_'):]}"
     if label.startswith("wcq_"):
         return f"wCQ {label[len('wcq_'):]}"
     return label
+
+
+def publication_display_label(label: str):
+    family = queue_metadata(label)["family"]
+    if family in ("UBQ", "RBBQ/BBQ", "LSCQ", "wCQ"):
+        return FAMILY_DISPLAY_LABELS.get(family, family)
+    return display_label(label)
 
 
 def queue_metadata(label: str):
@@ -372,6 +449,40 @@ def queue_metadata(label: str):
         "capacity_model": "",
         "ordering": "",
     }
+
+
+def finite_positive(value) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0.0
+
+
+def mean_value(stats):
+    try:
+        return float(stats["mean_ops_per_sec"])
+    except (KeyError, TypeError, ValueError):
+        return float("nan")
+
+
+def best_throughput_entry(entries, predicate):
+    candidates = []
+    for label, stats in entries.items():
+        value = mean_value(stats)
+        if predicate(label) and finite_positive(value):
+            candidates.append((label, value))
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: (-item[1], label_sort_key(item[0])))[0]
+
+
+def best_ubq_throughput_entry(entries, scenario):
+    def is_valid_ubq(label):
+        params = parse_ubq_variant(label)
+        return params is not None and ubq_params_valid_for_scenario(params, scenario)
+
+    return best_throughput_entry(entries, is_valid_ubq)
 
 
 def labels_by_ops_desc(entries):
@@ -699,6 +810,84 @@ def load_records(path: Path):
             yield machine_label, output_mode, scenario, queue_label, metric_value
 
 
+def csv_stats_from_row(row, mode: str):
+    metric_name = metric_column(mode)
+    try:
+        mean_value = float(row[metric_name])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    def optional_float(name: str):
+        raw = row.get(name, "")
+        if raw in ("", None):
+            return 0.0
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+
+    raw_samples = row.get("samples", "")
+    try:
+        samples = int(float(raw_samples)) if raw_samples not in ("", None) else 1
+    except (TypeError, ValueError):
+        samples = 1
+
+    return {
+        "mean_ops_per_sec": mean_value,
+        "stddev_ops_per_sec": optional_float("stddev"),
+        "sem_ops_per_sec": optional_float("sem"),
+        "samples": samples,
+    }
+
+
+def generated_scenario_csvs(csv_dir: Path):
+    skip_prefixes = ("scenarios_line_", "mpsc_line_", "spmc_line_")
+    for mode_dir in sorted(path for path in csv_dir.iterdir() if path.is_dir()):
+        mode = mode_dir.name
+        slug = metric_file_slug(mode)
+        suffix = f"_{slug}.csv"
+        for path in sorted(mode_dir.glob(f"*{suffix}")):
+            name = path.name
+            if name.startswith(skip_prefixes) or "immediate_variants" in name:
+                continue
+            scenario = name[: -len(suffix)]
+            if parse_scenario_threads(scenario) is None:
+                continue
+            yield mode, scenario, path
+
+
+def load_generated_csv_grouped(csv_dir: Path, machine_label: str):
+    grouped = {}
+    for mode, scenario, path in generated_scenario_csvs(csv_dir):
+        with path.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                label = row.get("queue")
+                if not label:
+                    continue
+                stats = csv_stats_from_row(row, mode)
+                if stats is None:
+                    continue
+                grouped.setdefault(machine_label, {}).setdefault(mode, {}).setdefault(
+                    scenario, {}
+                )[label] = stats
+    return grouped
+
+
+def infer_machine_label_from_csv_dir(csv_dir: Path):
+    if csv_dir.name == "csv" and csv_dir.parent.name:
+        return csv_dir.parent.name
+    return csv_dir.name
+
+
+def merge_grouped_records(target, source):
+    for machine, modes in source.items():
+        machine_group = target.setdefault(machine, {})
+        for mode, scenarios in modes.items():
+            mode_group = machine_group.setdefault(mode, {})
+            for scenario, entries in scenarios.items():
+                mode_group.setdefault(scenario, {}).update(entries)
+
+
 def summarize_ops(samples):
     sample_count = len(samples)
     mean_ops = sum(samples) / sample_count
@@ -905,8 +1094,220 @@ def write_queue_metadata_csv(out_path: Path, labels):
     return out_path
 
 
+def throughput_speedup_rows(entries_by_scenario):
+    rows = []
+    for scenario in sorted(entries_by_scenario, key=scenario_sort_key):
+        threads = parse_scenario_threads(scenario)
+        if threads is None:
+            continue
+        producers, consumers = threads
+        entries = entries_by_scenario[scenario]
+        ubq = best_ubq_throughput_entry(entries, scenario)
+        if ubq is None:
+            continue
+        ubq_label, ubq_value = ubq
+
+        for baseline_key, baseline_title, predicate in THROUGHPUT_SPEEDUP_BASELINES:
+            baseline = best_throughput_entry(entries, predicate)
+            if baseline is None:
+                continue
+            baseline_label, baseline_value = baseline
+            rows.append(
+                {
+                    "scenario": scenario,
+                    "producers": producers,
+                    "consumers": consumers,
+                    "comparison": baseline_key,
+                    "comparison_label": baseline_title,
+                    "ubq_queue": ubq_label,
+                    "ubq_ops_per_sec": ubq_value,
+                    "baseline_queue": baseline_label,
+                    "baseline_ops_per_sec": baseline_value,
+                    "speedup": ubq_value / baseline_value,
+                }
+            )
+    return rows
+
+
+def write_throughput_speedup_csv(out_path: Path, rows):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "scenario",
+                "producers",
+                "consumers",
+                "comparison",
+                "comparison_label",
+                "ubq_queue",
+                "ubq_ops_per_sec",
+                "baseline_queue",
+                "baseline_ops_per_sec",
+                "speedup",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row["scenario"],
+                    row["producers"],
+                    row["consumers"],
+                    row["comparison"],
+                    row["comparison_label"],
+                    row["ubq_queue"],
+                    f"{row['ubq_ops_per_sec']:.6f}",
+                    row["baseline_queue"],
+                    f"{row['baseline_ops_per_sec']:.6f}",
+                    f"{row['speedup']:.6f}",
+                ]
+            )
+    return out_path
+
+
+def format_speedup_label(value: float) -> str:
+    if value >= 100.0:
+        return f"{value:.0f}x"
+    if value >= 10.0:
+        return f"{value:.1f}x"
+    return f"{value:.2f}x"
+
+
 def family_scenarios(scenarios, family):
     return [scenario for scenario in scenarios if scenario_family(scenario) == family]
+
+
+def machine_family_entries(grouped, mode: str, family: str):
+    selected = {}
+    for machine in sorted(grouped, key=machine_sort_key):
+        entries_by_scenario = grouped[machine].get(mode)
+        if not entries_by_scenario:
+            continue
+        scenarios = family_scenarios(
+            sorted(entries_by_scenario, key=scaling_scenario_sort_key),
+            family,
+        )
+        if len(scenarios) < 2:
+            continue
+        selected[machine] = (
+            scenarios,
+            {scenario: entries_by_scenario[scenario] for scenario in scenarios},
+        )
+    return selected
+
+
+def publication_machine_entries(machine_entries):
+    return {
+        machine: entries
+        for machine, entries in machine_entries.items()
+        if str(machine).strip().lower() in PUBLICATION_MACHINE_KEYS
+    }
+
+
+def combined_scenario_line_labels(machine_entries, max_series: int, mode: str):
+    label_samples = {}
+    label_coverage = {}
+    for _machine, (_scenarios, entries_by_scenario) in machine_entries.items():
+        for entries in entries_by_scenario.values():
+            for label, stats in entries.items():
+                label_samples.setdefault(label, []).append(stats["mean_ops_per_sec"])
+                label_coverage[label] = label_coverage.get(label, 0) + 1
+
+    lower_is_better = metric_lower_is_better(mode)
+    labels = sorted(
+        label_samples.keys(),
+        key=lambda label: (
+            baseline_queue_priority(label),
+            -label_coverage[label],
+            average_ops_per_sec(label_samples[label])
+            if lower_is_better
+            else -average_ops_per_sec(label_samples[label]),
+            label_sort_key(label),
+        ),
+    )
+    if max_series <= 0:
+        return labels
+
+    selected = labels[:max_series]
+    selected_set = set(selected)
+    for _machine, (_scenarios, entries_by_scenario) in machine_entries.items():
+        for label in per_scenario_winning_ubq_labels(entries_by_scenario, mode):
+            if label not in selected_set:
+                selected.append(label)
+                selected_set.add(label)
+    return selected
+
+
+def best_aggregate_label(machine_entries, mode: str, predicate):
+    label_samples = {}
+    for _machine, (_scenarios, entries_by_scenario) in machine_entries.items():
+        for entries in entries_by_scenario.values():
+            for label, stats in entries.items():
+                if predicate(label):
+                    label_samples.setdefault(label, []).append(stats["mean_ops_per_sec"])
+
+    if not label_samples:
+        return None
+
+    lower_is_better = metric_lower_is_better(mode)
+    return sorted(
+        label_samples,
+        key=lambda label: (
+            average_ops_per_sec(label_samples[label])
+            if lower_is_better
+            else -average_ops_per_sec(label_samples[label]),
+            label_sort_key(label),
+        ),
+    )[0]
+
+
+def publication_scenario_line_labels(machine_entries, mode: str):
+    selected = []
+    selected_set = set()
+    for _display_name, predicate in PUBLICATION_SERIES:
+        label = best_aggregate_label(machine_entries, mode, predicate)
+        if label is not None and label not in selected_set:
+            selected.append(label)
+            selected_set.add(label)
+    return selected
+
+
+def write_machine_line_csv(
+    out_path: Path,
+    mode: str,
+    machine_entries,
+    labels,
+    value_formatter=lambda _mode, value: value,
+    column_name=None,
+    machine_formatter=lambda machine: machine,
+):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    metric_name = column_name or metric_column(mode)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["machine", "scenario", "queue", metric_name, "stddev", "sem", "samples"]
+        )
+        for machine in sorted(machine_entries, key=machine_sort_key):
+            scenarios, entries_by_scenario = machine_entries[machine]
+            for scenario in scenarios:
+                entries = entries_by_scenario[scenario]
+                for label in labels:
+                    stats = entries.get(label)
+                    if stats is None:
+                        continue
+                    writer.writerow(
+                        [
+                            machine_formatter(machine),
+                            scenario,
+                            label,
+                            f"{value_formatter(mode, stats['mean_ops_per_sec']):.6f}",
+                            f"{value_formatter(mode, stats['stddev_ops_per_sec']):.6f}",
+                            f"{value_formatter(mode, stats['sem_ops_per_sec']):.6f}",
+                            stats["samples"],
+                        ]
+                    )
+    return out_path
 
 
 def annotate_immediate_variant_status(ax, coverage_csv_name: str, report):
@@ -955,6 +1356,113 @@ def annotate_immediate_variant_status(ax, coverage_csv_name: str, report):
         fontsize=9,
         bbox=bbox,
     )
+
+
+def plot_throughput_speedup_grid(plt, out_path: Path, machine: str, entries_by_scenario):
+    rows = throughput_speedup_rows(entries_by_scenario)
+    if not rows:
+        return False
+
+    scenario_coords = {
+        parse_scenario_threads(scenario)
+        for scenario in entries_by_scenario
+        if parse_scenario_threads(scenario) is not None
+    }
+    if not scenario_coords:
+        return False
+
+    producers = sorted({coord[0] for coord in scenario_coords})
+    consumers = sorted({coord[1] for coord in scenario_coords})
+    by_cell = {
+        (row["comparison"], row["producers"], row["consumers"]): row
+        for row in rows
+    }
+    finite_logs = [
+        math.log2(row["speedup"])
+        for row in rows
+        if finite_positive(row["speedup"])
+    ]
+    if not finite_logs:
+        return False
+
+    from matplotlib.colors import TwoSlopeNorm
+
+    vmin = min(-3.0, max(-6.0, min(finite_logs)))
+    vmax = max(3.0, min(6.0, max(finite_logs)))
+    norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+    cmap = plt.get_cmap("RdYlGn").copy()
+    cmap.set_bad("#f2f2f2")
+
+    panel_count = len(THROUGHPUT_SPEEDUP_BASELINES)
+    width = max(12.0, panel_count * (2.8 + 0.42 * len(consumers)))
+    height = max(5.6, 2.6 + 0.52 * len(producers))
+    fig, axes = plt.subplots(1, panel_count, figsize=(width, height), squeeze=False)
+    axes = list(axes[0])
+    image = None
+    text_threshold = max(abs(vmin), abs(vmax)) * 0.52
+
+    for ax, (comparison, title, _predicate) in zip(axes, THROUGHPUT_SPEEDUP_BASELINES):
+        matrix = []
+        for producer in producers:
+            matrix_row = []
+            for consumer in consumers:
+                row = by_cell.get((comparison, producer, consumer))
+                if row is None or not finite_positive(row["speedup"]):
+                    matrix_row.append(float("nan"))
+                else:
+                    matrix_row.append(math.log2(row["speedup"]))
+            matrix.append(matrix_row)
+
+        image = ax.imshow(matrix, cmap=cmap, norm=norm, origin="upper", aspect="auto")
+        ax.set_xticks(range(len(consumers)), [str(value) for value in consumers])
+        ax.set_yticks(range(len(producers)), [str(value) for value in producers])
+        ax.set_xlabel("Consumers")
+        ax.set_title(title)
+        ax.set_xticks([idx - 0.5 for idx in range(1, len(consumers))], minor=True)
+        ax.set_yticks([idx - 0.5 for idx in range(1, len(producers))], minor=True)
+        ax.grid(which="minor", color="white", linestyle="-", linewidth=1.0)
+        ax.tick_params(which="minor", bottom=False, left=False)
+
+        for y_idx, producer in enumerate(producers):
+            for x_idx, consumer in enumerate(consumers):
+                coord = (producer, consumer)
+                row = by_cell.get((comparison, producer, consumer))
+                if row is None:
+                    if coord not in scenario_coords:
+                        continue
+                    text = "n/a"
+                    color = "#666666"
+                else:
+                    speedup = row["speedup"]
+                    text = format_speedup_label(speedup)
+                    log_speedup = math.log2(speedup)
+                    color = "white" if abs(log_speedup) >= text_threshold else "black"
+                ax.text(
+                    x_idx,
+                    y_idx,
+                    text,
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color=color,
+                )
+
+    axes[0].set_ylabel("Producers")
+    fig.suptitle(
+        f"{machine_display_label(machine)}: throughput speedup, best UBQ vs selected baselines"
+    )
+    fig.subplots_adjust(top=0.86, right=0.84, wspace=0.28)
+    if image is not None:
+        colorbar = fig.colorbar(image, ax=axes, fraction=0.028, pad=0.035)
+        ticks = [tick for tick in range(math.ceil(vmin), math.floor(vmax) + 1)]
+        colorbar.set_ticks(ticks)
+        colorbar.set_ticklabels([f"{2 ** tick:g}x" for tick in ticks])
+        colorbar.set_label("UBQ speedup")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return True
 
 
 def plot_scenario_lines(
@@ -1008,9 +1516,12 @@ def plot_scenario_lines(
     ax.set_xticks(x_positions, scenarios, rotation=40, ha="right")
     ax.set_xlabel(family_axis_label(family))
     ax.set_ylabel(metric_axis_label(mode))
+    log_y = scenario_line_uses_log_y(mode)
+    if log_y:
+        ax.set_yscale("log")
     family_prefix = f"{family.upper()} " if family else ""
     ax.set_title(f"{machine}: {family_prefix}{metric_display_name(mode)} scaling")
-    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    ax.grid(axis="y", which="both" if log_y else "major", linestyle=":", alpha=0.4)
     ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=9, frameon=False)
     fig.tight_layout(rect=(0, 0, 0.84, 1))
 
@@ -1019,12 +1530,188 @@ def plot_scenario_lines(
     plt.close(fig)
 
 
+def plot_machine_comparison_lines(
+    plt,
+    out_path: Path,
+    mode: str,
+    machine_entries,
+    labels,
+    error_bars: str,
+    family: str,
+    label_formatter=display_label,
+    value_formatter=lambda _mode, value: value,
+    y_axis_label=None,
+):
+    if len(machine_entries) < 2 or not labels:
+        return False
+
+    machines = sorted(machine_entries, key=machine_sort_key)
+    width = max(10.5, 3.7 * len(machines))
+    fig, axes = plt.subplots(
+        1,
+        len(machines),
+        figsize=(width, 4.1),
+        sharey=False,
+        squeeze=False,
+    )
+    axes = list(axes[0])
+    color_map = plt.get_cmap("tab20", max(len(labels), 1))
+    colors = {label: color_map(idx) for idx, label in enumerate(labels)}
+    markers = {label: LINE_MARKERS[idx % len(LINE_MARKERS)] for idx, label in enumerate(labels)}
+    handles_by_label = {}
+    log_y = scenario_line_uses_log_y(mode)
+    positive_y_values = []
+
+    for ax_idx, (ax, machine) in enumerate(zip(axes, machines)):
+        scenarios, entries_by_scenario = machine_entries[machine]
+        x_labels = [
+            parse_scenario_threads(scenario)[0]
+            if family == "mpsc"
+            else parse_scenario_threads(scenario)[1]
+            for scenario in scenarios
+        ]
+        x_positions = list(range(len(scenarios)))
+
+        for label in labels:
+            xs = []
+            ys = []
+            yerrs = []
+            for x_pos, scenario in zip(x_positions, scenarios):
+                stats = entries_by_scenario[scenario].get(label)
+                if stats is None:
+                    continue
+                y_value = value_formatter(mode, stats["mean_ops_per_sec"])
+                xs.append(x_pos)
+                ys.append(y_value)
+                if y_value > 0.0:
+                    positive_y_values.append(y_value)
+                err = error_value(stats, error_bars)
+                if err is not None:
+                    yerrs.append(value_formatter(mode, err))
+
+            if not xs:
+                continue
+
+            plot_kwargs = {
+                "label": label_formatter(label),
+                "color": colors[label],
+                "marker": markers[label],
+                "linewidth": 1.45,
+                "markersize": 4.2,
+            }
+            if yerrs and any(value != 0.0 for value in yerrs):
+                handle = ax.errorbar(xs, ys, yerr=yerrs, capsize=2, **plot_kwargs)
+            else:
+                line = ax.plot(xs, ys, **plot_kwargs)
+                handle = line[0] if line else None
+            if handle is not None:
+                handles_by_label.setdefault(label, handle)
+
+        ax.set_xticks(x_positions, [str(value) for value in x_labels], rotation=35, ha="right")
+        ax.tick_params(axis="x", labelsize=8)
+        ax.set_xlabel(family_axis_label(family))
+        ax.set_title(machine_display_label(machine), fontsize=10)
+        ax.grid(axis="y", which="both" if log_y else "major", linestyle=":", alpha=0.35)
+        ax.grid(axis="x", which="major", linestyle=":", alpha=0.14)
+        if ax_idx == 0:
+            ax.set_ylabel(y_axis_label or metric_axis_label(mode))
+        if log_y:
+            ax.set_yscale("log")
+
+    if log_y and positive_y_values:
+        y_min = min(positive_y_values) / 1.8
+        y_max = max(positive_y_values) * 1.8
+        for ax in axes:
+            ax.set_ylim(y_min, y_max)
+
+    legend_handles = [handles_by_label[label] for label in labels if label in handles_by_label]
+    legend_labels = [
+        label_formatter(label) for label in labels if label in handles_by_label
+    ]
+    if legend_handles:
+        legend_cols = min(6, max(1, len(legend_handles)))
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.025),
+            ncol=legend_cols,
+            fontsize=8,
+            frameon=False,
+        )
+
+    bottom = 0.105 if legend_handles else 0.08
+    fig.tight_layout(rect=(0, bottom, 1, 1))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def plot_publication_mpsc_figures(plt, out_root: Path, grouped, max_series: int, error_bars: str):
+    for mode, filename in PUBLICATION_MPSC_FIGURES:
+        machine_entries = publication_machine_entries(
+            machine_family_entries(grouped, mode, "mpsc")
+        )
+        if len(machine_entries) < 2:
+            continue
+        labels = (
+            publication_scenario_line_labels(machine_entries, mode)
+            if max_series > 0
+            else combined_scenario_line_labels(machine_entries, max_series, mode)
+        )
+        csv_path = out_root / "paper" / "csv" / filename.replace(".png", ".csv")
+        write_machine_line_csv(
+            csv_path,
+            mode,
+            machine_entries,
+            labels,
+            publication_metric_value,
+            publication_metric_column(mode),
+            machine_display_label,
+        )
+        print(f"Wrote CSV: {csv_path}")
+        png_path = out_root / "paper" / filename
+        if plot_machine_comparison_lines(
+            plt,
+            png_path,
+            mode,
+            machine_entries,
+            labels,
+            error_bars,
+            "mpsc",
+            publication_display_label,
+            publication_metric_value,
+            publication_metric_axis_label(mode),
+        ):
+            print(f"Wrote PNG: {png_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot UBQ benchmark throughput.")
     parser.add_argument("files", nargs="*", help="Benchmark JSON files")
     parser.add_argument(
         "--runs-dir",
         help="Recursively load benchmark JSON files from a runs directory tree",
+    )
+    parser.add_argument(
+        "--csv-dir",
+        action="append",
+        dest="csv_dirs",
+        help=(
+            "Render PNGs from an existing generated CSV machine directory. "
+            "Can be passed multiple times; examples: bench_results/GraceData "
+            "or bench_results/plots/grace/csv."
+        ),
+    )
+    parser.add_argument(
+        "--machine-label",
+        action="append",
+        dest="machine_labels",
+        help=(
+            "Machine label to use with --csv-dir output paths and plot titles. "
+            "Can be repeated to match repeated --csv-dir arguments."
+        ),
     )
     parser.add_argument(
         "--out-dir",
@@ -1054,113 +1741,141 @@ def main():
     if args.runs_dir:
         files.extend(collect_run_jsons(Path(args.runs_dir)))
 
-    if not files:
-        parser.error("provide at least one benchmark JSON file or --runs-dir")
+    if args.csv_dirs and files:
+        parser.error("provide either benchmark JSON input/--runs-dir or --csv-dir, not both")
+    if not files and not args.csv_dirs:
+        parser.error("provide at least one benchmark JSON file, --runs-dir, or --csv-dir")
+    if args.machine_labels and not args.csv_dirs:
+        parser.error("--machine-label requires --csv-dir")
+    if args.csv_dirs and args.machine_labels and len(args.machine_labels) != len(args.csv_dirs):
+        parser.error("repeat --machine-label once for each --csv-dir, or omit it")
 
     out_root = Path(args.out_dir)
-    raw_data = {}
-    sample_points = 0
-
-    for path in files:
-        for machine, mode, scenario, label, ops in load_records(path):
-            key = (machine, mode, scenario, label)
-            raw_data.setdefault(key, []).append(ops)
-            sample_points += 1
-
-    if sample_points == 0:
-        print("No benchmark records found in input files.")
-        return
-
-    if not args.no_clean:
-        clear_generated_outputs(out_root)
-
     grouped = {}
-    for (machine, mode, scenario, label), samples in raw_data.items():
-        grouped.setdefault(machine, {}).setdefault(mode, {}).setdefault(scenario, {})[label] = (
-            summarize_ops(samples)
-        )
 
-    for machine in sorted(grouped):
-        for mode in sorted(grouped[machine], key=mode_sort_key):
-            for scenario in sorted(grouped[machine][mode], key=scenario_sort_key):
-                entries = grouped[machine][mode][scenario]
-                report = primary_plot_report(entries, mode, scenario)
-                labels = report["selected_labels"]
-                values = [(label, entries[label]) for label in labels]
+    if args.csv_dirs:
+        for idx, raw_csv_dir in enumerate(args.csv_dirs):
+            csv_dir = Path(raw_csv_dir)
+            if not csv_dir.is_dir():
+                parser.error(f"--csv-dir does not exist or is not a directory: {csv_dir}")
+            machine_label = (
+                args.machine_labels[idx]
+                if args.machine_labels
+                else infer_machine_label_from_csv_dir(csv_dir)
+            )
+            merge_grouped_records(
+                grouped,
+                load_generated_csv_grouped(csv_dir, machine_label),
+            )
+        if not grouped:
+            print("No generated benchmark CSV records found under the provided --csv-dir path(s).")
+            return
+        if not args.no_clean:
+            for machine_label in sorted(grouped, key=machine_sort_key):
+                clear_generated_outputs(out_root / machine_label)
+    else:
+        raw_data = {}
+        sample_points = 0
+
+        for path in files:
+            for machine, mode, scenario, label, ops in load_records(path):
+                key = (machine, mode, scenario, label)
+                raw_data.setdefault(key, []).append(ops)
+                sample_points += 1
+
+        if sample_points == 0:
+            print("No benchmark records found in input files.")
+            return
+
+        if not args.no_clean:
+            clear_generated_outputs(out_root)
+
+        for (machine, mode, scenario, label), samples in raw_data.items():
+            grouped.setdefault(machine, {}).setdefault(mode, {}).setdefault(scenario, {})[label] = (
+                summarize_ops(samples)
+            )
+
+        for machine in sorted(grouped):
+            for mode in sorted(grouped[machine], key=mode_sort_key):
+                for scenario in sorted(grouped[machine][mode], key=scenario_sort_key):
+                    entries = grouped[machine][mode][scenario]
+                    report = primary_plot_report(entries, mode, scenario)
+                    labels = report["selected_labels"]
+                    values = [(label, entries[label]) for label in labels]
+                    slug = metric_file_slug(mode)
+                    csv_path = out_root / machine / "csv" / mode / f"{scenario}_{slug}.csv"
+                    write_csv(csv_path, mode, values)
+                    print(f"Wrote CSV: {csv_path}")
+                    if report["required_labels"] and mode in ("throughput", "complex_throughput"):
+                        coverage_csv_path = (
+                            out_root
+                            / machine
+                            / "csv"
+                            / mode
+                            / f"{scenario}_immediate_variants_{slug}.csv"
+                        )
+                        write_immediate_variant_csv(
+                            coverage_csv_path,
+                            entries,
+                            report["winner"],
+                            report["required_labels"],
+                        )
+                        print(f"Wrote CSV: {coverage_csv_path}")
+                        if report["missing_required_labels"]:
+                            print(
+                                f"warning: {machine} {mode} {scenario} is missing "
+                                f"{len(report['missing_required_labels'])} required UBQ variant(s)",
+                                file=sys.stderr,
+                            )
+
+        for machine in sorted(grouped):
+            for mode in sorted(grouped[machine], key=mode_sort_key):
+                scenarios = sorted(grouped[machine][mode], key=scaling_scenario_sort_key)
+                entries_by_scenario = grouped[machine][mode]
+                labels = scenario_line_labels(entries_by_scenario, args.max_line_series, mode)
                 slug = metric_file_slug(mode)
-                csv_path = out_root / machine / "csv" / mode / f"{scenario}_{slug}.csv"
-                write_csv(csv_path, mode, values)
+                csv_path = out_root / machine / "csv" / mode / f"scenarios_line_{slug}.csv"
+                write_scenario_line_csv(csv_path, mode, scenarios, labels, entries_by_scenario)
                 print(f"Wrote CSV: {csv_path}")
-                if report["required_labels"] and mode in ("throughput", "complex_throughput"):
-                    coverage_csv_path = (
+                all_labels = sorted(
+                    {
+                        label
+                        for entries in entries_by_scenario.values()
+                        for label in entries.keys()
+                    },
+                    key=label_sort_key,
+                )
+                metadata_csv_path = out_root / machine / "csv" / mode / "queue_metadata.csv"
+                write_queue_metadata_csv(metadata_csv_path, all_labels)
+                print(f"Wrote CSV: {metadata_csv_path}")
+                for family in ("mpsc", "spmc"):
+                    selected_scenarios = family_scenarios(scenarios, family)
+                    if len(selected_scenarios) < 2:
+                        continue
+                    selected_entries = {
+                        scenario: entries_by_scenario[scenario]
+                        for scenario in selected_scenarios
+                    }
+                    labels = scenario_line_labels(
+                        selected_entries,
+                        args.max_line_series,
+                        mode,
+                    )
+                    csv_path = (
                         out_root
                         / machine
                         / "csv"
                         / mode
-                        / f"{scenario}_immediate_variants_{slug}.csv"
+                        / f"{family}_line_{slug}.csv"
                     )
-                    write_immediate_variant_csv(
-                        coverage_csv_path,
-                        entries,
-                        report["winner"],
-                        report["required_labels"],
+                    write_scenario_line_csv(
+                        csv_path,
+                        mode,
+                        selected_scenarios,
+                        labels,
+                        selected_entries,
                     )
-                    print(f"Wrote CSV: {coverage_csv_path}")
-                    if report["missing_required_labels"]:
-                        print(
-                            f"warning: {machine} {mode} {scenario} is missing "
-                            f"{len(report['missing_required_labels'])} required UBQ variant(s)",
-                            file=sys.stderr,
-                        )
-
-    for machine in sorted(grouped):
-        for mode in sorted(grouped[machine], key=mode_sort_key):
-            scenarios = sorted(grouped[machine][mode], key=scaling_scenario_sort_key)
-            entries_by_scenario = grouped[machine][mode]
-            labels = scenario_line_labels(entries_by_scenario, args.max_line_series, mode)
-            slug = metric_file_slug(mode)
-            csv_path = out_root / machine / "csv" / mode / f"scenarios_line_{slug}.csv"
-            write_scenario_line_csv(csv_path, mode, scenarios, labels, entries_by_scenario)
-            print(f"Wrote CSV: {csv_path}")
-            all_labels = sorted(
-                {
-                    label
-                    for entries in entries_by_scenario.values()
-                    for label in entries.keys()
-                },
-                key=label_sort_key,
-            )
-            metadata_csv_path = out_root / machine / "csv" / mode / "queue_metadata.csv"
-            write_queue_metadata_csv(metadata_csv_path, all_labels)
-            print(f"Wrote CSV: {metadata_csv_path}")
-            for family in ("mpsc", "spmc"):
-                selected_scenarios = family_scenarios(scenarios, family)
-                if len(selected_scenarios) < 2:
-                    continue
-                selected_entries = {
-                    scenario: entries_by_scenario[scenario]
-                    for scenario in selected_scenarios
-                }
-                labels = scenario_line_labels(
-                    selected_entries,
-                    args.max_line_series,
-                    mode,
-                )
-                csv_path = (
-                    out_root
-                    / machine
-                    / "csv"
-                    / mode
-                    / f"{family}_line_{slug}.csv"
-                )
-                write_scenario_line_csv(
-                    csv_path,
-                    mode,
-                    selected_scenarios,
-                    labels,
-                    selected_entries,
-                )
-                print(f"Wrote CSV: {csv_path}")
+                    print(f"Wrote CSV: {csv_path}")
 
     ensure_plot_runtime_env(out_root)
     try:
@@ -1177,6 +1892,22 @@ def main():
         else:
             print("matplotlib not found; install requirements-plot.txt for PNG output. Wrote CSVs only.")
         return
+
+    for machine in sorted(grouped):
+        entries_by_scenario = grouped[machine].get("throughput")
+        if not entries_by_scenario:
+            continue
+        speedup_rows = throughput_speedup_rows(entries_by_scenario)
+        if not speedup_rows:
+            continue
+        csv_path = out_root / machine / "csv" / "throughput" / "ubq_speedup_grid_throughput.csv"
+        write_throughput_speedup_csv(csv_path, speedup_rows)
+        print(f"Wrote CSV: {csv_path}")
+        png_path = out_root / machine / "throughput" / "ubq_speedup_grid_throughput.png"
+        if plot_throughput_speedup_grid(plt, png_path, machine, entries_by_scenario):
+            print(f"Wrote PNG: {png_path}")
+
+    plot_publication_mpsc_figures(plt, out_root, grouped, args.max_line_series, args.error_bars)
 
     for machine in sorted(grouped):
         for mode in sorted(grouped[machine], key=mode_sort_key):

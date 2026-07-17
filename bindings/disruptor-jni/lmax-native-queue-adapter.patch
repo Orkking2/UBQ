@@ -1,0 +1,251 @@
+diff --git a/src/perftest/java/com/lmax/disruptor/queue/OneToOneQueueThroughputTest.java b/src/perftest/java/com/lmax/disruptor/queue/OneToOneQueueThroughputTest.java
+index 35f6a3d8..f7d594ee 100644
+--- a/src/perftest/java/com/lmax/disruptor/queue/OneToOneQueueThroughputTest.java
++++ b/src/perftest/java/com/lmax/disruptor/queue/OneToOneQueueThroughputTest.java
+@@ -16,17 +16,12 @@
+ package com.lmax.disruptor.queue;
+ 
+ import com.lmax.disruptor.AbstractPerfTestQueue;
+-import com.lmax.disruptor.support.ValueAdditionQueueProcessor;
+ import com.lmax.disruptor.util.DaemonThreadFactory;
++import ubq.jni.UbqLongQueue;
+ 
+-import java.util.concurrent.BlockingQueue;
+-import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.LinkedBlockingQueue;
+-
+-import static com.lmax.disruptor.support.PerfTestUtil.failIf;
+ 
+ /**
+  * <pre>
+@@ -59,9 +54,7 @@ public final class OneToOneQueueThroughputTest extends AbstractPerfTestQueue
+ 
+     ///////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-    private final BlockingQueue<Long> blockingQueue = new LinkedBlockingQueue<>(BUFFER_SIZE);
+-    private final ValueAdditionQueueProcessor queueProcessor =
+-        new ValueAdditionQueueProcessor(blockingQueue, ITERATIONS - 1);
++    private final UbqLongQueue queue = new UbqLongQueue();
+ 
+     ///////////////////////////////////////////////////////////////////////////////////////////////
+ 
+@@ -72,24 +65,20 @@ public final class OneToOneQueueThroughputTest extends AbstractPerfTestQueue
+     }
+ 
+     @Override
+-    protected long runQueuePass() throws InterruptedException
++    protected long runQueuePass() throws Exception
+     {
+-        final CountDownLatch latch = new CountDownLatch(1);
+-        queueProcessor.reset(latch);
+-        Future<?> future = executor.submit(queueProcessor);
++        Future<Long> future = executor.submit(() -> queue.popAddExact(ITERATIONS));
+         long start = System.currentTimeMillis();
+ 
+-        for (long i = 0; i < ITERATIONS; i++)
+-        {
+-            blockingQueue.put(3L);
+-        }
++        queue.pushConstantExact(3L, ITERATIONS);
+ 
+-        latch.await();
++        long result = future.get();
+         long opsPerSecond = (ITERATIONS * 1000L) / (System.currentTimeMillis() - start);
+-        queueProcessor.halt();
+-        future.cancel(true);
+ 
+-        failIf(expectedResult, 0);
++        if (result != expectedResult)
++        {
++            throw new RuntimeException();
++        }
+ 
+         return opsPerSecond;
+     }
+diff --git a/src/perftest/java/com/lmax/disruptor/queue/OneToThreeQueueThroughputTest.java b/src/perftest/java/com/lmax/disruptor/queue/OneToThreeQueueThroughputTest.java
+index 7c3668ee..91b2e2ad 100644
+--- a/src/perftest/java/com/lmax/disruptor/queue/OneToThreeQueueThroughputTest.java
++++ b/src/perftest/java/com/lmax/disruptor/queue/OneToThreeQueueThroughputTest.java
+@@ -17,17 +17,12 @@ package com.lmax.disruptor.queue;
+ 
+ import com.lmax.disruptor.AbstractPerfTestQueue;
+ import com.lmax.disruptor.support.Operation;
+-import com.lmax.disruptor.support.ValueMutationQueueProcessor;
+ import com.lmax.disruptor.util.DaemonThreadFactory;
++import ubq.jni.UbqLongQueue;
+ 
+-import java.util.concurrent.BlockingQueue;
+-import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.LinkedBlockingQueue;
+-
+-import static com.lmax.disruptor.support.PerfTestUtil.failIf;
+ 
+ /**
+  * <pre>
+@@ -92,21 +87,12 @@ public final class OneToThreeQueueThroughputTest extends AbstractPerfTestQueue
+ 
+     ///////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-    @SuppressWarnings("unchecked")
+-    private final BlockingQueue<Long>[] blockingQueues = new BlockingQueue[NUM_EVENT_PROCESSORS];
++    private final UbqLongQueue[] queues = new UbqLongQueue[NUM_EVENT_PROCESSORS];
+ 
+     {
+-        blockingQueues[0] = new LinkedBlockingQueue<>(BUFFER_SIZE);
+-        blockingQueues[1] = new LinkedBlockingQueue<>(BUFFER_SIZE);
+-        blockingQueues[2] = new LinkedBlockingQueue<>(BUFFER_SIZE);
+-    }
+-
+-    private final ValueMutationQueueProcessor[] queueProcessors = new ValueMutationQueueProcessor[NUM_EVENT_PROCESSORS];
+-
+-    {
+-        queueProcessors[0] = new ValueMutationQueueProcessor(blockingQueues[0], Operation.ADDITION, ITERATIONS - 1);
+-        queueProcessors[1] = new ValueMutationQueueProcessor(blockingQueues[1], Operation.SUBTRACTION, ITERATIONS - 1);
+-        queueProcessors[2] = new ValueMutationQueueProcessor(blockingQueues[2], Operation.AND, ITERATIONS - 1);
++        queues[0] = new UbqLongQueue();
++        queues[1] = new UbqLongQueue();
++        queues[2] = new UbqLongQueue();
+     }
+ 
+     ///////////////////////////////////////////////////////////////////////////////////////////////
+@@ -118,35 +104,26 @@ public final class OneToThreeQueueThroughputTest extends AbstractPerfTestQueue
+     }
+ 
+     @Override
+-    protected long runQueuePass() throws InterruptedException
++    protected long runQueuePass() throws Exception
+     {
+-        CountDownLatch latch = new CountDownLatch(NUM_EVENT_PROCESSORS);
+-        Future<?>[] futures = new Future[NUM_EVENT_PROCESSORS];
+-        for (int i = 0; i < NUM_EVENT_PROCESSORS; i++)
+-        {
+-            queueProcessors[i].reset(latch);
+-            futures[i] = executor.submit(queueProcessors[i]);
+-        }
++        Future<Long>[] futures = new Future[NUM_EVENT_PROCESSORS];
++        futures[0] = executor.submit(() -> queues[0].popAddExact(ITERATIONS));
++        futures[1] = executor.submit(() -> queues[1].popSubExact(ITERATIONS));
++        futures[2] = executor.submit(() -> queues[2].popAndExact(ITERATIONS));
+ 
+         long start = System.currentTimeMillis();
+ 
+-        for (long i = 0; i < ITERATIONS; i++)
++        UbqLongQueue.pushRangeToThreeExact(queues[0], queues[1], queues[2], 0, ITERATIONS);
++
++        for (int i = 0; i < NUM_EVENT_PROCESSORS; i++)
+         {
+-            final Long value = Long.valueOf(i);
+-            for (BlockingQueue<Long> queue : blockingQueues)
++            if (futures[i].get() != results[i])
+             {
+-                queue.put(value);
++                throw new RuntimeException();
+             }
+         }
+ 
+-        latch.await();
+         long opsPerSecond = (ITERATIONS * 1000L) / (System.currentTimeMillis() - start);
+-        for (int i = 0; i < NUM_EVENT_PROCESSORS; i++)
+-        {
+-            queueProcessors[i].halt();
+-            futures[i].cancel(true);
+-            failIf(queueProcessors[i].getValue(), -1);
+-        }
+ 
+         return opsPerSecond;
+     }
+diff --git a/src/perftest/java/com/lmax/disruptor/queue/ThreeToOneQueueThroughputTest.java b/src/perftest/java/com/lmax/disruptor/queue/ThreeToOneQueueThroughputTest.java
+index 10082a82..a49d8e3d 100644
+--- a/src/perftest/java/com/lmax/disruptor/queue/ThreeToOneQueueThroughputTest.java
++++ b/src/perftest/java/com/lmax/disruptor/queue/ThreeToOneQueueThroughputTest.java
+@@ -16,13 +16,10 @@
+ package com.lmax.disruptor.queue;
+ 
+ import com.lmax.disruptor.AbstractPerfTestQueue;
+-import com.lmax.disruptor.support.ValueAdditionQueueProcessor;
+-import com.lmax.disruptor.support.ValueQueuePublisher;
++import com.lmax.disruptor.support.PerfTestUtil;
+ import com.lmax.disruptor.util.DaemonThreadFactory;
++import ubq.jni.UbqLongQueue;
+ 
+-import java.util.concurrent.ArrayBlockingQueue;
+-import java.util.concurrent.BlockingQueue;
+-import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.CyclicBarrier;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+@@ -74,23 +71,15 @@ public final class ThreeToOneQueueThroughputTest extends AbstractPerfTestQueue
+     private static final int NUM_PUBLISHERS = 3;
+     private static final int BUFFER_SIZE = 1024 * 64;
+     private static final long ITERATIONS = 1000L * 1000L * 20L;
++    private static final long ITERATIONS_PER_PUBLISHER = ITERATIONS / NUM_PUBLISHERS;
++    private static final long PUBLISHED_ITERATIONS = ITERATIONS_PER_PUBLISHER * NUM_PUBLISHERS;
+     private final ExecutorService executor = Executors.newFixedThreadPool(NUM_PUBLISHERS + 1, DaemonThreadFactory.INSTANCE);
+     private final CyclicBarrier cyclicBarrier = new CyclicBarrier(NUM_PUBLISHERS + 1);
++    private final long expectedResult = PerfTestUtil.accumulatedAddition(ITERATIONS_PER_PUBLISHER) * NUM_PUBLISHERS;
+ 
+     ///////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-    private final BlockingQueue<Long> blockingQueue = new ArrayBlockingQueue<>(BUFFER_SIZE);
+-    private final ValueAdditionQueueProcessor queueProcessor =
+-        new ValueAdditionQueueProcessor(blockingQueue, ((ITERATIONS / NUM_PUBLISHERS) * NUM_PUBLISHERS) - 1L);
+-    private final ValueQueuePublisher[] valueQueuePublishers = new ValueQueuePublisher[NUM_PUBLISHERS];
+-
+-    {
+-        for (int i = 0; i < NUM_PUBLISHERS; i++)
+-        {
+-            valueQueuePublishers[i] =
+-                new ValueQueuePublisher(cyclicBarrier, blockingQueue, ITERATIONS / NUM_PUBLISHERS);
+-        }
+-    }
++    private final UbqLongQueue queue = new UbqLongQueue();
+ 
+     ///////////////////////////////////////////////////////////////////////////////////////////////
+ 
+@@ -103,15 +92,17 @@ public final class ThreeToOneQueueThroughputTest extends AbstractPerfTestQueue
+     @Override
+     protected long runQueuePass() throws Exception
+     {
+-        final CountDownLatch latch = new CountDownLatch(1);
+-        queueProcessor.reset(latch);
+-
+         Future<?>[] futures = new Future[NUM_PUBLISHERS];
+         for (int i = 0; i < NUM_PUBLISHERS; i++)
+         {
+-            futures[i] = executor.submit(valueQueuePublishers[i]);
++            futures[i] = executor.submit(() ->
++            {
++                cyclicBarrier.await();
++                queue.pushRangeExact(0, ITERATIONS_PER_PUBLISHER);
++                return null;
++            });
+         }
+-        Future<?> processorFuture = executor.submit(queueProcessor);
++        Future<Long> processorFuture = executor.submit(() -> queue.popAddExact(PUBLISHED_ITERATIONS));
+ 
+         long start = System.currentTimeMillis();
+         cyclicBarrier.await();
+@@ -121,11 +112,14 @@ public final class ThreeToOneQueueThroughputTest extends AbstractPerfTestQueue
+             futures[i].get();
+         }
+ 
+-        latch.await();
++        long result = processorFuture.get();
+ 
+         long opsPerSecond = (ITERATIONS * 1000L) / (System.currentTimeMillis() - start);
+-        queueProcessor.halt();
+-        processorFuture.cancel(true);
++
++        if (result != expectedResult)
++        {
++            throw new RuntimeException();
++        }
+ 
+         return opsPerSecond;
+     }

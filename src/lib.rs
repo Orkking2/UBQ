@@ -54,6 +54,8 @@ pub mod align;
 pub mod backoff;
 pub mod bench_harness;
 pub(crate) mod block;
+#[cfg(feature = "jni")]
+mod jni;
 pub(crate) mod queue;
 
 #[cfg(test)]

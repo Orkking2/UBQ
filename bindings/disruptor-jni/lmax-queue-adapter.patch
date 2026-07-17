@@ -1,0 +1,83 @@
+diff --git a/src/perftest/java/com/lmax/disruptor/queue/OneToOneQueueThroughputTest.java b/src/perftest/java/com/lmax/disruptor/queue/OneToOneQueueThroughputTest.java
+index 35f6a3d..33ee2fa 100644
+--- a/src/perftest/java/com/lmax/disruptor/queue/OneToOneQueueThroughputTest.java
++++ b/src/perftest/java/com/lmax/disruptor/queue/OneToOneQueueThroughputTest.java
+@@ -18,13 +18,13 @@ package com.lmax.disruptor.queue;
+ import com.lmax.disruptor.AbstractPerfTestQueue;
+ import com.lmax.disruptor.support.ValueAdditionQueueProcessor;
+ import com.lmax.disruptor.util.DaemonThreadFactory;
++import ubq.jni.UbqBlockingQueue;
+ 
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.LinkedBlockingQueue;
+ 
+ import static com.lmax.disruptor.support.PerfTestUtil.failIf;
+ 
+@@ -59,7 +59,7 @@ public final class OneToOneQueueThroughputTest extends AbstractPerfTestQueue
+ 
+     ///////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-    private final BlockingQueue<Long> blockingQueue = new LinkedBlockingQueue<>(BUFFER_SIZE);
++    private final BlockingQueue<Long> blockingQueue = new UbqBlockingQueue();
+     private final ValueAdditionQueueProcessor queueProcessor =
+         new ValueAdditionQueueProcessor(blockingQueue, ITERATIONS - 1);
+ 
+diff --git a/src/perftest/java/com/lmax/disruptor/queue/OneToThreeQueueThroughputTest.java b/src/perftest/java/com/lmax/disruptor/queue/OneToThreeQueueThroughputTest.java
+index 7c3668e..779752c 100644
+--- a/src/perftest/java/com/lmax/disruptor/queue/OneToThreeQueueThroughputTest.java
++++ b/src/perftest/java/com/lmax/disruptor/queue/OneToThreeQueueThroughputTest.java
+@@ -19,13 +19,13 @@ import com.lmax.disruptor.AbstractPerfTestQueue;
+ import com.lmax.disruptor.support.Operation;
+ import com.lmax.disruptor.support.ValueMutationQueueProcessor;
+ import com.lmax.disruptor.util.DaemonThreadFactory;
++import ubq.jni.UbqBlockingQueue;
+ 
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.LinkedBlockingQueue;
+ 
+ import static com.lmax.disruptor.support.PerfTestUtil.failIf;
+ 
+@@ -96,9 +96,9 @@ public final class OneToThreeQueueThroughputTest extends AbstractPerfTestQueue
+     private final BlockingQueue<Long>[] blockingQueues = new BlockingQueue[NUM_EVENT_PROCESSORS];
+ 
+     {
+-        blockingQueues[0] = new LinkedBlockingQueue<>(BUFFER_SIZE);
+-        blockingQueues[1] = new LinkedBlockingQueue<>(BUFFER_SIZE);
+-        blockingQueues[2] = new LinkedBlockingQueue<>(BUFFER_SIZE);
++        blockingQueues[0] = new UbqBlockingQueue();
++        blockingQueues[1] = new UbqBlockingQueue();
++        blockingQueues[2] = new UbqBlockingQueue();
+     }
+ 
+     private final ValueMutationQueueProcessor[] queueProcessors = new ValueMutationQueueProcessor[NUM_EVENT_PROCESSORS];
+diff --git a/src/perftest/java/com/lmax/disruptor/queue/ThreeToOneQueueThroughputTest.java b/src/perftest/java/com/lmax/disruptor/queue/ThreeToOneQueueThroughputTest.java
+index 10082a8..b125152 100644
+--- a/src/perftest/java/com/lmax/disruptor/queue/ThreeToOneQueueThroughputTest.java
++++ b/src/perftest/java/com/lmax/disruptor/queue/ThreeToOneQueueThroughputTest.java
+@@ -19,8 +19,8 @@ import com.lmax.disruptor.AbstractPerfTestQueue;
+ import com.lmax.disruptor.support.ValueAdditionQueueProcessor;
+ import com.lmax.disruptor.support.ValueQueuePublisher;
+ import com.lmax.disruptor.util.DaemonThreadFactory;
++import ubq.jni.UbqBlockingQueue;
+ 
+-import java.util.concurrent.ArrayBlockingQueue;
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.CyclicBarrier;
+@@ -79,7 +79,7 @@ public final class ThreeToOneQueueThroughputTest extends AbstractPerfTestQueue
+ 
+     ///////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-    private final BlockingQueue<Long> blockingQueue = new ArrayBlockingQueue<>(BUFFER_SIZE);
++    private final BlockingQueue<Long> blockingQueue = new UbqBlockingQueue();
+     private final ValueAdditionQueueProcessor queueProcessor =
+         new ValueAdditionQueueProcessor(blockingQueue, ((ITERATIONS / NUM_PUBLISHERS) * NUM_PUBLISHERS) - 1L);
+     private final ValueQueuePublisher[] valueQueuePublishers = new ValueQueuePublisher[NUM_PUBLISHERS];

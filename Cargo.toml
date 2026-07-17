@@ -12,6 +12,7 @@ categories = ["concurrency", "data-structures"]
 
 [lib]
 bench = false
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 concurrent-queue = "2"
@@ -29,6 +30,7 @@ wcq = { version = "0.1.0", optional = true }
 
 [features]
 default = []
+jni = []
 ubq_debug = []
 bench_small = []
 bench_medium = []

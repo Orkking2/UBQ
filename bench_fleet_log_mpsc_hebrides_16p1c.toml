@@ -1,0 +1,26 @@
+[defaults]
+runs_dir = "bench_results/runs"
+plot_out_dir = "bench_results/plots"
+remote_repo_dir = "~/UBQ"
+remote_runs_dir = "bench_results/runs"
+bench_mode = "matrix"
+
+queues = ["ubq", "segqueue", "concurrent-queue", "rbbq", "lfqueue"]
+modes = ["app_log_mpsc_file"]
+scenarios = ["16p1c"]
+items_per_producer = [100000]
+repeats = 3
+fastfifo_block_sizes = [64, 256, 1024, 4096]
+lfqueue_segment_sizes = [32, 256, 1024]
+ubq_labels = [
+  "balanced,0,255,crossbeam",
+  "balanced,8,255,crossbeam",
+  "balanced,64,255,crossbeam",
+  "balanced,8,511,crossbeam",
+  "balanced,8,2047,crossbeam",
+  "balanced,8,255,yield",
+]
+
+[machines.hebrides]
+host = "hebrides"
+machine_label = "hebrides"

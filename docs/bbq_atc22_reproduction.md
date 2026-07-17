@@ -72,8 +72,10 @@ The following BBQ paper figures are not reproduced directly by this harness:
 - `figure_self_blknum_{thpt,lat}_mpsc.pdf`: block-size sweeps can be approximated
   by running several `fastfifo_*` sizes and UBQ block labels, but there is not
   yet a dedicated block-size x-axis plot.
-- `figure_dpdk.pdf`, `figure_io_uring_*.pdf`, and `figure_disruptor_x86.pdf`:
-  application benchmarks are outside the microbenchmark harness.
+- `figure_dpdk.pdf` and `figure_disruptor_x86.pdf`: application benchmarks are
+  outside the microbenchmark harness.
+- `figure_io_uring_*.pdf`: covered by the dedicated three-thread SQ/CQ
+  replacement benchmark in [io_uring_queue_benchmarks.md](io_uring_queue_benchmarks.md).
 
 Example direct run:
 
