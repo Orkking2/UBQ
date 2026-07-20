@@ -380,7 +380,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         }
 
         let out = (slot.state.load(Ordering::Acquire) != SKIP)
-            .then_some(unsafe { slot.value.get().read().assume_init() });
+            .then(|| unsafe { slot.value.get().read().assume_init() });
 
         if unsafe { (*chead.block).consumed.fetch_add(1, Ordering::Relaxed) } + 1 == BLOCK_SIZE {
             unsafe { Block::reset(chead.block) };
