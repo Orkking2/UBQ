@@ -1,6 +1,6 @@
 [package]
 name = "ubq"
-version = "5.0.0"
+version = "5.0.1"
 edition = "2024"
 rust-version = "1.92"
 build = "build.rs"
