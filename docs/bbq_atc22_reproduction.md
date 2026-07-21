@@ -30,7 +30,7 @@ semantics, so UBQ does not have directly comparable operations.
 ## Plot coverage
 
 The plotting helpers generate both generic per-scenario plots and BBQ-style
-family scaling plots from the same v2 JSON files:
+family scaling plots from the same schema-v3 JSON files:
 
 - SPSC throughput/latency/fairness-style bars:
   `plots/<machine>/<mode>/1p1c_<metric>.png`
@@ -113,6 +113,7 @@ cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --repeats 3
 ```
 
-For a large UBQ variant search, keep using `bench_frontier` or
-`full_bench_fleet`. For fixed paper-style comparisons, use `bench_matrix` with
-explicit `--ubq-label` values for each UBQ variant you want in the paper plots.
+For reproducible UBQ variation coverage, use `bench_grid` or
+`full_bench_fleet`; both default to the sparse grid, with `-d` selecting the
+dense grid. For fixed paper-style comparisons, use `bench_matrix` with explicit
+`--ubq-label` values for each UBQ variant you want in the paper plots.

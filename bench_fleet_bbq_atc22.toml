@@ -9,7 +9,7 @@ remote_runs_dir = "bench_results/runs"
 #
 # This suite expands to SPSC plus MPSC/SPMC scaling through the x86-88T paper
 # limit: 1p1c, 1pNc, and Np1c for N=1..87. Use
-# "bbq-atc22-oversub-x86-12t" with --frontier-arg=--parallelism --frontier-arg=60
+# "bbq-atc22-oversub-x86-12t" with --grid-arg=--parallelism --grid-arg=60
 # for the x86-12T oversubscription shape.
 scenarios = ["bbq-atc22-x86-88t"]
 
@@ -18,7 +18,6 @@ modes = ["throughput", "complex_throughput", "data_latency", "fairness"]
 items_per_producer = [1000000]
 repeats = 3
 
-ubq_labels = ["balanced,8,127,crossbeam"]
 fastfifo_block_sizes = [64, 256, 1024, 4096]
 lfqueue_segment_sizes = [32, 256, 1024]
 wcq_capacities = [4096, 65536, 1048576]

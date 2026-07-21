@@ -14,6 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
+use ubq::bench_harness::UbqGrid;
 
 const REPO_SYNC_INCLUDE_PATTERNS: &[&str] = &[
     "/.gitmodules",
@@ -26,8 +27,15 @@ const REPO_SYNC_INCLUDE_PATTERNS: &[&str] = &[
     "/benches/**",
 ];
 
-const FORBIDDEN_FRONTIER_ARGS: &[&str] =
-    &["--machine-label", "--runs-dir", "--repeats", "--dry-run"];
+const FORBIDDEN_GRID_ARGS: &[&str] = &[
+    "--machine-label",
+    "--runs-dir",
+    "--repeats",
+    "--dense",
+    "-d",
+    "--rerun",
+    "--dry-run",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "full_bench_fleet")]
@@ -54,8 +62,16 @@ struct Args {
     #[arg(long)]
     dry_run: bool,
 
-    #[arg(long = "frontier-arg", alias = "complete-arg")]
-    frontier_args: Vec<String>,
+    /// Select the dense UBQ grid instead of the sparse default.
+    #[arg(short = 'd', long)]
+    dense: bool,
+
+    /// Ignore compatible existing benchmark data.
+    #[arg(long)]
+    rerun: bool,
+
+    #[arg(long = "grid-arg", alias = "complete-arg")]
+    grid_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -79,7 +95,8 @@ struct FleetDefaults {
     fastfifo_block_sizes: Option<Vec<usize>>,
     lfqueue_segment_sizes: Option<Vec<usize>>,
     wcq_capacities: Option<Vec<usize>>,
-    bench_mode: Option<String>,
+    bench_mode: Option<BenchMode>,
+    ubq_grid: Option<UbqGrid>,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
@@ -117,13 +134,16 @@ struct FleetRuntime {
     wcq_capacities: Vec<usize>,
     sync_repo: bool,
     dry_run: bool,
-    frontier_args: Vec<String>,
+    grid_args: Vec<String>,
     bench_mode: BenchMode,
+    ubq_grid: UbqGrid,
+    rerun: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum BenchMode {
-    Frontier,
+    Grid,
     Matrix,
 }
 
@@ -549,32 +569,32 @@ fn run_streaming_cmd(
     Ok(status.code().unwrap_or(1))
 }
 
-fn make_frontier_base_args(
+fn make_bench_base_args(
     runtime: &FleetRuntime,
     machine_label: &str,
     runs_dir: &str,
 ) -> Vec<String> {
-    let mut frontier_args = vec![
+    let mut bench_args = vec![
         "--machine-label".to_string(),
         machine_label.to_string(),
         "--runs-dir".to_string(),
         runs_dir.to_string(),
     ];
     if !runtime.scenarios.is_empty() {
-        frontier_args.push("--scenarios".to_string());
-        frontier_args.push(runtime.scenarios.join(","));
+        bench_args.push("--scenarios".to_string());
+        bench_args.push(runtime.scenarios.join(","));
     }
     if !runtime.queues.is_empty() {
-        frontier_args.push("--queues".to_string());
-        frontier_args.push(runtime.queues.join(","));
+        bench_args.push("--queues".to_string());
+        bench_args.push(runtime.queues.join(","));
     }
     if !runtime.modes.is_empty() {
-        frontier_args.push("--modes".to_string());
-        frontier_args.push(runtime.modes.join(","));
+        bench_args.push("--modes".to_string());
+        bench_args.push(runtime.modes.join(","));
     }
     if !runtime.items_per_producer.is_empty() {
-        frontier_args.push("--items-per-producer".to_string());
-        frontier_args.push(
+        bench_args.push("--items-per-producer".to_string());
+        bench_args.push(
             runtime
                 .items_per_producer
                 .iter()
@@ -583,19 +603,27 @@ fn make_frontier_base_args(
                 .join(","),
         );
     }
-    frontier_args.push("--repeats".to_string());
-    frontier_args.push(runtime.repeats.to_string());
+    bench_args.push("--repeats".to_string());
+    bench_args.push(runtime.repeats.to_string());
     let label_flag = match runtime.bench_mode {
-        BenchMode::Frontier => "--seed-label",
-        BenchMode::Matrix => "--ubq-label",
+        BenchMode::Grid => None,
+        BenchMode::Matrix => Some("--ubq-label"),
     };
-    for label in &runtime.ubq_labels {
-        frontier_args.push(label_flag.to_string());
-        frontier_args.push(label.clone());
+    if let Some(label_flag) = label_flag {
+        for label in &runtime.ubq_labels {
+            bench_args.push(label_flag.to_string());
+            bench_args.push(label.clone());
+        }
+    }
+    if runtime.bench_mode == BenchMode::Grid && runtime.ubq_grid == UbqGrid::Dense {
+        bench_args.push("--dense".to_string());
+    }
+    if runtime.rerun && runtime.bench_mode == BenchMode::Grid {
+        bench_args.push("--rerun".to_string());
     }
     if !runtime.fastfifo_block_sizes.is_empty() {
-        frontier_args.push("--rbbq-block-sizes".to_string());
-        frontier_args.push(
+        bench_args.push("--rbbq-block-sizes".to_string());
+        bench_args.push(
             runtime
                 .fastfifo_block_sizes
                 .iter()
@@ -605,8 +633,8 @@ fn make_frontier_base_args(
         );
     }
     if !runtime.lfqueue_segment_sizes.is_empty() {
-        frontier_args.push("--lfqueue-segment-sizes".to_string());
-        frontier_args.push(
+        bench_args.push("--lfqueue-segment-sizes".to_string());
+        bench_args.push(
             runtime
                 .lfqueue_segment_sizes
                 .iter()
@@ -616,8 +644,8 @@ fn make_frontier_base_args(
         );
     }
     if !runtime.wcq_capacities.is_empty() {
-        frontier_args.push("--wcq-capacities".to_string());
-        frontier_args.push(
+        bench_args.push("--wcq-capacities".to_string());
+        bench_args.push(
             runtime
                 .wcq_capacities
                 .iter()
@@ -626,11 +654,11 @@ fn make_frontier_base_args(
                 .join(","),
         );
     }
-    frontier_args.extend(runtime.frontier_args.clone());
+    bench_args.extend(runtime.grid_args.clone());
     if runtime.dry_run {
-        frontier_args.push("--dry-run".to_string());
+        bench_args.push("--dry-run".to_string());
     }
-    frontier_args
+    bench_args
 }
 
 fn queue_list_includes_fastfifo(queues: &[String]) -> bool {
@@ -678,7 +706,7 @@ fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -
     let runs_dir = runtime.runs_dir.display().to_string();
     let features = cargo_feature_arg(runtime);
     let bin = match runtime.bench_mode {
-        BenchMode::Frontier => "bench_frontier",
+        BenchMode::Grid => "bench_grid",
         BenchMode::Matrix => "bench_matrix",
     };
     let mut cmd = vec![
@@ -692,7 +720,7 @@ fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -
         bin.to_string(),
         "--".to_string(),
     ];
-    cmd.extend(make_frontier_base_args(
+    cmd.extend(make_bench_base_args(
         runtime,
         &machine.machine_label,
         &runs_dir,
@@ -700,11 +728,11 @@ fn build_local_complete_cmd(runtime: &FleetRuntime, machine: &ResolvedMachine) -
     cmd
 }
 
-/// Build the shell payload (no SSH wrapper) for running bench_frontier/bench_matrix on a remote machine.
+/// Build the shell payload (no SSH wrapper) for running bench_grid/bench_matrix on a remote machine.
 fn build_remote_bench_payload(runtime: &FleetRuntime, machine: &ResolvedMachine) -> String {
     let features = cargo_feature_arg(runtime);
     let bin = match runtime.bench_mode {
-        BenchMode::Frontier => "bench_frontier",
+        BenchMode::Grid => "bench_grid",
         BenchMode::Matrix => "bench_matrix",
     };
     let mut inner = vec![
@@ -718,7 +746,7 @@ fn build_remote_bench_payload(runtime: &FleetRuntime, machine: &ResolvedMachine)
         bin.to_string(),
         "--".to_string(),
     ];
-    inner.extend(make_frontier_base_args(
+    inner.extend(make_bench_base_args(
         runtime,
         &machine.machine_label,
         &machine.remote_runs_dir,
@@ -1119,7 +1147,7 @@ fn run_machine(runtime: Arc<FleetRuntime>, machine: ResolvedMachine) -> MachineR
     };
 
     if result.ok {
-        println!("  machine frontier-complete: {}", result.machine_name);
+        println!("  machine benchmark-complete: {}", result.machine_name);
     }
 
     result
@@ -1149,7 +1177,7 @@ fn render_plots(runtime: &FleetRuntime, no_clean: bool) -> Result<(), String> {
 }
 
 fn run(args: Args) -> Result<i32, String> {
-    validate_forwarded_args(&args.frontier_args, FORBIDDEN_FRONTIER_ARGS)?;
+    validate_forwarded_args(&args.grid_args, FORBIDDEN_GRID_ARGS)?;
 
     let machines = normalize_machine_list(&args.machines.join(","));
     if machines.is_empty() {
@@ -1191,9 +1219,11 @@ fn run(args: Args) -> Result<i32, String> {
         .repeats
         .unwrap_or_else(|| defaults.repeats.unwrap_or(1));
     let ubq_labels = defaults.ubq_labels.clone().unwrap_or_default();
-    let bench_mode = match defaults.bench_mode.as_deref().unwrap_or("frontier") {
-        "matrix" => BenchMode::Matrix,
-        _ => BenchMode::Frontier,
+    let bench_mode = defaults.bench_mode.unwrap_or(BenchMode::Grid);
+    let ubq_grid = if args.dense {
+        UbqGrid::Dense
+    } else {
+        defaults.ubq_grid.unwrap_or(UbqGrid::Sparse)
     };
     let fastfifo_block_sizes = defaults
         .fastfifo_block_sizes
@@ -1226,8 +1256,10 @@ fn run(args: Args) -> Result<i32, String> {
         wcq_capacities,
         sync_repo: !args.no_sync_repo,
         dry_run: args.dry_run,
-        frontier_args: args.frontier_args.clone(),
+        grid_args: args.grid_args.clone(),
         bench_mode,
+        ubq_grid,
+        rerun: args.rerun,
     });
 
     let mut resolved = Vec::new();
@@ -1252,16 +1284,24 @@ fn run(args: Args) -> Result<i32, String> {
     println!(
         "Mode: {}",
         match runtime.bench_mode {
-            BenchMode::Frontier => "frontier search",
+            BenchMode::Grid => "UBQ configuration grid",
             BenchMode::Matrix => "direct ubq matrix",
         }
     );
-    println!("Repeats: {}", runtime.repeats);
-    if !runtime.frontier_args.is_empty() {
+    if runtime.bench_mode == BenchMode::Grid {
+        println!("UBQ grid: {}", runtime.ubq_grid.name());
         println!(
-            "Forwarded frontier args: {}",
-            runtime.frontier_args.join(" ")
+            "Existing data: {}",
+            if runtime.rerun {
+                "ignored (--rerun)"
+            } else {
+                "reused"
+            }
         );
+    }
+    println!("Repeats: {}", runtime.repeats);
+    if !runtime.grid_args.is_empty() {
+        println!("Forwarded benchmark args: {}", runtime.grid_args.join(" "));
     }
 
     let mut joins = Vec::new();
@@ -1373,8 +1413,10 @@ mod tests {
             wcq_capacities: vec![4096, 65536, 1048576],
             sync_repo: true,
             dry_run: true,
-            frontier_args: vec!["--parallelism=16".to_string()],
-            bench_mode: BenchMode::Frontier,
+            grid_args: vec!["--parallelism=16".to_string()],
+            bench_mode: BenchMode::Grid,
+            ubq_grid: UbqGrid::Sparse,
+            rerun: false,
         }
     }
 
@@ -1409,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    fn local_frontier_command_contains_expected_args() {
+    fn local_grid_command_contains_expected_args() {
         let runtime = runtime();
         let machine = machine_local();
         let cmd = build_local_complete_cmd(&runtime, &machine);
@@ -1421,16 +1463,45 @@ mod tests {
             "--features".to_string(),
             "bench_registry".to_string(),
             "--bin".to_string(),
-            "bench_frontier".to_string(),
+            "bench_grid".to_string(),
             "--".to_string(),
         ]));
         assert!(cmd.contains(&"--machine-label".to_string()));
         assert!(cmd.contains(&"local".to_string()));
-        assert!(cmd.contains(&"--seed-label".to_string()));
+        assert!(!cmd.contains(&"--dense".to_string()));
     }
 
     #[test]
-    fn local_frontier_command_enables_rbbq_feature_when_selected() {
+    fn local_grid_command_forwards_dense_and_rerun_from_typed_runtime() {
+        let mut runtime = runtime();
+        runtime.ubq_grid = UbqGrid::Dense;
+        runtime.rerun = true;
+        let cmd = build_local_complete_cmd(&runtime, &machine_local());
+
+        assert!(cmd.contains(&"--dense".to_string()));
+        assert!(cmd.contains(&"--rerun".to_string()));
+    }
+
+    #[test]
+    fn fleet_grid_configuration_deserializes_to_enum_variants() {
+        let config: FleetConfig = toml::from_str(
+            r#"
+                [defaults]
+                bench_mode = "grid"
+                ubq_grid = "dense"
+
+                [machines.local]
+                local = true
+            "#,
+        )
+        .expect("fleet config");
+
+        assert_eq!(config.defaults.bench_mode, Some(BenchMode::Grid));
+        assert_eq!(config.defaults.ubq_grid, Some(UbqGrid::Dense));
+    }
+
+    #[test]
+    fn local_grid_command_enables_rbbq_feature_when_selected() {
         let mut runtime = runtime();
         runtime.queues.push("rbbq".to_string());
         let machine = machine_local();
@@ -1441,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn local_frontier_command_enables_publication_queue_features_when_selected() {
+    fn local_grid_command_enables_publication_queue_features_when_selected() {
         let mut runtime = runtime();
         runtime.queues.push("lfqueue".to_string());
         runtime.queues.push("wcq".to_string());
@@ -1455,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_frontier_command_uses_ssh_and_cargo() {
+    fn remote_grid_command_uses_ssh_and_cargo() {
         let runtime = runtime();
         let machine = machine_remote();
         let cmd = build_remote_complete_cmd(&runtime, &machine);
@@ -1463,7 +1534,7 @@ mod tests {
         assert_eq!(cmd[1], "lab");
         assert!(cmd[2].contains("cargo"));
         assert!(cmd[2].contains("--quiet"));
-        assert!(cmd[2].contains("bench_frontier"));
+        assert!(cmd[2].contains("bench_grid"));
         assert!(cmd[2].contains("cd \"$HOME/UBQ\""));
     }
 
@@ -1612,12 +1683,12 @@ edition = "2024"
     #[test]
     fn forwarded_arg_validation_blocks_protected_keys() {
         let bad = vec!["--machine-label=foo".to_string()];
-        assert!(validate_forwarded_args(&bad, FORBIDDEN_FRONTIER_ARGS).is_err());
+        assert!(validate_forwarded_args(&bad, FORBIDDEN_GRID_ARGS).is_err());
         let ok = vec![
             "--parallelism=16".to_string(),
-            "--seed-label=balanced,8,127,crossbeam,cas".to_string(),
+            "--items-per-producer=1000".to_string(),
         ];
-        assert!(validate_forwarded_args(&ok, FORBIDDEN_FRONTIER_ARGS).is_ok());
+        assert!(validate_forwarded_args(&ok, FORBIDDEN_GRID_ARGS).is_ok());
     }
 
     #[test]
@@ -1632,7 +1703,7 @@ edition = "2024"
     #[test]
     fn forwarded_arg_validation_blocks_repeats() {
         let bad = vec!["--repeats=4".to_string()];
-        assert!(validate_forwarded_args(&bad, FORBIDDEN_FRONTIER_ARGS).is_err());
+        assert!(validate_forwarded_args(&bad, FORBIDDEN_GRID_ARGS).is_err());
     }
 
     #[test]

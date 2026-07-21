@@ -41,6 +41,7 @@ THROUGHPUT_SPEEDUP_BASELINES = (
     ("bbq", "best BBQ", lambda label: queue_metadata(label)["family"] == "RBBQ/BBQ"),
     ("lscq", "best LSCQ", lambda label: queue_metadata(label)["family"] == "LSCQ"),
 )
+UBQ_BATCHED_PREFIX = "ubq_batched_"
 PUBLICATION_SERIES = (
     ("segqueue", lambda label: label == "segqueue"),
     ("concurrent-queue", lambda label: label == "concurrent-queue"),
@@ -48,6 +49,7 @@ PUBLICATION_SERIES = (
     ("LSCQ", lambda label: queue_metadata(label)["family"] == "LSCQ"),
     ("wCQ", lambda label: queue_metadata(label)["family"] == "wCQ"),
     ("UBQ", lambda label: queue_metadata(label)["family"] == "UBQ"),
+    ("UBQ batched", lambda label: queue_metadata(label)["family"] == "UBQ batched"),
 )
 FAMILY_DISPLAY_LABELS = {
     "RBBQ/BBQ": "BBQ",
@@ -340,8 +342,12 @@ def metric_lower_is_better(mode: str):
 
 
 def label_sort_key(label: str):
+    batched = parse_batched_ubq_label(label)
+    if batched is not None:
+        batch_size, params = batched
+        return (0, 1, batch_size, params)
     if label.startswith("ubq_"):
-        return (0, bench_label_sort_key(label[len("ubq_") :]))
+        return (0, 0, bench_label_sort_key(label[len("ubq_") :]))
     if label.startswith("ubq:"):
         return (0, bench_label_sort_key(label[len("ubq:") :]))
     if label.startswith("fastfifo_"):
@@ -377,6 +383,10 @@ def baseline_queue_priority(label: str):
 
 
 def display_label(label: str):
+    batched = parse_batched_ubq_label(label)
+    if batched is not None:
+        batch_size, params = batched
+        return f"UBQ batched {batch_size} ({format_ubq_label_parts(*params[:4])})"
     if label.startswith("fastfifo_"):
         return f"BBQ {label[len('fastfifo_'):]}"
     if label.startswith("lfqueue_"):
@@ -388,12 +398,22 @@ def display_label(label: str):
 
 def publication_display_label(label: str):
     family = queue_metadata(label)["family"]
-    if family in ("UBQ", "RBBQ/BBQ", "LSCQ", "wCQ"):
+    if family in ("UBQ", "UBQ batched", "RBBQ/BBQ", "LSCQ", "wCQ"):
         return FAMILY_DISPLAY_LABELS.get(family, family)
     return display_label(label)
 
 
 def queue_metadata(label: str):
+    batched = parse_batched_ubq_label(label)
+    if batched is not None:
+        batch_size, params = batched
+        return {
+            "family": "UBQ batched",
+            "variant": f"batch={batch_size}; {format_ubq_label_parts(*params[:4])}",
+            "publication": "this repository",
+            "capacity_model": "unbounded",
+            "ordering": "strict FIFO",
+        }
     if label.startswith("ubq_"):
         return {
             "family": "UBQ",
@@ -485,6 +505,14 @@ def best_ubq_throughput_entry(entries, scenario):
     return best_throughput_entry(entries, is_valid_ubq)
 
 
+def best_batched_ubq_throughput_entry(entries, scenario):
+    def is_valid_batched_ubq(label):
+        parsed = parse_batched_ubq_label(label)
+        return parsed is not None and ubq_params_valid_for_scenario(parsed[1], scenario)
+
+    return best_throughput_entry(entries, is_valid_batched_ubq)
+
+
 def labels_by_ops_desc(entries):
     return labels_by_metric(entries, "throughput")
 
@@ -504,6 +532,24 @@ def labels_by_metric(entries, mode: str):
 
 def parse_ubq_variant(label: str):
     return parse_ubq_queue_label(label, require_valid=False)
+
+
+def format_batched_ubq_label(ubq_label: str, batch_size: int) -> str:
+    return f"{UBQ_BATCHED_PREFIX}{batch_size}_{ubq_label}"
+
+
+def parse_batched_ubq_label(label: str):
+    text = str(label)
+    if not text.startswith(UBQ_BATCHED_PREFIX):
+        return None
+    remainder = text[len(UBQ_BATCHED_PREFIX) :]
+    batch_text, separator, ubq_label = remainder.partition("_")
+    if not separator or not batch_text.isdigit():
+        return None
+    params = parse_ubq_queue_label(f"ubq_{ubq_label}", require_valid=False)
+    if params is None:
+        return None
+    return int(batch_text), params
 
 
 def ubq_params_valid_for_scenario(params, scenario=None) -> bool:
@@ -614,10 +660,37 @@ def empty_immediate_variant_report(selected_labels):
     }
 
 
-def primary_plot_report(entries, mode: str, scenario=None):
+def grid_winner_variant_report(entries, mode: str, scenario=None, coverage=None):
+    non_ubq_labels = [
+        label
+        for label in labels_by_metric(entries, mode)
+        if parse_ubq_variant(label) is None and parse_batched_ubq_label(label) is None
+    ]
+    scalar = best_ubq_throughput_entry(entries, scenario)
+    batched = best_batched_ubq_throughput_entry(entries, scenario)
+    selected_labels = list(non_ubq_labels)
+    for winner in (scalar, batched):
+        if winner is not None and winner[0] not in selected_labels:
+            selected_labels.append(winner[0])
+    return {
+        "selected_labels": selected_labels,
+        "winner": scalar[0] if scalar else None,
+        "batched_winner": batched[0] if batched else None,
+        "required_labels": [],
+        "present_required_labels": [],
+        "missing_required_labels": [],
+        "zero_pool_labels": [],
+        "grid_coverage": grid_coverage_report(coverage, mode),
+    }
+
+
+def primary_plot_report(entries, mode: str, scenario=None, coverage=None):
     if mode in ("throughput", "complex_throughput"):
-        return immediate_winner_variant_report(entries, scenario)
-    return empty_immediate_variant_report(labels_by_metric(entries, mode))
+        return grid_winner_variant_report(entries, mode, scenario, coverage)
+    report = empty_immediate_variant_report(labels_by_metric(entries, mode))
+    report["batched_winner"] = None
+    report["grid_coverage"] = grid_coverage_report(coverage, mode)
+    return report
 
 
 def immediate_domain_neighbors(value, ordered_values):
@@ -744,7 +817,7 @@ def load_records(path: Path):
         print(f"warning: could not parse {path}: {exc}", file=sys.stderr)
         return
 
-    if data.get("schema_version") not in (2, "2"):
+    if data.get("schema_version") not in (2, "2", 3, "3"):
         return
 
     meta = data.get("meta", {})
@@ -755,13 +828,22 @@ def load_records(path: Path):
     for rec in data.get("results", []):
         if rec.get("skipped_reason"):
             continue
+        if rec.get("status", "completed") != "completed":
+            continue
 
         queue = rec.get("queue")
         scenario = scenario_meta
         mode = str(rec.get("mode", "throughput"))
 
         if queue == "ubq":
-            queue_label = f"ubq_{ubq_label}"
+            batch_size = rec.get("batch_size")
+            if batch_size is None:
+                queue_label = f"ubq_{ubq_label}"
+            else:
+                try:
+                    queue_label = format_batched_ubq_label(ubq_label, int(batch_size))
+                except (TypeError, ValueError):
+                    continue
         else:
             queue_label = str(queue)
 
@@ -808,6 +890,136 @@ def load_records(path: Path):
                 continue
 
             yield machine_label, output_mode, scenario, queue_label, metric_value
+
+
+def load_grid_coverage(path: Path):
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+
+    if data.get("schema_version") not in (3, "3"):
+        return
+    meta = data.get("meta", {})
+    grid = str(meta.get("ubq_grid", "")).strip().lower()
+    if grid not in ("sparse", "dense"):
+        return
+    try:
+        expected_configs = int(meta["expected_ubq_configurations"])
+        planned_repeats = int(meta["planned_repeats"])
+        batch_sizes = tuple(sorted({int(value) for value in meta.get("ubq_batch_sizes", [])}))
+        planned_items = tuple(
+            sorted({int(value) for value in meta.get("planned_items_per_producer", [])})
+        )
+        repeat_index = int(meta["repeat_index"])
+    except (KeyError, TypeError, ValueError):
+        return
+    if expected_configs <= 0 or planned_repeats <= 0 or not planned_items:
+        return
+
+    machine = str(meta.get("machine_label", "local")).strip() or "local"
+    scenario = normalize_scenario(meta.get("scenario", ""))
+    ubq_label = str(meta.get("ubq_label", ""))
+    specification = {
+        "grid": grid,
+        "expected_configurations": expected_configs,
+        "planned_repeats": planned_repeats,
+        "batch_sizes": batch_sizes,
+        "planned_items": planned_items,
+    }
+    for record in data.get("results", []):
+        if record.get("queue") != "ubq":
+            continue
+        if record.get("status", "completed") != "completed":
+            continue
+        mode = str(record.get("mode", "throughput"))
+        try:
+            items = int(record["items_per_producer"])
+            batch_size = record.get("batch_size")
+            batch_size = None if batch_size is None else int(batch_size)
+        except (KeyError, TypeError, ValueError):
+            continue
+        sample = (ubq_label, batch_size, repeat_index, items)
+        yield machine, mode, scenario, specification, sample
+
+
+def merge_grid_coverage(target, machine, mode, scenario, specification, sample):
+    key = (machine, mode, scenario)
+    current = target.get(key)
+    rank = {"sparse": 0, "dense": 1}
+    if current is None:
+        current = dict(specification)
+        current["present"] = set()
+        target[key] = current
+    elif rank[specification["grid"]] > rank[current["grid"]]:
+        present = current["present"]
+        current = dict(specification)
+        current["present"] = present
+        target[key] = current
+    elif rank[specification["grid"]] == rank[current["grid"]]:
+        current["expected_configurations"] = max(
+            current["expected_configurations"], specification["expected_configurations"]
+        )
+        current["planned_repeats"] = max(
+            current["planned_repeats"], specification["planned_repeats"]
+        )
+        current["batch_sizes"] = tuple(
+            sorted(set(current["batch_sizes"]) | set(specification["batch_sizes"]))
+        )
+        current["planned_items"] = tuple(
+            sorted(set(current["planned_items"]) | set(specification["planned_items"]))
+        )
+    current["present"].add(sample)
+
+
+def grid_coverage_report(coverage, mode: str):
+    if not coverage:
+        return {
+            "known": False,
+            "grid": None,
+            "present": 0,
+            "expected": 0,
+            "percent": 0.0,
+            "complete": False,
+        }
+    variants = 1 + len(coverage["batch_sizes"]) if mode == "throughput" else 1
+    expected = (
+        coverage["expected_configurations"]
+        * coverage["planned_repeats"]
+        * len(coverage["planned_items"])
+        * variants
+    )
+    present = len(coverage["present"])
+    return {
+        "known": True,
+        "grid": coverage["grid"],
+        "present": present,
+        "expected": expected,
+        "percent": completion_percent_for_plot(present, expected),
+        "complete": expected > 0 and present >= expected,
+    }
+
+
+def completion_percent_for_plot(completed: int, total: int) -> float:
+    return 100.0 if total == 0 else 100.0 * completed / total
+
+
+def aggregate_grid_coverage(coverages, mode: str):
+    reports = [grid_coverage_report(coverage, mode) for coverage in coverages]
+    if not reports or any(not report["known"] for report in reports):
+        return grid_coverage_report(None, mode)
+    present = sum(report["present"] for report in reports)
+    expected = sum(report["expected"] for report in reports)
+    grid = "dense" if any(report["grid"] == "dense" for report in reports) else "sparse"
+    return {
+        "known": True,
+        "grid": grid,
+        "present": present,
+        "expected": expected,
+        "percent": completion_percent_for_plot(present, expected),
+        "complete": expected > 0 and all(report["complete"] for report in reports),
+    }
 
 
 def csv_stats_from_row(row, mode: str):
@@ -959,6 +1171,36 @@ def write_immediate_variant_csv(out_path: Path, entries, winner, required_labels
     return out_path
 
 
+def write_grid_coverage_csv(out_path: Path, report):
+    coverage = report["grid_coverage"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "grid",
+                "status",
+                "present_samples",
+                "expected_samples",
+                "completion_percent",
+                "best_scalar_ubq",
+                "best_batched_ubq",
+            ]
+        )
+        writer.writerow(
+            [
+                coverage["grid"] or "unknown",
+                "complete" if coverage["complete"] else "incomplete",
+                coverage["present"],
+                coverage["expected"],
+                f"{coverage['percent']:.6f}",
+                report.get("winner") or "",
+                report.get("batched_winner") or "",
+            ]
+        )
+    return out_path
+
+
 def error_values(entries, labels, error_bars: str):
     if error_bars == "none":
         return None
@@ -994,15 +1236,20 @@ def average_ops_per_sec(values):
 def per_scenario_winning_ubq_labels(entries_by_scenario, mode: str):
     winners = set()
     for scenario, entries in entries_by_scenario.items():
-        ubq_entries = {}
+        scalar_entries = {}
+        batched_entries = {}
         for label, stats in entries.items():
             parsed = parse_ubq_variant(label)
-            if parsed is None or not ubq_params_valid_for_scenario(parsed, scenario):
+            if parsed is not None and ubq_params_valid_for_scenario(parsed, scenario):
+                scalar_entries[label] = stats
                 continue
-            ubq_entries[label] = stats
-        if not ubq_entries:
-            continue
-        winners.add(labels_by_metric(ubq_entries, mode)[0])
+            batched = parse_batched_ubq_label(label)
+            if batched is not None and ubq_params_valid_for_scenario(batched[1], scenario):
+                batched_entries[label] = stats
+        if scalar_entries:
+            winners.add(labels_by_metric(scalar_entries, mode)[0])
+        if batched_entries:
+            winners.add(labels_by_metric(batched_entries, mode)[0])
     return winners
 
 
@@ -1102,30 +1349,34 @@ def throughput_speedup_rows(entries_by_scenario):
             continue
         producers, consumers = threads
         entries = entries_by_scenario[scenario]
-        ubq = best_ubq_throughput_entry(entries, scenario)
-        if ubq is None:
-            continue
-        ubq_label, ubq_value = ubq
-
-        for baseline_key, baseline_title, predicate in THROUGHPUT_SPEEDUP_BASELINES:
-            baseline = best_throughput_entry(entries, predicate)
-            if baseline is None:
+        ubq_variants = (
+            ("scalar", "best scalar UBQ", best_ubq_throughput_entry(entries, scenario)),
+            ("batched", "best batched UBQ", best_batched_ubq_throughput_entry(entries, scenario)),
+        )
+        for ubq_kind, ubq_title, ubq in ubq_variants:
+            if ubq is None:
                 continue
-            baseline_label, baseline_value = baseline
-            rows.append(
-                {
-                    "scenario": scenario,
-                    "producers": producers,
-                    "consumers": consumers,
-                    "comparison": baseline_key,
-                    "comparison_label": baseline_title,
-                    "ubq_queue": ubq_label,
-                    "ubq_ops_per_sec": ubq_value,
-                    "baseline_queue": baseline_label,
-                    "baseline_ops_per_sec": baseline_value,
-                    "speedup": ubq_value / baseline_value,
-                }
-            )
+            ubq_label, ubq_value = ubq
+            for baseline_key, baseline_title, predicate in THROUGHPUT_SPEEDUP_BASELINES:
+                baseline = best_throughput_entry(entries, predicate)
+                if baseline is None:
+                    continue
+                baseline_label, baseline_value = baseline
+                rows.append(
+                    {
+                        "scenario": scenario,
+                        "producers": producers,
+                        "consumers": consumers,
+                        "ubq_kind": ubq_kind,
+                        "comparison": f"{ubq_kind}_{baseline_key}",
+                        "comparison_label": f"{ubq_title} vs {baseline_title}",
+                        "ubq_queue": ubq_label,
+                        "ubq_ops_per_sec": ubq_value,
+                        "baseline_queue": baseline_label,
+                        "baseline_ops_per_sec": baseline_value,
+                        "speedup": ubq_value / baseline_value,
+                    }
+                )
     return rows
 
 
@@ -1140,6 +1391,7 @@ def write_throughput_speedup_csv(out_path: Path, rows):
                 "consumers",
                 "comparison",
                 "comparison_label",
+                "ubq_kind",
                 "ubq_queue",
                 "ubq_ops_per_sec",
                 "baseline_queue",
@@ -1155,6 +1407,7 @@ def write_throughput_speedup_csv(out_path: Path, rows):
                     row["consumers"],
                     row["comparison"],
                     row["comparison_label"],
+                    row["ubq_kind"],
                     row["ubq_queue"],
                     f"{row['ubq_ops_per_sec']:.6f}",
                     row["baseline_queue"],
@@ -1358,7 +1611,60 @@ def annotate_immediate_variant_status(ax, coverage_csv_name: str, report):
     )
 
 
-def plot_throughput_speedup_grid(plt, out_path: Path, machine: str, entries_by_scenario):
+def annotate_grid_coverage_status(ax, report):
+    coverage = report["grid_coverage"]
+    if coverage["known"] and coverage["complete"]:
+        note = (
+            f"{coverage['grid'].upper()} GRID EXHAUSTED\n"
+            f"{coverage['present']}/{coverage['expected']} planned samples"
+        )
+        facecolor = "#e8f5e9"
+        edgecolor = "#2e7d32"
+    elif coverage["known"]:
+        note = (
+            f"{coverage['grid'].upper()} GRID INCOMPLETE\n"
+            f"{coverage['present']}/{coverage['expected']} planned samples "
+            f"({coverage['percent']:.1f}%)"
+        )
+        facecolor = "#ffebee"
+        edgecolor = "#c62828"
+    else:
+        note = "GRID COVERAGE UNKNOWN\nlegacy or non-grid input"
+        facecolor = "#ffebee"
+        edgecolor = "#c62828"
+    ax.text(
+        0.99,
+        0.99,
+        note,
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        bbox={
+            "boxstyle": "round,pad=0.25",
+            "facecolor": facecolor,
+            "edgecolor": edgecolor,
+            "linewidth": 0.9,
+            "alpha": 0.95,
+        },
+    )
+
+
+def annotate_figure_grid_coverage(fig, coverage):
+    report = {"grid_coverage": coverage}
+    class FigureTextTarget:
+        transAxes = None
+
+        def text(self, _x, _y, note, **kwargs):
+            kwargs.pop("transform", None)
+            fig.text(0.99, 0.99, note, **kwargs)
+
+    annotate_grid_coverage_status(FigureTextTarget(), report)
+
+
+def plot_throughput_speedup_grid(
+    plt, out_path: Path, machine: str, entries_by_scenario, coverage=None
+):
     rows = throughput_speedup_rows(entries_by_scenario)
     if not rows:
         return False
@@ -1393,7 +1699,13 @@ def plot_throughput_speedup_grid(plt, out_path: Path, machine: str, entries_by_s
     cmap = plt.get_cmap("RdYlGn").copy()
     cmap.set_bad("#f2f2f2")
 
-    panel_count = len(THROUGHPUT_SPEEDUP_BASELINES)
+    panels = []
+    for ubq_kind, ubq_title in (("scalar", "best scalar UBQ"), ("batched", "best batched UBQ")):
+        for baseline_key, baseline_title, _predicate in THROUGHPUT_SPEEDUP_BASELINES:
+            comparison = f"{ubq_kind}_{baseline_key}"
+            if any(row["comparison"] == comparison for row in rows):
+                panels.append((comparison, f"{ubq_title} vs {baseline_title}"))
+    panel_count = len(panels)
     width = max(12.0, panel_count * (2.8 + 0.42 * len(consumers)))
     height = max(5.6, 2.6 + 0.52 * len(producers))
     fig, axes = plt.subplots(1, panel_count, figsize=(width, height), squeeze=False)
@@ -1401,7 +1713,7 @@ def plot_throughput_speedup_grid(plt, out_path: Path, machine: str, entries_by_s
     image = None
     text_threshold = max(abs(vmin), abs(vmax)) * 0.52
 
-    for ax, (comparison, title, _predicate) in zip(axes, THROUGHPUT_SPEEDUP_BASELINES):
+    for ax, (comparison, title) in zip(axes, panels):
         matrix = []
         for producer in producers:
             matrix_row = []
@@ -1449,8 +1761,9 @@ def plot_throughput_speedup_grid(plt, out_path: Path, machine: str, entries_by_s
 
     axes[0].set_ylabel("Producers")
     fig.suptitle(
-        f"{machine_display_label(machine)}: throughput speedup, best UBQ vs selected baselines"
+        f"{machine_display_label(machine)}: scalar and batched UBQ throughput speedup"
     )
+    annotate_figure_grid_coverage(fig, coverage or grid_coverage_report(None, "throughput"))
     fig.subplots_adjust(top=0.86, right=0.84, wspace=0.28)
     if image is not None:
         colorbar = fig.colorbar(image, ax=axes, fraction=0.028, pad=0.035)
@@ -1475,6 +1788,7 @@ def plot_scenario_lines(
     entries_by_scenario,
     error_bars: str,
     family=None,
+    coverage=None,
 ):
     if not scenarios or not labels:
         return
@@ -1523,6 +1837,11 @@ def plot_scenario_lines(
     ax.set_title(f"{machine}: {family_prefix}{metric_display_name(mode)} scaling")
     ax.grid(axis="y", which="both" if log_y else "major", linestyle=":", alpha=0.4)
     ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=9, frameon=False)
+    if mode in ("throughput", "complex_throughput"):
+        annotate_grid_coverage_status(
+            ax,
+            {"grid_coverage": coverage or grid_coverage_report(None, mode)},
+        )
     fig.tight_layout(rect=(0, 0, 0.84, 1))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1752,6 +2071,7 @@ def main():
 
     out_root = Path(args.out_dir)
     grouped = {}
+    grid_coverage = {}
 
     if args.csv_dirs:
         for idx, raw_csv_dir in enumerate(args.csv_dirs):
@@ -1782,6 +2102,15 @@ def main():
                 key = (machine, mode, scenario, label)
                 raw_data.setdefault(key, []).append(ops)
                 sample_points += 1
+            for machine, mode, scenario, specification, sample in load_grid_coverage(path):
+                merge_grid_coverage(
+                    grid_coverage,
+                    machine,
+                    mode,
+                    scenario,
+                    specification,
+                    sample,
+                )
 
         if sample_points == 0:
             print("No benchmark records found in input files.")
@@ -1799,32 +2128,31 @@ def main():
             for mode in sorted(grouped[machine], key=mode_sort_key):
                 for scenario in sorted(grouped[machine][mode], key=scenario_sort_key):
                     entries = grouped[machine][mode][scenario]
-                    report = primary_plot_report(entries, mode, scenario)
+                    coverage = grid_coverage.get((machine, mode, scenario))
+                    report = primary_plot_report(entries, mode, scenario, coverage)
                     labels = report["selected_labels"]
-                    values = [(label, entries[label]) for label in labels]
+                    values = [
+                        (label, entries[label])
+                        for label in labels_by_metric(entries, mode)
+                    ]
                     slug = metric_file_slug(mode)
                     csv_path = out_root / machine / "csv" / mode / f"{scenario}_{slug}.csv"
                     write_csv(csv_path, mode, values)
                     print(f"Wrote CSV: {csv_path}")
-                    if report["required_labels"] and mode in ("throughput", "complex_throughput"):
+                    if mode in ("throughput", "complex_throughput"):
                         coverage_csv_path = (
                             out_root
                             / machine
                             / "csv"
                             / mode
-                            / f"{scenario}_immediate_variants_{slug}.csv"
+                            / f"{scenario}_grid_coverage_{slug}.csv"
                         )
-                        write_immediate_variant_csv(
-                            coverage_csv_path,
-                            entries,
-                            report["winner"],
-                            report["required_labels"],
-                        )
+                        write_grid_coverage_csv(coverage_csv_path, report)
                         print(f"Wrote CSV: {coverage_csv_path}")
-                        if report["missing_required_labels"]:
+                        if not report["grid_coverage"]["complete"]:
                             print(
-                                f"warning: {machine} {mode} {scenario} is missing "
-                                f"{len(report['missing_required_labels'])} required UBQ variant(s)",
+                                f"warning: {machine} {mode} {scenario} does not exhaust "
+                                "its declared UBQ grid",
                                 file=sys.stderr,
                             )
 
@@ -1904,7 +2232,16 @@ def main():
         write_throughput_speedup_csv(csv_path, speedup_rows)
         print(f"Wrote CSV: {csv_path}")
         png_path = out_root / machine / "throughput" / "ubq_speedup_grid_throughput.png"
-        if plot_throughput_speedup_grid(plt, png_path, machine, entries_by_scenario):
+        coverage = aggregate_grid_coverage(
+            [
+                grid_coverage.get((machine, "throughput", scenario))
+                for scenario in entries_by_scenario
+            ],
+            "throughput",
+        )
+        if plot_throughput_speedup_grid(
+            plt, png_path, machine, entries_by_scenario, coverage
+        ):
             print(f"Wrote PNG: {png_path}")
 
     plot_publication_mpsc_figures(plt, out_root, grouped, args.max_line_series, args.error_bars)
@@ -1913,7 +2250,8 @@ def main():
         for mode in sorted(grouped[machine], key=mode_sort_key):
             for scenario in sorted(grouped[machine][mode], key=scenario_sort_key):
                 entries = grouped[machine][mode][scenario]
-                report = primary_plot_report(entries, mode, scenario)
+                coverage = grid_coverage.get((machine, mode, scenario))
+                report = primary_plot_report(entries, mode, scenario, coverage)
                 labels = report["selected_labels"]
                 values = [entries[label]["mean_ops_per_sec"] for label in labels]
                 if not values:
@@ -1941,11 +2279,7 @@ def main():
                 ax.grid(axis="y", linestyle=":", alpha=0.4)
                 slug = metric_file_slug(mode)
                 if mode in ("throughput", "complex_throughput"):
-                    annotate_immediate_variant_status(
-                        ax,
-                        f"{scenario}_immediate_variants_{slug}.csv",
-                        report,
-                    )
+                    annotate_grid_coverage_status(ax, report)
 
                 if metric_lower_is_better(mode):
                     best_idx = min(range(len(values)), key=lambda i: values[i])
@@ -1988,6 +2322,10 @@ def main():
                 labels,
                 entries_by_scenario,
                 args.error_bars,
+                coverage=aggregate_grid_coverage(
+                    [grid_coverage.get((machine, mode, scenario)) for scenario in scenarios],
+                    mode,
+                ),
             )
             print(f"Wrote PNG: {png_path}")
             for family in ("mpsc", "spmc"):
@@ -2014,6 +2352,13 @@ def main():
                     selected_entries,
                     args.error_bars,
                     family=family,
+                    coverage=aggregate_grid_coverage(
+                        [
+                            grid_coverage.get((machine, mode, scenario))
+                            for scenario in selected_scenarios
+                        ],
+                        mode,
+                    ),
                 )
                 print(f"Wrote PNG: {png_path}")
 

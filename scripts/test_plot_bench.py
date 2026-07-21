@@ -6,11 +6,15 @@ from pathlib import Path
 
 from scripts.plot_bench import (
     combined_scenario_line_labels,
+    format_batched_ubq_label,
+    grid_coverage_report,
+    grid_winner_variant_report,
     immediate_winner_variant_report,
     format_speedup_label,
     infer_machine_label_from_csv_dir,
     label_sort_key,
     load_generated_csv_grouped,
+    load_grid_coverage,
     load_records,
     machine_display_label,
     machine_family_entries,
@@ -52,6 +56,7 @@ class FakeAxes:
     def __init__(self):
         self.yscale = None
         self.grid_kwargs = None
+        self.transAxes = None
 
     def plot(self, *_args, **_kwargs):
         pass
@@ -78,6 +83,9 @@ class FakeAxes:
         self.grid_kwargs = kwargs
 
     def legend(self, *_args, **_kwargs):
+        pass
+
+    def text(self, *_args, **_kwargs):
         pass
 
 
@@ -539,19 +547,125 @@ class ThroughputSpeedupGridTest(unittest.TestCase):
         rows = throughput_speedup_rows(entries_by_scenario)
         by_comparison = {row["comparison"]: row for row in rows}
 
-        self.assertEqual({"segqueue", "bbq", "lscq"}, set(by_comparison))
+        self.assertEqual(
+            {"scalar_segqueue", "scalar_bbq", "scalar_lscq"},
+            set(by_comparison),
+        )
         self.assertEqual(
             "ubq_balanced,8,127,crossbeam",
-            by_comparison["segqueue"]["ubq_queue"],
+            by_comparison["scalar_segqueue"]["ubq_queue"],
         )
-        self.assertEqual(5.0, by_comparison["segqueue"]["speedup"])
-        self.assertEqual("fastfifo_256", by_comparison["bbq"]["baseline_queue"])
-        self.assertEqual(2.0, by_comparison["bbq"]["speedup"])
-        self.assertEqual("lfqueue_256", by_comparison["lscq"]["baseline_queue"])
-        self.assertEqual(1.25, by_comparison["lscq"]["speedup"])
+        self.assertEqual(5.0, by_comparison["scalar_segqueue"]["speedup"])
+        self.assertEqual("fastfifo_256", by_comparison["scalar_bbq"]["baseline_queue"])
+        self.assertEqual(2.0, by_comparison["scalar_bbq"]["speedup"])
+        self.assertEqual("lfqueue_256", by_comparison["scalar_lscq"]["baseline_queue"])
+        self.assertEqual(1.25, by_comparison["scalar_lscq"]["speedup"])
+
+    def test_rows_report_scalar_and_batched_ubq_separately(self):
+        scalar = "ubq_balanced,8,127,crossbeam"
+        batched = format_batched_ubq_label("balanced,1,511,yield", 64)
+        rows = throughput_speedup_rows(
+            {"1p1c": {scalar: stats(100), batched: stats(180), "segqueue": stats(60)}}
+        )
+        by_comparison = {row["comparison"]: row for row in rows}
+
+        self.assertEqual(100 / 60, by_comparison["scalar_segqueue"]["speedup"])
+        self.assertEqual(3.0, by_comparison["batched_segqueue"]["speedup"])
+        self.assertEqual(batched, by_comparison["batched_segqueue"]["ubq_queue"])
 
 
 class MetricExtractionTest(unittest.TestCase):
+    def test_schema_v3_loads_scalar_and_batched_ubq_as_distinct_series(self):
+        payload = {
+            "schema_version": 3,
+            "meta": {
+                "machine_label": "local",
+                "scenario": "1p1c",
+                "repeat_index": 1,
+                "ubq_label": "balanced,8,127,crossbeam",
+                "ubq_grid": "sparse",
+                "expected_ubq_configurations": 40,
+                "ubq_batch_sizes": [2, 4],
+                "planned_repeats": 1,
+                "planned_items_per_producer": [10],
+            },
+            "results": [
+                {
+                    "queue": "ubq",
+                    "mode": "throughput",
+                    "items_per_producer": 10,
+                    "ops_per_sec": 100.0,
+                },
+                {
+                    "queue": "ubq",
+                    "mode": "throughput",
+                    "batch_size": 4,
+                    "items_per_producer": 10,
+                    "ops_per_sec": 140.0,
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            rows = list(load_records(path))
+            coverage_rows = list(load_grid_coverage(path))
+
+        labels = {label for _machine, _mode, _scenario, label, _value in rows}
+        self.assertEqual(
+            {
+                "ubq_balanced,8,127,crossbeam",
+                "ubq_batched_4_balanced,8,127,crossbeam",
+            },
+            labels,
+        )
+        self.assertEqual(2, len(coverage_rows))
+
+    def test_grid_coverage_reports_complete_and_incomplete_samples(self):
+        coverage = {
+            "grid": "sparse",
+            "expected_configurations": 2,
+            "planned_repeats": 2,
+            "batch_sizes": (2, 4),
+            "planned_items": (10,),
+            "present": {("label", None, repeat, 10) for repeat in (1, 2)},
+        }
+        incomplete = grid_coverage_report(coverage, "throughput")
+        self.assertEqual(12, incomplete["expected"])
+        self.assertEqual(2, incomplete["present"])
+        self.assertFalse(incomplete["complete"])
+
+        coverage["present"] = {(str(index), None, 1, 10) for index in range(12)}
+        complete = grid_coverage_report(coverage, "throughput")
+        self.assertTrue(complete["complete"])
+        self.assertEqual(100.0, complete["percent"])
+
+    def test_grid_report_selects_best_scalar_and_best_batch(self):
+        scalar_slow = "ubq_balanced,0,31,crossbeam"
+        scalar_best = "ubq_balanced,8,127,crossbeam"
+        batched_slow = format_batched_ubq_label("balanced,0,31,crossbeam", 2)
+        batched_best = format_batched_ubq_label("balanced,64,4095,yield", 256)
+        report = grid_winner_variant_report(
+            {
+                "segqueue": stats(80),
+                scalar_slow: stats(90),
+                scalar_best: stats(100),
+                batched_slow: stats(95),
+                batched_best: stats(150),
+            },
+            "throughput",
+            "1p1c",
+            None,
+        )
+
+        self.assertEqual(scalar_best, report["winner"])
+        self.assertEqual(batched_best, report["batched_winner"])
+        self.assertEqual(
+            ["segqueue", scalar_best, batched_best],
+            report["selected_labels"],
+        )
+
     def test_load_records_emits_derived_timing_metrics(self):
         payload = {
             "schema_version": 2,

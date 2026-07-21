@@ -41,6 +41,7 @@ fn main() {
              \x20\x20\x20\x20_repeat_index: usize,\n\
              \x20\x20\x20\x20_mode: Mode,\n\
              \x20\x20\x20\x20_items_per_producer: u64,\n\
+             \x20\x20\x20\x20_batch_size: Option<usize>,\n\
              ) -> Option<JobFactory> { None }\n",
         )
         .expect("failed to write bench_registry.rs stub");
@@ -55,6 +56,7 @@ fn main() {
     writeln!(code, "    repeat_index: usize,").unwrap();
     writeln!(code, "    mode: Mode,").unwrap();
     writeln!(code, "    items_per_producer: u64,").unwrap();
+    writeln!(code, "    batch_size: Option<usize>,").unwrap();
     writeln!(code, ") -> Option<JobFactory> {{").unwrap();
     writeln!(code, "    match label {{").unwrap();
 
@@ -70,7 +72,7 @@ fn main() {
                     );
                     writeln!(
                         code,
-                        "        {:?} => Some(make_ubq_job_factory::<{value_type_expr}, {log_type_expr}>(label, scenario, repeat_index, mode, items_per_producer)),",
+                        "        {:?} => Some(make_ubq_job_factory::<{value_type_expr}, {log_type_expr}>(label, scenario, repeat_index, mode, items_per_producer, batch_size)),",
                         label_str,
                     )
                     .unwrap();

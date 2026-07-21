@@ -35,8 +35,8 @@ fn bench_core_ids() -> &'static [core_affinity::CoreId] {
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 
-pub const RUN_SCHEMA_VERSION: u32 = 2;
-pub const PLAN_SCHEMA_VERSION: u32 = 1;
+pub const RUN_SCHEMA_VERSION: u32 = 3;
+pub const PLAN_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_ITEMS_PER_PRODUCER: u64 = 1_000_000;
 pub const DEFAULT_RUNS_DIR: &str = "bench_results/runs";
 pub const DEFAULT_PLOTS_DIR: &str = "bench_results/plots";
@@ -74,6 +74,9 @@ const DEFAULT_BENCH_JOB_TIMEOUT_SECS: u64 = 300;
 const UBQ_POOL_VALUES: [u8; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
 const UBQ_BLOCK_VALUES: [u16; 8] = [31, 63, 127, 255, 511, 1023, 2047, 4095];
 const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
+const UBQ_SPARSE_POOL_VALUES: [u8; 4] = [0, 1, 8, 64];
+const UBQ_SPARSE_BLOCK_VALUES: [u16; 5] = [31, 127, 511, 2047, 4095];
+pub const DEFAULT_UBQ_BATCH_SIZES: [usize; 11] = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
 const DEFAULT_LFQUEUE_SEGMENT_SIZES: [usize; 3] = [32, 256, 1024];
 const DEFAULT_WCQ_CAPACITIES: [usize; 3] = [4096, 65536, 1048576];
 const SUPPORTED_WCQ_CAPACITIES: [usize; 8] =
@@ -224,17 +227,27 @@ pub trait LogQueue: LogQueueOps {
 
 pub trait BenchQueueOps: Send + Sync + 'static {
     fn send_value(&self, value: u64);
+    fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
+        for offset in offsets {
+            self.send_value(base + offset as u64);
+        }
+    }
     fn recv_value(&self) -> u64;
 }
 
 pub trait BenchQueueThreadOps: Send + 'static {
     fn send_value(&self, value: u64);
+    fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>);
     fn recv_value(&self) -> u64;
 }
 
 impl<Q: BenchQueueOps> BenchQueueThreadOps for Arc<Q> {
     fn send_value(&self, value: u64) {
         (**self).send_value(value);
+    }
+
+    fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
+        (**self).send_batch(base, offsets);
     }
 
     fn recv_value(&self) -> u64 {
@@ -271,6 +284,11 @@ where
     fn send_value(&self, value: u64) {
         check_bench_job_deadline("pushing to UBQ");
         self.push(value);
+    }
+
+    fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
+        check_bench_job_deadline("batch-pushing to UBQ");
+        self.push_batch(offsets.map(move |offset| base + offset as u64));
     }
 
     fn recv_value(&self) -> u64 {
@@ -830,6 +848,42 @@ pub struct UbqLabel {
     pub backoff: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UbqGrid {
+    Sparse,
+    Dense,
+}
+
+impl UbqGrid {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sparse => "sparse",
+            Self::Dense => "dense",
+        }
+    }
+
+    pub fn labels(self) -> Vec<String> {
+        let pools: &[u8] = match self {
+            Self::Sparse => &UBQ_SPARSE_POOL_VALUES,
+            Self::Dense => &UBQ_POOL_VALUES,
+        };
+        let blocks: &[u16] = match self {
+            Self::Sparse => &UBQ_SPARSE_BLOCK_VALUES,
+            Self::Dense => &UBQ_BLOCK_VALUES,
+        };
+        let mut labels = Vec::with_capacity(pools.len() * blocks.len() * UBQ_BACKOFF_VALUES.len());
+        for pool in pools {
+            for block in blocks {
+                for backoff in UBQ_BACKOFF_VALUES {
+                    labels.push(format!("balanced,{pool},{block},{backoff}"));
+                }
+            }
+        }
+        labels
+    }
+}
+
 impl UbqLabel {
     pub fn text(&self) -> String {
         format!(
@@ -854,6 +908,8 @@ pub struct JobSpec {
     pub items_per_producer: u64,
     pub queue: QueueKind,
     pub ubq_label: Option<String>,
+    #[serde(default)]
+    pub batch_size: Option<usize>,
     pub fastfifo_block_size: Option<usize>,
     #[serde(default)]
     pub lfqueue_segment_size: Option<usize>,
@@ -885,7 +941,17 @@ impl JobSpec {
             .unwrap_or_else(|| panic!("job thread budget overflow"))
     }
 
-    pub fn sort_key(&self) -> (std::cmp::Reverse<usize>, String, usize, String, u64, String) {
+    pub fn sort_key(
+        &self,
+    ) -> (
+        std::cmp::Reverse<usize>,
+        String,
+        usize,
+        String,
+        u64,
+        String,
+        Option<usize>,
+    ) {
         (
             std::cmp::Reverse(self.thread_budget()),
             self.scenario.name.clone(),
@@ -893,6 +959,7 @@ impl JobSpec {
             self.mode.name().to_string(),
             self.items_per_producer,
             self.queue_label(),
+            self.batch_size,
         )
     }
 }
@@ -904,6 +971,7 @@ pub struct SampleKey {
     pub mode: Mode,
     pub items_per_producer: u64,
     pub queue_label: String,
+    pub batch_size: Option<usize>,
 }
 
 impl SampleKey {
@@ -914,6 +982,7 @@ impl SampleKey {
             mode: job.mode,
             items_per_producer: job.items_per_producer,
             queue_label: job.queue_label(),
+            batch_size: job.batch_size,
         }
     }
 }
@@ -940,6 +1009,12 @@ pub struct MatrixPlan {
     pub lfqueue_segment_sizes: Vec<usize>,
     #[serde(default)]
     pub wcq_capacities: Vec<usize>,
+    #[serde(default)]
+    pub ubq_grid: Option<UbqGrid>,
+    #[serde(default)]
+    pub ubq_batch_sizes: Vec<usize>,
+    #[serde(default)]
+    pub planned_repeats: usize,
     pub bundles: Vec<PlanBundle>,
     pub reuse_existing: bool,
 }
@@ -986,6 +1061,16 @@ pub struct OutputMeta {
     pub ubq_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ubq_block_size: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ubq_grid: Option<UbqGrid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_ubq_configurations: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ubq_batch_sizes: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_repeats: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planned_items_per_producer: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1010,6 +1095,8 @@ fn is_completed_status(status: &BenchRecordStatus) -> bool {
 pub struct BenchRecord {
     pub queue: String,
     pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<usize>,
     pub items_per_producer: u64,
     pub total_items: u64,
     pub consumed_items: u64,
@@ -1088,7 +1175,6 @@ struct BundleOutputState {
     ordered_keys: Vec<SampleKey>,
     records: BTreeMap<SampleKey, BenchRecord>,
     dirty: bool,
-    wrote_once: bool,
 }
 
 impl BundleOutputState {
@@ -1099,7 +1185,6 @@ impl BundleOutputState {
             ordered_keys: expected_keys_for_bundle(plan, bundle),
             records: BTreeMap::new(),
             dirty: false,
-            wrote_once: false,
         })
     }
 
@@ -1115,7 +1200,7 @@ impl BundleOutputState {
     }
 
     fn flush(&mut self) -> Result<bool, String> {
-        if !self.dirty && self.wrote_once {
+        if !self.dirty {
             return Ok(false);
         }
 
@@ -1133,7 +1218,6 @@ impl BundleOutputState {
             .map_err(|err| format!("failed to serialize output: {err}"))?;
         atomic_write_string(&self.path, &json)?;
         self.dirty = false;
-        self.wrote_once = true;
         Ok(true)
     }
 }
@@ -2138,9 +2222,75 @@ pub fn build_direct_matrix_plan(
         fastfifo_block_sizes: normalized_fastfifo_block_sizes,
         lfqueue_segment_sizes: normalized_lfqueue_segment_sizes,
         wcq_capacities: normalized_wcq_capacities,
+        ubq_grid: None,
+        ubq_batch_sizes: Vec::new(),
+        planned_repeats: repeats,
         bundles,
         reuse_existing,
     })
+}
+
+pub fn build_grid_matrix_plan(
+    machine_label: &str,
+    runs_dir: PathBuf,
+    available_parallelism: usize,
+    selected_queues: &[QueueKind],
+    grid: UbqGrid,
+    batch_sizes: &[usize],
+    fastfifo_block_sizes: &[usize],
+    lfqueue_segment_sizes: &[usize],
+    wcq_capacities: &[usize],
+    scenarios: &[ScenarioConfig],
+    modes: &[Mode],
+    items_per_producer_values: &[u64],
+    repeats: usize,
+    reuse_existing: bool,
+) -> Result<MatrixPlan, String> {
+    let mut normalized_batch_sizes = Vec::with_capacity(batch_sizes.len());
+    let mut seen = BTreeSet::new();
+    for &batch_size in batch_sizes {
+        if batch_size < 2 {
+            return Err(
+                "UBQ batch sizes must be >= 2; scalar push is measured separately".to_string(),
+            );
+        }
+        if seen.insert(batch_size) {
+            normalized_batch_sizes.push(batch_size);
+        }
+    }
+    let labels = grid.labels();
+    let mut plan = build_direct_matrix_plan(
+        machine_label,
+        runs_dir,
+        available_parallelism,
+        selected_queues,
+        &labels,
+        fastfifo_block_sizes,
+        lfqueue_segment_sizes,
+        wcq_capacities,
+        scenarios,
+        modes,
+        items_per_producer_values,
+        repeats,
+        reuse_existing,
+    )?;
+    plan.ubq_grid = Some(grid);
+    plan.ubq_batch_sizes = normalized_batch_sizes;
+    plan.planned_repeats = repeats;
+    if !plan.baseline_queues.is_empty() {
+        for scenario in scenarios {
+            for repeat_index in 1..=repeats {
+                plan.bundles.push(PlanBundle {
+                    scenario: scenario.clone(),
+                    repeat_index,
+                    ubq_label: None,
+                    modes: modes.to_vec(),
+                    items_per_producer_values: items_per_producer_values.to_vec(),
+                });
+            }
+        }
+    }
+    Ok(plan)
 }
 
 pub fn parse_embedded_plan(raw: &str) -> Result<MatrixPlan, String> {
@@ -2181,6 +2331,9 @@ pub fn load_existing_runs(
             continue;
         }
         for record in parsed.results {
+            if !record.completed() {
+                continue;
+            }
             let queue_label = if record.queue == "ubq" {
                 match parsed.meta.ubq_label.as_deref() {
                     Some(label) => format!("ubq_{label}"),
@@ -2195,6 +2348,7 @@ pub fn load_existing_runs(
                 mode: Mode::parse(&record.mode).unwrap_or(Mode::Throughput),
                 items_per_producer: record.items_per_producer,
                 queue_label,
+                batch_size: record.batch_size,
             };
             index.records.entry(key).or_insert(record);
         }
@@ -2239,6 +2393,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                     items_per_producer,
                                     queue: baseline_queue,
                                     ubq_label: None,
+                                    batch_size: None,
                                     fastfifo_block_size: Some(block_size),
                                     lfqueue_segment_size: None,
                                     wcq_capacity: None,
@@ -2254,6 +2409,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                     items_per_producer,
                                     queue: baseline_queue,
                                     ubq_label: None,
+                                    batch_size: None,
                                     fastfifo_block_size: None,
                                     lfqueue_segment_size: Some(segment_size),
                                     wcq_capacity: None,
@@ -2275,6 +2431,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                         items_per_producer,
                                         queue: baseline_queue,
                                         ubq_label: None,
+                                        batch_size: None,
                                         fastfifo_block_size: None,
                                         lfqueue_segment_size: None,
                                         wcq_capacity: Some(capacity),
@@ -2290,6 +2447,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                 items_per_producer,
                                 queue: baseline_queue,
                                 ubq_label: None,
+                                batch_size: None,
                                 fastfifo_block_size: None,
                                 lfqueue_segment_size: None,
                                 wcq_capacity: None,
@@ -2305,10 +2463,27 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                         items_per_producer,
                         queue: QueueKind::Ubq,
                         ubq_label: Some(label.clone()),
+                        batch_size: None,
                         fastfifo_block_size: None,
                         lfqueue_segment_size: None,
                         wcq_capacity: None,
                     });
+                    if *mode == Mode::Throughput {
+                        for &batch_size in &plan.ubq_batch_sizes {
+                            out.insert(JobSpec {
+                                scenario: bundle.scenario.clone(),
+                                repeat_index: bundle.repeat_index,
+                                mode: *mode,
+                                items_per_producer,
+                                queue: QueueKind::Ubq,
+                                ubq_label: Some(label.clone()),
+                                batch_size: Some(batch_size),
+                                fastfifo_block_size: None,
+                                lfqueue_segment_size: None,
+                                wcq_capacity: None,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -2322,6 +2497,7 @@ pub fn make_ubq_job_factory<Q: BenchQueue, L: LogQueue>(
     repeat_index: usize,
     mode: Mode,
     items_per_producer: u64,
+    batch_size: Option<usize>,
 ) -> JobFactory {
     let parsed = parse_ubq_label(label, true).expect("valid UBQ label");
     let normalized = parsed.text();
@@ -2333,6 +2509,7 @@ pub fn make_ubq_job_factory<Q: BenchQueue, L: LogQueue>(
         items_per_producer,
         queue: QueueKind::Ubq,
         ubq_label: Some(normalized),
+        batch_size,
         fastfifo_block_size: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
@@ -2340,9 +2517,21 @@ pub fn make_ubq_job_factory<Q: BenchQueue, L: LogQueue>(
     let queue_name = "ubq".to_string();
     let run_scenario = scenario.clone();
     let run = Arc::new(move |core_offset: usize| match mode {
-        Mode::Throughput => {
-            bench_throughput_for::<Q>(&queue_name, &run_scenario, items_per_producer, core_offset)
-        }
+        Mode::Throughput => match batch_size {
+            Some(batch_size) => bench_throughput_batched_for::<Q>(
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                batch_size,
+                core_offset,
+            ),
+            None => bench_throughput_for::<Q>(
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+        },
         Mode::ComplexThroughput => bench_complex_throughput_for::<Q>(
             &queue_name,
             &run_scenario,
@@ -2396,6 +2585,7 @@ pub fn make_segqueue_job_factory(
         items_per_producer,
         queue: QueueKind::SegQueue,
         ubq_label: None,
+        batch_size: None,
         fastfifo_block_size: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
@@ -2474,6 +2664,7 @@ pub fn make_concurrent_queue_job_factory(
         items_per_producer,
         queue: QueueKind::ConcurrentQueue,
         ubq_label: None,
+        batch_size: None,
         fastfifo_block_size: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
@@ -2555,6 +2746,7 @@ pub fn make_lfqueue_job_factory(
         items_per_producer,
         queue: QueueKind::LfQueue,
         ubq_label: None,
+        batch_size: None,
         fastfifo_block_size: None,
         lfqueue_segment_size: Some(segment_size),
         wcq_capacity: None,
@@ -2648,6 +2840,7 @@ fn make_wcq_job_factory_typed<const CAPACITY: usize>(
         items_per_producer,
         queue: QueueKind::Wcq,
         ubq_label: None,
+        batch_size: None,
         fastfifo_block_size: None,
         lfqueue_segment_size: None,
         wcq_capacity: Some(CAPACITY),
@@ -2805,6 +2998,7 @@ pub fn make_fastfifo_job_factory(
         items_per_producer,
         queue: QueueKind::FastFifo,
         ubq_label: None,
+        batch_size: None,
         fastfifo_block_size: Some(block_size),
         lfqueue_segment_size: None,
         wcq_capacity: None,
@@ -2965,16 +3159,24 @@ fn execute_job_factories_with_timeout(
     }
 
     pending.sort_by(|lhs, rhs| lhs.spec.sort_key().cmp(&rhs.spec.sort_key()));
-    let total_jobs = pending.len();
+    let required_specs = required_job_specs(plan);
+    let total_jobs = required_specs.len();
+    let progress_layout = ProgressLayout::new(required_specs.iter(), available_parallelism);
+    let initially_complete = total_jobs.saturating_sub(pending.len());
     progress_line(format!(
-        "scheduler: starting {} benchmark job(s) with thread budget {}",
-        total_jobs, available_parallelism
+        "scheduler: starting {} pending benchmark job(s); {}/{} ({:.2}%) already complete; thread budget {}",
+        pending.len(),
+        initially_complete,
+        total_jobs,
+        completion_percent(initially_complete, total_jobs),
+        available_parallelism
     ));
     let writer = OutputWriterHandle::start(plan, cache)?;
     if pending.is_empty() {
         writer.close(true)?;
         return Ok((BTreeMap::new(), None));
     }
+    progress_layout.print_header();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2982,145 +3184,141 @@ fn execute_job_factories_with_timeout(
 
     // Each task returns (key, record, budget). Panics and timeouts become
     // failed records so one bad queue does not abort the whole batch.
-    let execution_result: Result<(BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>), String> =
-        runtime.block_on(async {
-            let mut results = BTreeMap::new();
-            let mut running: JoinSet<Result<(SampleKey, BenchRecord, usize), String>> =
-                JoinSet::new();
-            let mut used_threads = 0_usize;
-            let mut completed = 0_usize;
+    let execution_result: Result<
+        (BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>),
+        String,
+    > = runtime.block_on(async {
+        let mut results = BTreeMap::new();
+        let mut running: JoinSet<Result<(SampleKey, BenchRecord, usize), String>> = JoinSet::new();
+        let mut used_threads = 0_usize;
+        let mut completed = initially_complete;
 
-            while !pending.is_empty() || !running.is_empty() {
-                let mut started = false;
-                loop {
-                    let Some(index) = pending
-                        .iter()
-                        .position(|job| can_start_job(&job.spec, used_threads, available_parallelism))
-                    else {
-                        break;
-                    };
-                    let job = pending.remove(index);
-                    let key = SampleKey::from_job(&job.spec);
-                    let budget = job.spec.thread_budget();
-                    used_threads += budget;
-                    started = true;
-                    progress_line(format!(
-                        "scheduler: start {} scenario={} repeat={} mode={} items={} threads={} active={}/{} pending={}",
-                        job.spec.queue_label(),
-                        job.spec.scenario.name.as_str(),
-                        job.spec.repeat_index,
-                        job.spec.mode.name(),
-                        job.spec.items_per_producer,
-                        budget,
-                        used_threads,
-                        available_parallelism,
-                        pending.len()
-                    ));
-                    let core_offset = used_threads - budget;
-                    running.spawn(async move {
-                        let timeout_ns = job_timeout.as_nanos() as u64;
-                        let started_at = Instant::now();
-                        let deadline = started_at.checked_add(job_timeout);
-                        let timeout_spec = job.spec.clone();
-                        let panic_spec = job.spec.clone();
-                        let mut handle = tokio::task::spawn_blocking(move || {
-                            with_bench_job_deadline(deadline, || (job.run)(core_offset))
-                        });
-                        let mut timed_out = false;
-                        let join_result = match tokio::time::timeout(job_timeout, &mut handle).await
-                        {
-                            Ok(result) => result,
-                            Err(_) => {
-                                timed_out = true;
-                                handle.await
-                            }
-                        };
-                        match join_result {
-                            Ok(_record) if timed_out => {
-                                let elapsed_ns = started_at.elapsed().as_nanos() as u64;
-                                let record = failed_bench_record(
-                                    &timeout_spec,
-                                    BenchRecordStatus::TimedOut,
-                                    format!(
-                                        "benchmark job exceeded {}s timeout",
-                                        job_timeout.as_secs()
-                                    ),
-                                    elapsed_ns,
-                                    Some(timeout_ns),
-                                );
-                                Ok((key, record, budget))
-                            }
-                            Ok(record) => Ok((key, record, budget)),
-                            Err(err) if err.is_panic() => {
-                                let elapsed_ns = started_at.elapsed().as_nanos() as u64;
-                                let reason = panic_payload_message(err.into_panic());
-                                let (status, timeout) =
-                                    status_and_timeout_for_failure(&reason, elapsed_ns);
-                                let record = failed_bench_record(
-                                    &panic_spec,
-                                    status,
-                                    reason,
-                                    elapsed_ns,
-                                    timeout,
-                                );
-                                Ok((key, record, budget))
-                            }
-                            Err(err) => Err(format!("benchmark task join failed: {err}")),
-                        }
+        while !pending.is_empty() || !running.is_empty() {
+            let mut started = false;
+            loop {
+                let Some(index) = pending
+                    .iter()
+                    .position(|job| can_start_job(&job.spec, used_threads, available_parallelism))
+                else {
+                    break;
+                };
+                let job = pending.remove(index);
+                let key = SampleKey::from_job(&job.spec);
+                let budget = job.spec.thread_budget();
+                used_threads += budget;
+                started = true;
+                progress_layout.print_row(
+                    "start",
+                    &key,
+                    budget,
+                    used_threads,
+                    pending.len(),
+                    completed,
+                    total_jobs,
+                );
+                let core_offset = used_threads - budget;
+                running.spawn(async move {
+                    let timeout_ns = job_timeout.as_nanos() as u64;
+                    let started_at = Instant::now();
+                    let deadline = started_at.checked_add(job_timeout);
+                    let timeout_spec = job.spec.clone();
+                    let panic_spec = job.spec.clone();
+                    let mut handle = tokio::task::spawn_blocking(move || {
+                        with_bench_job_deadline(deadline, || (job.run)(core_offset))
                     });
-                }
-
-                if running.is_empty() && !pending.is_empty() {
-                    return Err("scheduler stalled with pending work".to_string());
-                }
-
-                if !started || pending.is_empty() {
-                    if let Some(joined) = running.join_next().await {
-                        let (key, record, budget) =
-                            joined.map_err(|err| format!("scheduler task failed: {err}"))??;
-                        used_threads = used_threads.saturating_sub(budget);
-                        completed += 1;
-                        if record.completed() {
-                            progress_line(format!(
-                                "scheduler: done {} scenario={} repeat={} mode={} items={} active={}/{} completed={}/{}",
-                                key.queue_label.as_str(),
-                                key.scenario.as_str(),
-                                key.repeat_index,
-                                key.mode.name(),
-                                key.items_per_producer,
-                                used_threads,
-                                available_parallelism,
-                                completed,
-                                total_jobs
-                            ));
-                        } else {
-                            progress_line(format!(
-                                "scheduler: {} {} scenario={} repeat={} mode={} items={} active={}/{} completed={}/{} reason={}",
-                                match &record.status {
-                                    BenchRecordStatus::Completed => "done",
-                                    BenchRecordStatus::Failed => "failed",
-                                    BenchRecordStatus::TimedOut => "timed out",
-                                },
-                                key.queue_label.as_str(),
-                                key.scenario.as_str(),
-                                key.repeat_index,
-                                key.mode.name(),
-                                key.items_per_producer,
-                                used_threads,
-                                available_parallelism,
-                                completed,
-                                total_jobs,
-                                record.failure_reason.as_deref().unwrap_or("unknown")
-                            ));
+                    let mut timed_out = false;
+                    let join_result = match tokio::time::timeout(job_timeout, &mut handle).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            timed_out = true;
+                            handle.await
                         }
-                        writer.submit(key.clone(), record.clone())?;
-                        results.insert(key, record);
+                    };
+                    match join_result {
+                        Ok(_record) if timed_out => {
+                            let elapsed_ns = started_at.elapsed().as_nanos() as u64;
+                            let record = failed_bench_record(
+                                &timeout_spec,
+                                BenchRecordStatus::TimedOut,
+                                format!(
+                                    "benchmark job exceeded {}s timeout",
+                                    job_timeout.as_secs()
+                                ),
+                                elapsed_ns,
+                                Some(timeout_ns),
+                            );
+                            Ok((key, record, budget))
+                        }
+                        Ok(record) => Ok((key, record, budget)),
+                        Err(err) if err.is_panic() => {
+                            let elapsed_ns = started_at.elapsed().as_nanos() as u64;
+                            let reason = panic_payload_message(err.into_panic());
+                            let (status, timeout) =
+                                status_and_timeout_for_failure(&reason, elapsed_ns);
+                            let record = failed_bench_record(
+                                &panic_spec,
+                                status,
+                                reason,
+                                elapsed_ns,
+                                timeout,
+                            );
+                            Ok((key, record, budget))
+                        }
+                        Err(err) => Err(format!("benchmark task join failed: {err}")),
                     }
-                }
+                });
             }
 
-            Ok((results, None))
-        });
+            if running.is_empty() && !pending.is_empty() {
+                return Err("scheduler stalled with pending work".to_string());
+            }
+
+            if !started || pending.is_empty() {
+                if let Some(joined) = running.join_next().await {
+                    let (key, record, budget) =
+                        joined.map_err(|err| format!("scheduler task failed: {err}"))??;
+                    used_threads = used_threads.saturating_sub(budget);
+                    completed += 1;
+                    if record.completed() {
+                        progress_layout.print_row(
+                            "done",
+                            &key,
+                            budget,
+                            used_threads,
+                            pending.len(),
+                            completed,
+                            total_jobs,
+                        );
+                    } else {
+                        let state = match &record.status {
+                            BenchRecordStatus::Completed => "done",
+                            BenchRecordStatus::Failed => "failed",
+                            BenchRecordStatus::TimedOut => "timed out",
+                        };
+                        progress_layout.print_row(
+                            state,
+                            &key,
+                            budget,
+                            used_threads,
+                            pending.len(),
+                            completed,
+                            total_jobs,
+                        );
+                        progress_line(format!(
+                            "scheduler: reason {:<width$} | {}",
+                            "",
+                            record.failure_reason.as_deref().unwrap_or("unknown"),
+                            width = progress_layout.state_width
+                        ));
+                    }
+                    writer.submit(key.clone(), record.clone())?;
+                    results.insert(key, record);
+                }
+            }
+        }
+
+        Ok((results, None))
+    });
     runtime.shutdown_timeout(Duration::from_secs(1));
     let is_fully_complete = matches!(&execution_result, Ok((_, None)));
     let writer_result = writer.close(is_fully_complete);
@@ -3162,6 +3360,7 @@ fn result_key_sort(lhs: &SampleKey, rhs: &SampleKey) -> Ordering {
         queue_order(&lhs.queue_label),
         queue_variant(&lhs.queue_label),
         lhs.queue_label.clone(),
+        lhs.batch_size,
     )
         .cmp(&(
             rhs.mode.name().to_string(),
@@ -3169,6 +3368,7 @@ fn result_key_sort(lhs: &SampleKey, rhs: &SampleKey) -> Ordering {
             queue_order(&rhs.queue_label),
             queue_variant(&rhs.queue_label),
             rhs.queue_label.clone(),
+            rhs.batch_size,
         ))
 }
 
@@ -3176,7 +3376,12 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
     let mut keys = Vec::new();
     for mode in &bundle.modes {
         for &items_per_producer in &bundle.items_per_producer_values {
-            for baseline_queue in &plan.baseline_queues {
+            let baseline_queues = if plan.ubq_grid.is_some() && bundle.ubq_label.is_some() {
+                &[][..]
+            } else {
+                plan.baseline_queues.as_slice()
+            };
+            for baseline_queue in baseline_queues {
                 match baseline_queue {
                     QueueKind::FastFifo => {
                         for &block_size in &plan.fastfifo_block_sizes {
@@ -3187,6 +3392,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                                 items_per_producer,
                                 queue: *baseline_queue,
                                 ubq_label: None,
+                                batch_size: None,
                                 fastfifo_block_size: Some(block_size),
                                 lfqueue_segment_size: None,
                                 wcq_capacity: None,
@@ -3203,6 +3409,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                                 items_per_producer,
                                 queue: *baseline_queue,
                                 ubq_label: None,
+                                batch_size: None,
                                 fastfifo_block_size: None,
                                 lfqueue_segment_size: Some(segment_size),
                                 wcq_capacity: None,
@@ -3225,6 +3432,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                                     items_per_producer,
                                     queue: *baseline_queue,
                                     ubq_label: None,
+                                    batch_size: None,
                                     fastfifo_block_size: None,
                                     lfqueue_segment_size: None,
                                     wcq_capacity: Some(capacity),
@@ -3241,6 +3449,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                             items_per_producer,
                             queue: *baseline_queue,
                             ubq_label: None,
+                            batch_size: None,
                             fastfifo_block_size: None,
                             lfqueue_segment_size: None,
                             wcq_capacity: None,
@@ -3257,11 +3466,29 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                     items_per_producer,
                     queue: QueueKind::Ubq,
                     ubq_label: Some(label.clone()),
+                    batch_size: None,
                     fastfifo_block_size: None,
                     lfqueue_segment_size: None,
                     wcq_capacity: None,
                 };
                 keys.push(SampleKey::from_job(&spec));
+                if *mode == Mode::Throughput {
+                    for &batch_size in &plan.ubq_batch_sizes {
+                        let spec = JobSpec {
+                            scenario: bundle.scenario.clone(),
+                            repeat_index: bundle.repeat_index,
+                            mode: *mode,
+                            items_per_producer,
+                            queue: QueueKind::Ubq,
+                            ubq_label: Some(label.clone()),
+                            batch_size: Some(batch_size),
+                            fastfifo_block_size: None,
+                            lfqueue_segment_size: None,
+                            wcq_capacity: None,
+                        };
+                        keys.push(SampleKey::from_job(&spec));
+                    }
+                }
             }
         }
     }
@@ -3275,6 +3502,25 @@ fn bundle_output_meta(plan: &MatrixPlan, bundle: &PlanBundle) -> Result<OutputMe
         Some(label) => Some(parse_ubq_label(label, true)?.block),
         None => None,
     };
+    let expected_ubq_configurations = plan.ubq_grid.map(|_| {
+        plan.bundles
+            .iter()
+            .filter(|candidate| candidate.scenario == bundle.scenario)
+            .filter_map(|candidate| candidate.ubq_label.as_deref())
+            .collect::<BTreeSet<_>>()
+            .len()
+    });
+    let planned_items_per_producer = if plan.ubq_grid.is_some() {
+        plan.bundles
+            .iter()
+            .filter(|candidate| candidate.scenario == bundle.scenario)
+            .flat_map(|candidate| candidate.items_per_producer_values.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(OutputMeta {
         timestamp_unix_ms: now_unix_ms(),
         machine_label: plan.machine_label.clone(),
@@ -3285,6 +3531,11 @@ fn bundle_output_meta(plan: &MatrixPlan, bundle: &PlanBundle) -> Result<OutputMe
         available_parallelism: plan.available_parallelism,
         ubq_label,
         ubq_block_size,
+        ubq_grid: plan.ubq_grid,
+        expected_ubq_configurations,
+        ubq_batch_sizes: plan.ubq_batch_sizes.clone(),
+        planned_repeats: plan.ubq_grid.map(|_| plan.planned_repeats),
+        planned_items_per_producer,
     })
 }
 
@@ -3562,13 +3813,14 @@ fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
                 )
                 .expect("valid label");
                 out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_ubq_job_factory::<{}, {}>(\"{}\", {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
+                    "    jobs.push(bench_harness::make_ubq_job_factory::<{}, {}>(\"{}\", {scenario_expr}, {}, bench_harness::Mode::{:?}, {}, {:?}));\n",
                     ubq_type_expr(&label, "u64"),
                     ubq_type_expr(&label, "bench_harness::LogRecord"),
                     label.text(),
                     spec.repeat_index,
                     spec.mode,
-                    spec.items_per_producer
+                    spec.items_per_producer,
+                    spec.batch_size
                 ));
             }
         }
@@ -3587,6 +3839,151 @@ fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
 fn progress_line(message: impl AsRef<str>) {
     println!("{}", message.as_ref());
     let _ = io::stdout().flush();
+}
+
+fn decimal_width(value: usize) -> usize {
+    value.max(1).ilog10() as usize + 1
+}
+
+fn completion_percent(completed: usize, total: usize) -> f64 {
+    if total == 0 {
+        100.0
+    } else {
+        100.0 * completed as f64 / total as f64
+    }
+}
+
+struct ProgressLayout {
+    state_width: usize,
+    queue_width: usize,
+    scenario_width: usize,
+    repeat_width: usize,
+    mode_width: usize,
+    items_width: usize,
+    batch_width: usize,
+    thread_width: usize,
+    count_width: usize,
+    available_parallelism: usize,
+}
+
+impl ProgressLayout {
+    fn new<'a>(specs: impl IntoIterator<Item = &'a JobSpec>, available_parallelism: usize) -> Self {
+        let mut layout = Self {
+            state_width: "timed out".len(),
+            queue_width: "queue".len(),
+            scenario_width: 1,
+            repeat_width: 1,
+            mode_width: 1,
+            items_width: 1,
+            batch_width: "scalar".len(),
+            thread_width: 1,
+            count_width: 1,
+            available_parallelism,
+        };
+        let mut count = 0_usize;
+        for spec in specs {
+            count += 1;
+            layout.queue_width = layout.queue_width.max(spec.queue_label().len());
+            layout.scenario_width = layout.scenario_width.max(spec.scenario.name.len());
+            layout.repeat_width = layout.repeat_width.max(decimal_width(spec.repeat_index));
+            layout.mode_width = layout.mode_width.max(spec.mode.name().len());
+            layout.items_width = layout
+                .items_width
+                .max(spec.items_per_producer.to_string().len());
+            layout.batch_width = layout.batch_width.max(
+                spec.batch_size
+                    .map(|value| value.to_string().len())
+                    .unwrap_or("scalar".len()),
+            );
+            layout.thread_width = layout.thread_width.max(decimal_width(spec.thread_budget()));
+        }
+        layout.count_width = decimal_width(count);
+        layout.thread_width = layout
+            .thread_width
+            .max(decimal_width(available_parallelism));
+        layout
+    }
+
+    fn print_header(&self) {
+        progress_line(format!(
+            "scheduler: {:<state$} {:<queue$} | {:>8} | {:<scenario_col$} | {:<repeat_col$} | {:<mode_col$} | {:<items_col$} | {:<batch_col$} | {:<threads_col$} | {:<active_col$} | {:<pending_col$} | {:<completed_col$}",
+            "state",
+            "queue",
+            "progress",
+            "scenario",
+            "repeat",
+            "mode",
+            "items",
+            "batch",
+            "threads",
+            "active",
+            "pending",
+            "completed",
+            state = self.state_width,
+            queue = self.queue_width,
+            scenario_col = self.scenario_width + "scenario=".len(),
+            repeat_col = self.repeat_width + "repeat=".len(),
+            mode_col = self.mode_width + "mode=".len(),
+            items_col = self.items_width + "items=".len(),
+            batch_col = self.batch_width + "batch=".len(),
+            threads_col = self.thread_width + "threads=".len(),
+            active_col = self.thread_width * 2 + 1 + "active=".len(),
+            pending_col = self.count_width + "pending=".len(),
+            completed_col = self.count_width * 2 + 1 + "completed=".len(),
+        ));
+    }
+
+    fn print_row(
+        &self,
+        state: &str,
+        key: &SampleKey,
+        threads: usize,
+        active: usize,
+        pending: usize,
+        completed: usize,
+        total: usize,
+    ) {
+        let batch = key
+            .batch_size
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "scalar".to_string());
+        progress_line(format!(
+            "scheduler: {:<state$} {:<queue$} | {:>7.2}% | scenario={:<scenario$} | repeat={:>repeat$} | mode={:<mode$} | items={:>items$} | batch={:>batch$} | threads={:>threads$} | active={:>active_width$} | pending={:>pending_width$} | completed={:>completed_width$}",
+            state,
+            key.queue_label,
+            completion_percent(completed, total),
+            key.scenario,
+            key.repeat_index,
+            key.mode.name(),
+            key.items_per_producer,
+            batch,
+            threads,
+            format!(
+                "{:>width$}/{:<width$}",
+                active,
+                self.available_parallelism,
+                width = self.thread_width
+            ),
+            pending,
+            format!(
+                "{:>width$}/{:<width$}",
+                completed,
+                total,
+                width = self.count_width
+            ),
+            state = self.state_width,
+            queue = self.queue_width,
+            scenario = self.scenario_width,
+            repeat = self.repeat_width,
+            mode = self.mode_width,
+            items = self.items_width,
+            batch = self.batch_width,
+            threads = self.thread_width,
+            active_width = self.thread_width * 2 + 1,
+            pending_width = self.count_width,
+            completed_width = self.count_width * 2 + 1,
+        ));
+    }
 }
 
 fn ubq_type_expr(label: &UbqLabel, value_type: &str) -> String {
@@ -3805,6 +4202,9 @@ pub fn compute_frontier_round_plan(
         fastfifo_block_sizes: config.fastfifo_block_sizes.clone(),
         lfqueue_segment_sizes: config.lfqueue_segment_sizes.clone(),
         wcq_capacities: config.wcq_capacities.clone(),
+        ubq_grid: None,
+        ubq_batch_sizes: Vec::new(),
+        planned_repeats: config.repeats,
         bundles,
         reuse_existing: true,
     })
@@ -3999,6 +4399,7 @@ fn bundle_complete(
                     mode: *mode,
                     items_per_producer: items,
                     queue_label: baseline_label.clone(),
+                    batch_size: None,
                 };
                 if !index.records.contains_key(&key) {
                     return false;
@@ -4011,6 +4412,7 @@ fn bundle_complete(
                     mode: *mode,
                     items_per_producer: items,
                     queue_label: format!("ubq_{label}"),
+                    batch_size: None,
                 };
                 if !index.records.contains_key(&key) {
                     return false;
@@ -4052,6 +4454,7 @@ fn is_complete_coverage(
                         mode: *mode,
                         items_per_producer: items,
                         queue_label: baseline_label,
+                        batch_size: None,
                     };
                     if !index.records.contains_key(&key) {
                         return false;
@@ -4063,6 +4466,7 @@ fn is_complete_coverage(
                     mode: *mode,
                     items_per_producer: items,
                     queue_label: format!("ubq_{label}"),
+                    batch_size: None,
                 };
                 if !index.records.contains_key(&key) {
                     return false;
@@ -4100,6 +4504,7 @@ fn mean_ops(
             mode,
             items_per_producer,
             queue_label: lookup_label.clone(),
+            batch_size: None,
         };
         let record = index.records.get(&key)?;
         values.push(record.ops_per_sec?);
@@ -4122,11 +4527,47 @@ fn bench_throughput_for<Q: BenchQueue>(
     )
 }
 
+fn bench_throughput_batched_for<Q: BenchQueue>(
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    batch_size: usize,
+    core_offset: usize,
+) -> BenchRecord {
+    assert!(batch_size >= 2, "batch size must be >= 2");
+    bench_throughput_with_queue_variant(
+        Q::new_queue(),
+        queue_name,
+        scenario,
+        items_per_producer,
+        Some(batch_size),
+        core_offset,
+    )
+}
+
 fn bench_throughput_with_queue<Q: BenchQueueHandleFactory>(
     queue_handle: Arc<Q>,
     queue_name: &str,
     scenario: &ScenarioConfig,
     items_per_producer: u64,
+    core_offset: usize,
+) -> BenchRecord {
+    bench_throughput_with_queue_variant(
+        queue_handle,
+        queue_name,
+        scenario,
+        items_per_producer,
+        None,
+        core_offset,
+    )
+}
+
+fn bench_throughput_with_queue_variant<Q: BenchQueueHandleFactory>(
+    queue_handle: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    batch_size: Option<usize>,
     core_offset: usize,
 ) -> BenchRecord {
     let total_items = total_items(items_per_producer, scenario.producers);
@@ -4156,9 +4597,22 @@ fn bench_throughput_with_queue<Q: BenchQueueHandleFactory>(
             let base = (producer_id as u64)
                 .checked_mul(items_per_producer)
                 .expect("item count overflow");
-            for offset in 0..items_per_producer {
-                let value = base.checked_add(offset).expect("item count overflow");
-                queue_thread.send_value(value);
+            let end = base
+                .checked_add(items_per_producer)
+                .expect("item count overflow");
+            if let Some(batch_size) = batch_size {
+                let item_count =
+                    usize::try_from(items_per_producer).expect("batched item count must fit usize");
+                let mut first = 0_usize;
+                while first < item_count {
+                    let next = first.saturating_add(batch_size).min(item_count);
+                    queue_thread.send_batch(base, first..next);
+                    first = next;
+                }
+            } else {
+                for value in base..end {
+                    queue_thread.send_value(value);
+                }
             }
             let end_ns = start.elapsed().as_nanos() as u64;
             producer_max.fetch_max(end_ns, AtomicOrdering::Relaxed);
@@ -4228,6 +4682,7 @@ fn bench_throughput_with_queue<Q: BenchQueueHandleFactory>(
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::Throughput.name().to_string(),
+        batch_size,
         items_per_producer,
         total_items,
         consumed_items: consumed,
@@ -4489,6 +4944,7 @@ fn bench_app_log_mpsc_file_with_queue<Q: LogQueueHandleFactory>(
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::AppLogMpscFile.name().to_string(),
+        batch_size: None,
         items_per_producer,
         total_items,
         consumed_items: consumed,
@@ -4673,6 +5129,7 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::AppLogFanIn.name().to_string(),
+        batch_size: None,
         items_per_producer,
         total_items,
         consumed_items: consumed,
@@ -4861,6 +5318,7 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::AppPipeline.name().to_string(),
+        batch_size: None,
         items_per_producer,
         total_items,
         consumed_items: consumed,
@@ -5026,6 +5484,7 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::AppTaskRoundtrip.name().to_string(),
+        batch_size: None,
         items_per_producer,
         total_items,
         consumed_items: consumed,
@@ -5183,6 +5642,7 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::ComplexThroughput.name().to_string(),
+        batch_size: None,
         items_per_producer,
         total_items,
         consumed_items: consumed,
@@ -5339,6 +5799,7 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::DataLatency.name().to_string(),
+        batch_size: None,
         items_per_producer,
         total_items,
         consumed_items: consumed,
@@ -5491,6 +5952,7 @@ fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::Fairness.name().to_string(),
+        batch_size: None,
         items_per_producer,
         total_items,
         consumed_items: consumed,
@@ -5553,6 +6015,7 @@ fn bench_fill_drain_with_queue<Q: BenchQueueHandleFactory>(
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::FillDrain.name().to_string(),
+        batch_size: None,
         items_per_producer,
         total_items,
         consumed_items: consumed,
@@ -5612,6 +6075,7 @@ fn failed_bench_record(
     BenchRecord {
         queue: record_queue_name_for_spec(spec),
         mode: spec.mode.name().to_string(),
+        batch_size: spec.batch_size,
         items_per_producer: spec.items_per_producer,
         total_items: total_items(spec.items_per_producer, spec.scenario.producers),
         consumed_items: 0,
@@ -5658,6 +6122,7 @@ fn failed_runtime_bench_record(
     BenchRecord {
         queue: queue_name.to_string(),
         mode: mode.name().to_string(),
+        batch_size: None,
         items_per_producer,
         total_items: total_items(items_per_producer, scenario.producers),
         consumed_items: 0,
@@ -5903,13 +6368,13 @@ pub fn detect_available_parallelism() -> Result<usize, String> {
 ///
 /// This replaces the old two-process approach (`build_and_run_matrix_plan`) that
 /// generated a temporary Cargo project and compiled it at runtime.  All UBQ
-/// configurations are now monomorphised once at build time; each frontier-search round
-/// dispatches directly into the pre-compiled functions with no subprocess overhead.
+/// configurations are monomorphised once at build time, so grid and direct-matrix
+/// plans dispatch through precompiled functions with no subprocess overhead.
 ///
 /// Panics inside individual benchmark jobs are caught via
 /// `tokio::task::spawn_blocking` join errors and reported as a [`BatchOutcome`]
 /// with `exit_success = false` and the crashing job identified, matching the
-/// contract expected by [`frontier_search`].
+/// contract expected by the benchmark runners.
 pub fn run_matrix_plan_in_process(
     plan: &MatrixPlan,
     dry_run: bool,
@@ -6031,6 +6496,7 @@ pub fn run_matrix_plan_in_process(
                     spec.repeat_index,
                     spec.mode,
                     spec.items_per_producer,
+                    spec.batch_size,
                 )
                 .ok_or_else(|| {
                     format!(
@@ -6073,7 +6539,9 @@ pub fn run_matrix_plan_in_process(
 }
 
 // Static UBQ registry — generated by build.rs.
-// Defines: fn lookup_ubq_job_factory(label, scenario, repeat_index, mode, items_per_producer)
+// Defines: fn lookup_ubq_job_factory(
+//     label, scenario, repeat_index, mode, items_per_producer, batch_size,
+// )
 //          -> Option<JobFactory>
 include!(concat!(env!("OUT_DIR"), "/bench_registry.rs"));
 
@@ -6085,6 +6553,7 @@ mod tests {
         BenchRecord {
             queue: queue.to_string(),
             mode: mode.name().to_string(),
+            batch_size: None,
             items_per_producer,
             total_items: items_per_producer,
             consumed_items: items_per_producer,
@@ -6105,6 +6574,165 @@ mod tests {
             failure_reason: None,
             timeout_ns: None,
         }
+    }
+
+    #[test]
+    fn sparse_and_dense_grids_have_the_approved_dimensions() {
+        let sparse = UbqGrid::Sparse.labels();
+        let dense = UbqGrid::Dense.labels();
+
+        assert_eq!(sparse.len(), 40);
+        assert_eq!(dense.len(), 128);
+        assert!(sparse.contains(&"balanced,0,31,crossbeam".to_string()));
+        assert!(sparse.contains(&"balanced,64,4095,yield".to_string()));
+        assert!(!sparse.contains(&"balanced,2,63,crossbeam".to_string()));
+        assert!(dense.contains(&"balanced,2,63,crossbeam".to_string()));
+    }
+
+    #[test]
+    fn grid_plan_adds_every_batch_size_only_to_ubq_throughput() {
+        let plan = build_grid_matrix_plan(
+            "local",
+            PathBuf::from("runs"),
+            2,
+            &[
+                QueueKind::Ubq,
+                QueueKind::SegQueue,
+                QueueKind::ConcurrentQueue,
+            ],
+            UbqGrid::Sparse,
+            &DEFAULT_UBQ_BATCH_SIZES,
+            &[],
+            &[],
+            &[],
+            &[ScenarioConfig::new(1, 1)],
+            &[Mode::Throughput],
+            &[10],
+            1,
+            true,
+        )
+        .expect("grid plan");
+        let specs = required_job_specs(&plan);
+
+        assert_eq!(
+            plan.bundles
+                .iter()
+                .filter(|bundle| bundle.ubq_label.is_some())
+                .count(),
+            40
+        );
+        assert_eq!(
+            plan.bundles
+                .iter()
+                .filter(|bundle| bundle.ubq_label.is_none())
+                .count(),
+            1
+        );
+        assert_eq!(specs.len(), 482);
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.queue == QueueKind::Ubq && spec.batch_size.is_none())
+                .count(),
+            40
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.queue == QueueKind::Ubq && spec.batch_size.is_some())
+                .count(),
+            440
+        );
+        assert!(
+            specs
+                .iter()
+                .filter(|spec| spec.queue.is_baseline())
+                .all(|spec| spec.batch_size.is_none())
+        );
+        let baseline_bundle = plan
+            .bundles
+            .iter()
+            .find(|bundle| bundle.ubq_label.is_none())
+            .expect("baseline bundle");
+        assert_eq!(expected_keys_for_bundle(&plan, baseline_bundle).len(), 2);
+        let ubq_bundle = plan
+            .bundles
+            .iter()
+            .find(|bundle| bundle.ubq_label.is_some())
+            .expect("UBQ bundle");
+        let ubq_keys = expected_keys_for_bundle(&plan, ubq_bundle);
+        assert_eq!(ubq_keys.len(), 12);
+        assert!(
+            ubq_keys
+                .iter()
+                .all(|key| key.queue_label.starts_with("ubq_"))
+        );
+    }
+
+    #[test]
+    fn scenario_constraints_reduce_the_grid_before_counting_jobs() {
+        let plan = build_grid_matrix_plan(
+            "local",
+            PathBuf::from("runs"),
+            65,
+            &[QueueKind::Ubq],
+            UbqGrid::Sparse,
+            &DEFAULT_UBQ_BATCH_SIZES,
+            &[],
+            &[],
+            &[],
+            &[ScenarioConfig::new(64, 1)],
+            &[Mode::Throughput],
+            &[10],
+            1,
+            true,
+        )
+        .expect("grid plan");
+
+        assert_eq!(plan.bundles.len(), 32);
+        assert_eq!(required_job_specs(&plan).len(), 384);
+    }
+
+    #[test]
+    fn batched_throughput_job_preserves_values_and_records_its_batch_size() {
+        type Queue = ConfiguredUBQ<u64, backoff::Crossbeam, 1, 31, align::A64>;
+        let record =
+            bench_throughput_batched_for::<Queue>("ubq", &ScenarioConfig::new(1, 1), 257, 16, 0);
+
+        assert_eq!(record.status, BenchRecordStatus::Completed);
+        assert_eq!(record.batch_size, Some(16));
+        assert_eq!(record.total_items, 257);
+        assert_eq!(record.consumed_items, 257);
+    }
+
+    #[test]
+    fn completion_percentage_includes_cached_jobs() {
+        assert_eq!(completion_percent(0, 480), 0.0);
+        assert_eq!(completion_percent(120, 480), 25.0);
+        assert_eq!(completion_percent(480, 480), 100.0);
+    }
+
+    #[test]
+    fn scalar_and_batched_samples_have_distinct_cache_keys() {
+        let scalar = JobSpec {
+            scenario: ScenarioConfig::new(1, 1),
+            repeat_index: 1,
+            mode: Mode::Throughput,
+            items_per_producer: 10,
+            queue: QueueKind::Ubq,
+            ubq_label: Some("balanced,1,31,crossbeam".to_string()),
+            batch_size: None,
+            fastfifo_block_size: None,
+            lfqueue_segment_size: None,
+            wcq_capacity: None,
+        };
+        let batched = JobSpec {
+            batch_size: Some(16),
+            ..scalar.clone()
+        };
+
+        assert_ne!(SampleKey::from_job(&scalar), SampleKey::from_job(&batched));
+        assert_eq!(scalar.queue_label(), batched.queue_label());
     }
 
     #[test]
@@ -6488,10 +7116,16 @@ mod tests {
                 available_parallelism: 2,
                 ubq_label: None,
                 ubq_block_size: None,
+                ubq_grid: None,
+                expected_ubq_configurations: None,
+                ubq_batch_sizes: Vec::new(),
+                planned_repeats: None,
+                planned_items_per_producer: Vec::new(),
             },
             results: vec![BenchRecord {
                 queue: "segqueue".to_string(),
                 mode: "throughput".to_string(),
+                batch_size: None,
                 items_per_producer: 1,
                 total_items: 1,
                 consumed_items: 1,
@@ -6536,6 +7170,9 @@ mod tests {
             fastfifo_block_sizes: Vec::new(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
+            ubq_grid: None,
+            ubq_batch_sizes: Vec::new(),
+            planned_repeats: 1,
             bundles: vec![PlanBundle {
                 scenario: ScenarioConfig::new(1, 1),
                 repeat_index: 1,
@@ -6552,6 +7189,7 @@ mod tests {
             mode: Mode::Throughput,
             items_per_producer: 1,
             queue_label: "segqueue".to_string(),
+            batch_size: None,
         };
 
         let writer =
@@ -6576,7 +7214,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_job_factories_writes_cached_bundles_without_pending_jobs() {
+    fn execute_job_factories_does_not_duplicate_cached_bundles() {
         let root =
             std::env::temp_dir().join(format!("ubq_cached_bundle_test_{}", now_unix_nanos()));
         let runs_dir = root.join("runs");
@@ -6592,6 +7230,9 @@ mod tests {
             fastfifo_block_sizes: Vec::new(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
+            ubq_grid: None,
+            ubq_batch_sizes: Vec::new(),
+            planned_repeats: 1,
             bundles: vec![PlanBundle {
                 scenario: scenario.clone(),
                 repeat_index: 1,
@@ -6608,6 +7249,7 @@ mod tests {
             mode: Mode::Throughput,
             items_per_producer: 1,
             queue_label: "segqueue".to_string(),
+            batch_size: None,
         };
         let concurrent_key = SampleKey {
             scenario: scenario.name.clone(),
@@ -6615,6 +7257,7 @@ mod tests {
             mode: Mode::Throughput,
             items_per_producer: 1,
             queue_label: "concurrent-queue".to_string(),
+            batch_size: None,
         };
         let mut cache = ExistingRunsIndex::default();
         cache.records.insert(
@@ -6631,9 +7274,12 @@ mod tests {
         assert!(executed.is_empty());
         assert!(crashed.is_none());
 
-        let loaded = load_existing_runs(&runs_dir, "local").expect("load");
-        assert!(loaded.records.contains_key(&segqueue_key));
-        assert!(loaded.records.contains_key(&concurrent_key));
+        let mut files = Vec::new();
+        collect_run_jsons_recursive(&runs_dir, &mut files).expect("scan runs");
+        assert!(
+            files.is_empty(),
+            "a no-op resume must not rewrite cached samples"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -6655,6 +7301,9 @@ mod tests {
             fastfifo_block_sizes: Vec::new(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
+            ubq_grid: None,
+            ubq_batch_sizes: Vec::new(),
+            planned_repeats: 1,
             bundles: vec![
                 PlanBundle {
                     scenario: scenario.clone(),
@@ -6689,6 +7338,7 @@ mod tests {
                     items_per_producer: 1,
                     queue: QueueKind::Ubq,
                     ubq_label: Some(ubq_label.clone()),
+                    batch_size: None,
                     fastfifo_block_size: None,
                     lfqueue_segment_size: None,
                     wcq_capacity: None,
@@ -6750,6 +7400,9 @@ mod tests {
             fastfifo_block_sizes: Vec::new(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
+            ubq_grid: None,
+            ubq_batch_sizes: Vec::new(),
+            planned_repeats: 1,
             bundles: vec![PlanBundle {
                 scenario: scenario.clone(),
                 repeat_index: 1,
@@ -6767,6 +7420,7 @@ mod tests {
             items_per_producer: 1,
             queue: QueueKind::SegQueue,
             ubq_label: None,
+            batch_size: None,
             fastfifo_block_size: None,
             lfqueue_segment_size: None,
             wcq_capacity: None,
@@ -6817,14 +7471,11 @@ mod tests {
         );
 
         let loaded = load_existing_runs(&runs_dir, "local").expect("load");
-        assert_eq!(
-            loaded
-                .records
-                .get(&slow_key)
-                .expect("persisted timeout")
-                .status,
-            BenchRecordStatus::TimedOut
+        assert!(
+            !loaded.records.contains_key(&slow_key),
+            "timed-out jobs must remain eligible for retry after resume"
         );
+        assert!(loaded.records.contains_key(&fast_key));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -6863,10 +7514,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "segqueue".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "segqueue".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -6895,10 +7548,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "concurrent-queue".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "concurrent-queue".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -6927,10 +7582,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "ubq_balanced,8,127,crossbeam".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "ubq".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -6993,10 +7650,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "segqueue".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "segqueue".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7025,10 +7684,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "concurrent-queue".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "concurrent-queue".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7057,10 +7718,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "ubq_balanced,8,127,crossbeam".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "ubq".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7118,6 +7781,7 @@ mod tests {
                     mode,
                     items_per_producer: 1,
                     queue_label: "segqueue".to_string(),
+                    batch_size: None,
                 },
                 test_record("segqueue", mode, 1),
             );
@@ -7128,6 +7792,7 @@ mod tests {
                     mode,
                     items_per_producer: 1,
                     queue_label: "ubq_balanced,8,127,crossbeam".to_string(),
+                    batch_size: None,
                 },
                 test_record("ubq", mode, 1),
             );
@@ -7139,6 +7804,7 @@ mod tests {
                 mode: Mode::FillDrain,
                 items_per_producer: 1,
                 queue_label: "wcq_4096".to_string(),
+                batch_size: None,
             },
             test_record("wcq", Mode::FillDrain, 1),
         );
@@ -7187,10 +7853,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "segqueue".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "segqueue".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7219,10 +7887,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "concurrent-queue".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "concurrent-queue".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7251,10 +7921,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: format!("ubq_{weaker_label}"),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "ubq".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7283,10 +7955,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: format!("ubq_{best_label}"),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "ubq".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7377,10 +8051,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "segqueue".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "segqueue".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7409,10 +8085,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "concurrent-queue".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "concurrent-queue".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7441,10 +8119,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: format!("ubq_{winning_label}"),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "ubq".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7512,10 +8192,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "segqueue".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "segqueue".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7544,10 +8226,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: "concurrent-queue".to_string(),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "concurrent-queue".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7576,10 +8260,12 @@ mod tests {
                     mode: Mode::Throughput,
                     items_per_producer: 1,
                     queue_label: format!("ubq_{winning_label}"),
+                    batch_size: None,
                 },
                 BenchRecord {
                     queue: "ubq".to_string(),
                     mode: "throughput".to_string(),
+                    batch_size: None,
                     items_per_producer: 1,
                     total_items: 1,
                     consumed_items: 1,
@@ -7633,6 +8319,7 @@ mod tests {
             items_per_producer: 1,
             queue: QueueKind::SegQueue,
             ubq_label: None,
+            batch_size: None,
             fastfifo_block_size: None,
             lfqueue_segment_size: None,
             wcq_capacity: None,
@@ -7644,6 +8331,7 @@ mod tests {
             items_per_producer: 1,
             queue: QueueKind::Ubq,
             ubq_label: Some("balanced,1,31,crossbeam".to_string()),
+            batch_size: None,
             fastfifo_block_size: None,
             lfqueue_segment_size: None,
             wcq_capacity: None,

@@ -14,7 +14,6 @@ scenarios = [
   "8p8c",
   "64p64c",
 ]
-ubq_labels = ["balanced,8,127,crossbeam"]
 
 [machines.hebrides]
 host = "hebrides"

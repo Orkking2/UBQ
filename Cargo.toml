@@ -49,14 +49,14 @@ bench_fastfifo = ["bench_tools", "dep:rbbq"]
 bench_rbbq = ["bench_fastfifo"]
 bench_lfqueue = ["bench_tools", "dep:lfqueue"]
 bench_wcq = ["bench_tools", "dep:wcq"]
-# Compile the full static UBQ variant registry (928 monomorphizations).
-# Required for bench_frontier and bench_matrix to run in-process.
+# Compile the full static UBQ variant registry.
+# Required for bench_grid and bench_matrix to run in-process.
 bench_registry = ["bench_tools"]
 
 [[bin]]
-name = "bench_frontier"
-path = "src/bin/bench_frontier.rs"
-required-features = ["bench_tools"]
+name = "bench_grid"
+path = "src/bin/bench_grid.rs"
+required-features = ["bench_registry"]
 
 [[bin]]
 name = "bench_matrix"

@@ -37,7 +37,7 @@ multi-threaded scenarios to run.
 
 Interpretation: the fixed preview label `balanced,8,127,crossbeam` is enough to
 show a fan-out win, but it is not the tuned high-contention label. Use the BSC
-frontier run below for real claims.
+sparse-grid run below for real claims.
 
 I also attempted:
 
@@ -62,7 +62,7 @@ cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --config bench_fleet_preview.toml \
   --machines local \
   --plot-partial \
-  --frontier-arg=--parallelism=$(nproc)
+  --grid-arg=--parallelism=$(nproc)
 ```
 
 For hebrides:
@@ -78,7 +78,7 @@ If hebrides reports too little available parallelism, add the same forwarded
 argument:
 
 ```bash
---frontier-arg=--parallelism=<hardware-thread-count>
+--grid-arg=--parallelism=<hardware-thread-count>
 ```
 
 Preview output locations:
@@ -96,14 +96,15 @@ cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --machines bsc-cns \
   --repeats 3 \
   --plot-partial \
-  --frontier-arg=--parallelism=$(nproc)
+  --grid-arg=--parallelism=$(nproc)
 ```
 
 This uses:
 
 - all 49 producer/consumer grid points from 1 to 64 threads,
 - `throughput`, `complex_throughput`, `data_latency`, and `fairness`,
-- UBQ frontier expansion seeded at `balanced,8,127,crossbeam`,
+- the 40-configuration sparse UBQ grid, including scalar and all configured
+  `push_batch` sizes for throughput,
 - SegQueue, concurrent-queue, RBBQ/BBQ, LSCQ, and wCQ baselines,
 - three repeats for the paper run.
 
@@ -114,7 +115,7 @@ cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --config bench_fleet_preview.toml \
   --machines bsc-cns \
   --plot-partial \
-  --frontier-arg=--parallelism=$(nproc)
+  --grid-arg=--parallelism=$(nproc)
 ```
 
 ## Paper Figures From BSC-CNS Results

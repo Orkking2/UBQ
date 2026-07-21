@@ -101,19 +101,29 @@ The Rust benchmark harness and binaries are isolated behind the `bench_tools`
 feature. Benchmark-specific features such as `bench_registry`, `bench_rbbq`,
 `bench_lfqueue`, and `bench_wcq` enable it automatically.
 
-The v2 harness has two layers:
+The schema-v3 harness has two execution paths:
 
 - `bench_matrix`: direct matrix execution. It dispatches through the
-  precompiled benchmark registry and writes v2 JSON files under
+  precompiled benchmark registry and writes schema-v3 JSON files under
   `bench_results/runs`.
-- `bench_frontier`: higher-level frontier search. It inspects existing v2 runs,
-  expands the UBQ search graph scenario-by-scenario, and submits missing work to
-  `bench_matrix`. RBBQ/BBQ uses a fixed block-size grid rather than adaptive
-  frontier expansion.
-  A run is `frontier-complete` when no pending frontier bundles remain; the
-  frontier expands around the best fully-covered UBQ label per
-  scenario/metric, including the matching `pool=0` no-pool variant, while
-  propagating baseline-beating fully-covered winners across scenarios.
+- `bench_grid`: reproducible UBQ grid execution. Its default sparse grid is
+  `pool=[0,1,8,64]` × `block=[31,127,511,2047,4095]` × both backoffs (40
+  configurations). `-d` selects the dense grid containing all 8 pool values ×
+  all 8 block values × both backoffs (128 configurations). Configurations whose
+  block is smaller than a scenario's producer count are excluded before jobs
+  are counted.
+
+For throughput, every UBQ configuration measures scalar `push` and
+`push_batch` at batch sizes `2,4,8,16,32,64,128,256,512,1024,2048`. Thus an
+unconstrained scenario has 480 sparse or 1,536 dense UBQ throughput jobs per
+repeat; selected baseline queues are measured once rather than once per UBQ
+configuration. Other benchmark modes remain scalar.
+
+`bench_grid` reuses successful schema-v3 samples by default, writes each
+completed job through an atomic checkpoint, and retries failed or timed-out
+jobs after an interruption. `--rerun` ignores existing samples. Its stdout is a
+fixed-width job table with the queue, scenario, mode, batch size, thread use,
+pending count, and percentage of the complete plan.
 
 UBQ labels are 4-part identifiers:
 
@@ -186,19 +196,21 @@ cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue --bin ben
   --repeats 3
 ```
 
-Run the frontier search on one machine:
+Run the sparse grid on one machine:
 
 ```bash
-cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_frontier -- \
+cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_grid -- \
   --machine-label local \
   --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
-  --seed-label balanced,8,127,crossbeam \
   --rbbq-block-sizes 64,256,1024,4096 \
   --lfqueue-segment-sizes 32,256,1024 \
   --wcq-capacities 4096,65536,1048576
 ```
 
-Run the configured fleet search:
+Add `-d` for the dense grid or `--rerun` to benchmark every job without using
+compatible existing results.
+
+Run the configured fleet grid:
 
 ```bash
 cargo run --release --features bench_tools --bin full_bench_fleet -- \
@@ -206,10 +218,19 @@ cargo run --release --features bench_tools --bin full_bench_fleet -- \
   --repeats 3
 ```
 
-`full_bench_fleet` now runs `bench_frontier` per machine, syncs
+`full_bench_fleet` runs `bench_grid` per machine with the sparse grid by
+default. Its own `-d` flag selects the dense grid, and `--rerun` is forwarded
+to each machine. The typed TOML alternative is `ubq_grid = "dense"` under
+`[defaults]`. It syncs
 `bench_results/runs`, and refreshes plots under `bench_results/plots`.
 `--repeats` overrides the `defaults.repeats` value from `bench_fleet.toml`.
 Python is only needed for the plotting helpers.
+
+Throughput plots retain every measured configuration and batch size in their
+per-scenario CSV while displaying the best scalar UBQ configuration and the
+best configuration/batch-size pair as distinct series. A green badge reports
+that the declared grid is exhausted; a red badge reports incomplete or legacy
+coverage while the plotted winners remain the best measurements present.
 
 Set up a minimal plotting environment:
 

@@ -42,7 +42,6 @@ scenarios = [
   "64p32c",
   "64p16c",
 ]
-ubq_labels = ["balanced,8,127,crossbeam"]
 
 [machines.local]
 local = true

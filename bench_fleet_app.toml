@@ -13,7 +13,6 @@ repeats = 3
 fastfifo_block_sizes = [64, 256, 1024, 4096]
 lfqueue_segment_sizes = [32, 256, 1024]
 scenarios = ["1p1c", "4p1c", "1p4c", "4p4c", "8p8c", "16p16c"]
-ubq_labels = ["balanced,8,127,crossbeam"]
 
 [machines.local]
 local = true

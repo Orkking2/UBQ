@@ -9,7 +9,7 @@ use ubq::UBQ;
 
 const DEFAULT_ITEMS: usize = 1_000_000;
 const DEFAULT_SAMPLES: usize = 7;
-const BATCH_SIZES: &[usize] = &[2, 4, 8, 16, 32, 64, 256, 2_048];
+const BATCH_SIZES: &[usize] = &[2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048];
 
 #[derive(Clone, Copy)]
 enum PushMode {
