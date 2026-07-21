@@ -306,7 +306,8 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
             for i in 0..new_blocks {
                 if i != new_blocks - 1 {
                     unsafe {
-                        blocks.get_unchecked(i)
+                        blocks
+                            .get_unchecked(i)
                             .next
                             .as_ptr()
                             .write(ref_to_mut_ptr(&blocks.get_unchecked(i + 1)))
@@ -314,20 +315,26 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
                 }
             }
 
+            let first_block = ref_to_mut_ptr(unsafe { &**blocks.get_unchecked(0) });
+            let last_block = ref_to_mut_ptr(unsafe { &**blocks.get_unchecked(new_blocks - 1) });
+
+            // The linked blocks are now queue-owned. Consuming the boxed slice
+            // drops any unused preallocated blocks.
+            for block in blocks.into_iter().take(new_blocks) {
+                let _ = Box::into_raw(block);
+            }
+
             unsafe {
-                (*phead.block)
-                    .next
-                    .store(ref_to_mut_ptr(&blocks.get_unchecked(0)), Release);
+                (*phead.block).next.store(first_block, Release);
             }
             self.phead.store(
                 Head {
-                    index: todo!(), // This should be past where we are going to push our values.
-                    block: ref_to_mut_ptr(unsafe { &blocks.get_unchecked(new_blocks - 1) }),
+                    index: (len - (BLOCK_SIZE - phead.index)) % BLOCK_SIZE,
+                    block: last_block,
                 }
                 .pack(),
                 Release,
             )
-            // TODO: Make sure the newly linked blocks don't get dropped, and the rest get put into the pool or freed.
         }
 
         // At this point we are guaranteed to have `len` slots available, whether that be in the current block
@@ -337,14 +344,16 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
                 "ExactSizeIterator gave len == {len}, but only produced {i} items"
             ));
 
+            let slot = unsafe { (*phead.block).slots.get_unchecked(phead.index) };
+
+            phead.index += 1;
+
             if phead.index == BLOCK_SIZE {
                 phead = Head {
                     index: 0,
                     block: unsafe { (*phead.block).next.as_ptr().read() }, // next is guaranteed to not change until the block is freed
                 }
             }
-
-            let slot = unsafe { (*phead.block).slots.get_unchecked(phead.index) };
 
             unsafe { slot.value.get().write(MaybeUninit::new(item)) };
             slot.state.store(WRITE, Release);
