@@ -5,12 +5,16 @@ use crate::{
 };
 use alloc::{boxed::Box, sync::Arc};
 use core::{
-    array, fmt,
+    array, fmt, iter,
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::DerefMut,
     ptr::{null_mut, with_exposed_provenance_mut},
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence},
+    sync::atomic::{
+        AtomicPtr, AtomicUsize,
+        Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
+        fence,
+    },
 };
 use crossbeam_utils::CachePadded;
 
@@ -62,13 +66,18 @@ pub struct ConfiguredUBQ<
 }
 
 struct Head<T, const BLOCK_SIZE: usize, A> {
-    block: *mut Block<T, BLOCK_SIZE, A>,
     index: usize,
+    block: *mut Block<T, BLOCK_SIZE, A>,
 }
 
 #[inline]
 fn drop_spare_block<T, const BLOCK_SIZE: usize, A>(block: *mut Block<T, BLOCK_SIZE, A>) {
     let _ = unsafe { Box::from_raw(block.cast::<ManuallyDrop<Block<T, BLOCK_SIZE, A>>>()) };
+}
+
+#[inline]
+fn ref_to_mut_ptr<T>(r: &T) -> *mut T {
+    r as *const T as *mut T
 }
 
 impl<T, const BLOCK: usize, A> Copy for Head<T, BLOCK, A> {}
@@ -135,11 +144,19 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
     #[inline]
     fn release_block(&self, block: *mut Block<T, BLOCK_SIZE, A>) {
         if !self.pool.iter().any(|slot| {
-            slot.compare_exchange(null_mut(), block, Ordering::Release, Ordering::Relaxed)
+            slot.compare_exchange(null_mut(), block, Release, Relaxed)
                 .is_ok()
         }) {
             drop_spare_block(block);
         }
+    }
+
+    fn acquire_phead(&self) -> Head<T, BLOCK_SIZE, A> {
+        Head::new(self.phead.load(Acquire))
+    }
+
+    fn acquire_chead(&self) -> Head<T, BLOCK_SIZE, A> {
+        Head::new(self.chead.load(Acquire))
     }
 
     /// Creates a new, empty queue.
@@ -169,12 +186,12 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
     pub fn is_empty(&self) -> bool {
         let () = Self::LAYOUT_CHECKS;
 
-        let chead = self.chead.load(Ordering::Acquire);
+        let chead = self.chead.load(Acquire);
         if chead == 0 {
             return true;
         }
 
-        let phead = self.phead.load(Ordering::Acquire);
+        let phead = self.phead.load(Acquire);
         let mask = Head::<T, BLOCK_SIZE, A>::mask();
 
         if (chead & !mask) != (phead & !mask) {
@@ -182,6 +199,156 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         }
 
         ((chead & mask) >> 1) >= (phead & mask)
+    }
+
+    /// Pushes an exact number of items onto the back of the queue.
+    ///
+    /// This push is "atomic": every item will be placed in order without gaps.
+    #[doc(alias = "enqueue_batch")]
+    #[doc(alias = "send_batch")]
+    pub fn push_batch<I>(&self, items: I)
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        // Key insight:
+        // We either reserve the entirety of this block (giving us exclusive
+        // access to construct subsequent blocks) or we do not fill the entire block.
+
+        let () = Self::LAYOUT_CHECKS;
+
+        let mut items = items.into_iter();
+        let len = items.len();
+
+        if len == 0 {
+            return;
+        } else if len == 1 {
+            return self.push(
+                items
+                    .next()
+                    .expect("ExactSizeIterator gave len == 1, but no items were supplied"),
+            );
+        }
+
+        // There exists a minimum number of blocks needed to fit all items.
+        // Note: A completely full block must link a new empty one.
+        let min_blocks = 1 + len / BLOCK_SIZE;
+        // Preallocate all the blocks we will (potentially) need.
+        // Worst case we have to allocate and free one block erroneously.
+        let blocks = iter::repeat_with(Block::new_zeroed)
+            .take(min_blocks)
+            .collect::<Box<_>>();
+
+        let backoff = B::new();
+        let mut phead = Head::new(0);
+        let mut next_block = None;
+
+        if self.phead.load(Acquire) == 0 {
+            let ptr = Box::into_raw(Block::new_zeroed());
+
+            match self.phead.compare_exchange(
+                0,
+                ptr.expose_provenance() + BLOCK_SIZE.min(len),
+                Release,
+                Relaxed,
+            ) {
+                Ok(_) => {
+                    self.chead.store(ptr.expose_provenance(), Release);
+                    phead = Head {
+                        index: 0,
+                        block: ptr,
+                    }
+                }
+                Err(_) => next_block = Some(unsafe { Box::from_raw(ptr) }),
+            }
+        }
+
+        if phead.is_zero() {
+            phead = self.acquire_phead();
+
+            loop {
+                if phead.index >= BLOCK_SIZE {
+                    backoff.snooze();
+                    phead = self.acquire_phead();
+                    continue;
+                }
+
+                if next_block.is_none()
+                    && phead.index + 1 == BLOCK_SIZE
+                    && self.pool.iter().all(|b| b.load(Relaxed).is_null())
+                {
+                    next_block = Some(Block::new_zeroed());
+                }
+
+                match self.phead.compare_exchange_weak(
+                    phead.pack(),
+                    Head {
+                        index: BLOCK_SIZE.min(phead.index + len),
+                        block: phead.block,
+                    }
+                    .pack(),
+                    SeqCst,
+                    Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(real) => phead = Head::new(real),
+                }
+            }
+        }
+
+        // We are responsible for the subsequent block linkage.
+        if BLOCK_SIZE.min(phead.index + len) == BLOCK_SIZE {
+            // Let us construct here the full linkage of blocks.
+            let new_blocks = 1 + (len - (BLOCK_SIZE - phead.index)) / BLOCK_SIZE;
+
+            debug_assert!(new_blocks <= blocks.len());
+
+            for i in 0..new_blocks {
+                if i != new_blocks - 1 {
+                    unsafe {
+                        blocks.get_unchecked(i)
+                            .next
+                            .as_ptr()
+                            .write(ref_to_mut_ptr(&blocks.get_unchecked(i + 1)))
+                    }
+                }
+            }
+
+            unsafe {
+                (*phead.block)
+                    .next
+                    .store(ref_to_mut_ptr(&blocks.get_unchecked(0)), Release);
+            }
+            self.phead.store(
+                Head {
+                    index: todo!(), // This should be past where we are going to push our values.
+                    block: ref_to_mut_ptr(unsafe { &blocks.get_unchecked(new_blocks - 1) }),
+                }
+                .pack(),
+                Release,
+            )
+            // TODO: Make sure the newly linked blocks don't get dropped, and the rest get put into the pool or freed.
+        }
+
+        // At this point we are guaranteed to have `len` slots available, whether that be in the current block
+        // or if that overflows into the subsequent blocks we have just allocated. These are all ours.
+        for i in 0..len {
+            let item = items.next().expect(&format!(
+                "ExactSizeIterator gave len == {len}, but only produced {i} items"
+            ));
+
+            if phead.index == BLOCK_SIZE {
+                phead = Head {
+                    index: 0,
+                    block: unsafe { (*phead.block).next.as_ptr().read() }, // next is guaranteed to not change until the block is freed
+                }
+            }
+
+            let slot = unsafe { (*phead.block).slots.get_unchecked(phead.index) };
+
+            unsafe { slot.value.get().write(MaybeUninit::new(item)) };
+            slot.state.store(WRITE, Release);
+        }
     }
 
     /// Pushes `e` onto the back of the queue.
@@ -204,17 +371,15 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         let mut next_block = None;
 
         // This is the only time the ptr part of phead is invalid.
-        if self.phead.load(Ordering::Acquire) == 0 {
+        if self.phead.load(Acquire) == 0 {
             let ptr = Box::into_raw(Block::new_zeroed());
 
-            match self.phead.compare_exchange(
-                0,
-                ptr.expose_provenance() + 1,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .phead
+                .compare_exchange(0, ptr.expose_provenance() + 1, Release, Relaxed)
+            {
                 Ok(_) => {
-                    self.chead.store(ptr.expose_provenance(), Ordering::Release);
+                    self.chead.store(ptr.expose_provenance(), Release);
                     phead = Head {
                         index: 0,
                         block: ptr,
@@ -225,27 +390,23 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         }
 
         if phead.is_zero() {
-            phead = Head::new(self.phead.load(Ordering::Acquire));
+            phead = self.acquire_phead();
 
             loop {
                 if phead.index >= BLOCK_SIZE {
                     backoff.snooze();
-
-                    phead = Head::new(self.phead.load(Ordering::Acquire));
+                    phead = self.acquire_phead();
                     continue;
                 }
 
                 if next_block.is_none()
                     && phead.index + 1 == BLOCK_SIZE
-                    && self
-                        .pool
-                        .iter()
-                        .all(|b| b.load(Ordering::Relaxed).is_null())
+                    && self.pool.iter().all(|b| b.load(Relaxed).is_null())
                 {
                     next_block = Some(Block::<T, BLOCK_SIZE, A>::new_zeroed());
                 }
 
-                phead = Head::new(self.phead.fetch_add(1, Ordering::SeqCst));
+                phead = Head::new(self.phead.fetch_add(1, SeqCst));
 
                 if phead.index < BLOCK_SIZE {
                     break;
@@ -263,13 +424,13 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
                 .or_else(|| {
                     self.pool
                         .iter()
-                        .find(|slot| !slot.load(Ordering::Relaxed).is_null())
-                        .map(|slot| slot.swap(null_mut(), Ordering::AcqRel))
+                        .find(|slot| !slot.load(Relaxed).is_null())
+                        .map(|slot| slot.swap(null_mut(), AcqRel))
                 })
                 .unwrap_or_else(|| Box::into_raw(Block::new_zeroed()));
 
-            unsafe { (*phead.block).next.store(new, Ordering::Release) };
-            self.phead.store(new.expose_provenance(), Ordering::Release);
+            unsafe { (*phead.block).next.store(new, Release) };
+            self.phead.store(new.expose_provenance(), Release);
         }
 
         let slot = unsafe { (*phead.block).slots.get_unchecked(phead.index) };
@@ -282,7 +443,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
             SKIP
         };
 
-        slot.state.store(state, Ordering::Release);
+        slot.state.store(state, Release);
 
         if let Some(block) = next_block {
             self.release_block(Box::into_raw(block))
@@ -297,24 +458,24 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
 
         let backoff = B::new();
 
-        if self.chead.load(Ordering::Relaxed) == 0 {
+        if self.chead.load(Relaxed) == 0 {
             return None;
         }
 
-        let mut chead = Head::new(self.chead.load(Ordering::Acquire));
+        let mut chead = self.acquire_chead();
 
         loop {
             if chead.index >> 1 == BLOCK_SIZE {
                 backoff.snooze();
-                chead = Head::new(self.chead.load(Ordering::Acquire));
+                chead = self.acquire_chead();
                 continue;
             }
 
             let mut new_index = chead.index + 2;
 
             if chead.index & 1 == 0 {
-                fence(Ordering::SeqCst);
-                let phead = Head::<T, BLOCK_SIZE, A>::new(self.phead.load(Ordering::Relaxed));
+                fence(SeqCst);
+                let phead = Head::<T, BLOCK_SIZE, A>::new(self.phead.load(Relaxed));
 
                 if phead.block == chead.block {
                     if chead.index >> 1 >= phead.index {
@@ -330,15 +491,13 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
                 index: new_index,
             };
 
-            match self.chead.compare_exchange_weak(
-                chead.pack(),
-                new_chead.pack(),
-                Ordering::SeqCst,
-                Ordering::Acquire,
-            ) {
+            match self
+                .chead
+                .compare_exchange_weak(chead.pack(), new_chead.pack(), SeqCst, Acquire)
+            {
                 Ok(_) => {
                     // This load *must* be ordered subsequent (in time) to the CAS of chead
-                    let phead = Head::<T, BLOCK_SIZE, A>::new(self.phead.load(Ordering::SeqCst));
+                    let phead = Head::<T, BLOCK_SIZE, A>::new(self.phead.load(SeqCst));
 
                     if phead.block == chead.block && phead.index <= chead.index {
                         self.faux_push();
@@ -346,7 +505,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
 
                     break;
                 }
-                Err(head) => chead = Head::new(head),
+                Err(real) => chead = Head::new(real),
             }
 
             backoff.spin();
@@ -356,7 +515,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
 
         if chead.index + 1 == BLOCK_SIZE {
             let next = loop {
-                let p = unsafe { (*chead.block).next.load(Ordering::Acquire) };
+                let p = unsafe { (*chead.block).next.load(Acquire) };
 
                 if !p.is_null() {
                     break p;
@@ -365,24 +524,24 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
                 backoff.snooze();
             };
 
-            let has_next = unsafe { !(*next).next.load(Ordering::Relaxed).is_null() };
+            let has_next = unsafe { !(*next).next.load(Relaxed).is_null() };
 
             self.chead.store(
                 next.expose_provenance() + if has_next { 1 } else { 0 },
-                Ordering::Release,
+                Release,
             );
         }
 
         let slot = unsafe { (*chead.block).slots.get_unchecked(chead.index) };
 
-        while slot.state.load(Ordering::Acquire) & WRITE == 0 {
+        while slot.state.load(Acquire) & WRITE == 0 {
             backoff.snooze();
         }
 
-        let out = (slot.state.load(Ordering::Acquire) != SKIP)
+        let out = (slot.state.load(Acquire) != SKIP)
             .then(|| unsafe { slot.value.get().read().assume_init() });
 
-        if unsafe { (*chead.block).consumed.fetch_add(1, Ordering::Relaxed) } + 1 == BLOCK_SIZE {
+        if unsafe { (*chead.block).consumed.fetch_add(1, Relaxed) } + 1 == BLOCK_SIZE {
             unsafe { Block::reset(chead.block) };
             self.release_block(chead.block);
         }

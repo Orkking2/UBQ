@@ -81,7 +81,7 @@ compile_error!("ubq requires native 8-bit and pointer-width atomic operations");
 #[cfg(test)]
 mod tests;
 
-pub use block::BLOCK_LENGTH;
+pub use block::DEFAULT_BLOCK_SIZE;
 pub use queue::{ConfiguredUBQ, DEFAULT_POOL_SIZE};
 
 /// Default queue type alias that preserves the crate's legacy no-feature

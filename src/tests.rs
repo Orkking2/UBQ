@@ -1,22 +1,207 @@
 use std::{
     fmt::Debug,
     hint::black_box,
+    panic::{AssertUnwindSafe, catch_unwind},
     println,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self},
     time::Instant,
     vec::Vec,
 };
 
-use crate::{BLOCK_LENGTH, ConfiguredUBQ, UBQ, align, backoff, ubq};
+use crate::{ConfiguredUBQ, DEFAULT_BLOCK_SIZE, UBQ, align, backoff, ubq};
+
+type TinyQueue<T> = ConfiguredUBQ<T, backoff::Crossbeam, 2, 7, align::A64>;
+
+#[test]
+fn push_batch_preserves_order_at_every_block_offset() {
+    const BATCH_LEN: usize = 23;
+
+    for prefix in 0..TinyQueue::<usize>::BLOCK_LENGTH {
+        let q = TinyQueue::new();
+
+        for value in 0..prefix {
+            q.push(value);
+        }
+        q.push_batch(prefix..prefix + BATCH_LEN);
+
+        for expected in 0..prefix + BATCH_LEN {
+            assert_eq!(q.pop(), Some(expected), "prefix={prefix}");
+        }
+        assert_eq!(q.pop(), None, "prefix={prefix}");
+        assert!(q.is_empty(), "prefix={prefix}");
+    }
+}
+
+#[test]
+fn push_batch_handles_empty_single_and_exact_block_batches() {
+    let q = TinyQueue::new();
+
+    q.push_batch([]);
+    assert!(q.is_empty());
+
+    q.push_batch([0]);
+    q.push_batch(1..8);
+    q.push_batch(8..15);
+    q.push(15);
+
+    for expected in 0..16 {
+        assert_eq!(q.pop(), Some(expected));
+    }
+    assert_eq!(q.pop(), None);
+}
+
+#[test]
+fn concurrent_push_batches_do_not_interleave() {
+    const PRODUCERS: usize = 4;
+    const BATCHES: usize = 200;
+    const BATCH_LEN: usize = 11;
+
+    let q = Arc::new(TinyQueue::new());
+    let producers = (0..PRODUCERS)
+        .map(|producer| {
+            let q = Arc::clone(&q);
+            thread::spawn(move || {
+                for batch in 0..BATCHES {
+                    q.push_batch((0..BATCH_LEN).map(|offset| (producer, batch, offset)));
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for producer in producers {
+        producer.join().unwrap();
+    }
+
+    for _ in 0..PRODUCERS * BATCHES {
+        let (producer, batch, offset) = q.pop().unwrap();
+        assert_eq!(offset, 0);
+
+        for expected_offset in 1..BATCH_LEN {
+            assert_eq!(q.pop(), Some((producer, batch, expected_offset)));
+        }
+    }
+    assert_eq!(q.pop(), None);
+}
+
+#[test]
+fn push_batch_is_safe_with_concurrent_consumers() {
+    const PRODUCERS: usize = 4;
+    const CONSUMERS: usize = 4;
+    const ITEMS_PER_PRODUCER: usize = 10_000;
+    const BATCH_LEN: usize = 13;
+    const TOTAL: usize = PRODUCERS * ITEMS_PER_PRODUCER;
+
+    let q: Arc<TinyQueue<usize>> = Arc::new(TinyQueue::new());
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let seen: Arc<Vec<AtomicUsize>> = Arc::new((0..TOTAL).map(|_| AtomicUsize::new(0)).collect());
+
+    let consumers = (0..CONSUMERS)
+        .map(|_| {
+            let q = Arc::clone(&q);
+            let consumed = Arc::clone(&consumed);
+            let seen = Arc::clone(&seen);
+            thread::spawn(move || {
+                while consumed.load(Ordering::Acquire) < TOTAL {
+                    if let Some(value) = q.pop() {
+                        assert!(value < TOTAL);
+                        let prior_count = seen[value].fetch_add(1, Ordering::Relaxed);
+                        consumed.fetch_add(1, Ordering::Release);
+                        assert_eq!(prior_count, 0);
+                    } else {
+                        thread::yield_now();
+                    }
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let producers = (0..PRODUCERS)
+        .map(|producer| {
+            let q = Arc::clone(&q);
+            thread::spawn(move || {
+                let first = producer * ITEMS_PER_PRODUCER;
+                let end = first + ITEMS_PER_PRODUCER;
+                for batch_first in (first..end).step_by(BATCH_LEN) {
+                    q.push_batch(batch_first..end.min(batch_first + BATCH_LEN));
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for producer in producers {
+        producer.join().unwrap();
+    }
+    for consumer in consumers {
+        consumer.join().unwrap();
+    }
+
+    assert_eq!(consumed.load(Ordering::Relaxed), TOTAL);
+    assert!(seen.iter().all(|count| count.load(Ordering::Relaxed) == 1));
+    assert_eq!(q.pop(), None);
+}
+
+struct ShortExactIterator {
+    next: usize,
+}
+
+impl Iterator for ShortExactIterator {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.next < 2).then(|| {
+            let value = self.next;
+            self.next += 1;
+            value
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (4, Some(4))
+    }
+}
+
+impl ExactSizeIterator for ShortExactIterator {
+    fn len(&self) -> usize {
+        4
+    }
+}
+
+#[test]
+fn invalid_exact_size_iterator_does_not_block_the_queue() {
+    let q = TinyQueue::new();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        q.push_batch(ShortExactIterator { next: 0 });
+    }));
+    assert!(result.is_err());
+
+    q.push(2);
+    assert_eq!(q.pop(), Some(0));
+    assert_eq!(q.pop(), Some(1));
+    assert_eq!(q.pop(), Some(2));
+    assert_eq!(q.pop(), None);
+}
+
+#[test]
+fn dropping_queue_releases_batched_values() {
+    let token = Arc::new(());
+    let q = TinyQueue::new();
+    let values = (0..25).map(|_| Arc::clone(&token)).collect::<Vec<_>>();
+
+    q.push_batch(values);
+    assert_eq!(Arc::strong_count(&token), 26);
+    drop(q);
+    assert_eq!(Arc::strong_count(&token), 1);
+}
 
 #[test]
 fn drop_releases_all_enqueued_values() {
     let token = Arc::new(());
-    let n = (BLOCK_LENGTH * 3) + 7;
+    let n = (DEFAULT_BLOCK_SIZE * 3) + 7;
 
     for _ in 0..16 {
         let q = UBQ::new();
@@ -52,7 +237,7 @@ fn fill_drain_ordered() {
 #[test]
 fn refill_drain_recycled_blocks() {
     let q = UBQ::new();
-    let per_round = BLOCK_LENGTH * 3 + 17;
+    let per_round = DEFAULT_BLOCK_SIZE * 3 + 17;
 
     for round in 0..64 {
         for i in 0..per_round {

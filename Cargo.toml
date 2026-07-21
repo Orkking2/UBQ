@@ -77,3 +77,7 @@ required-features = ["bench_tools"]
 name = "ubq_bench"
 harness = false
 required-features = ["bench_tools"]
+
+[[bench]]
+name = "push_batch"
+harness = false
