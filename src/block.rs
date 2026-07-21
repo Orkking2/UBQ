@@ -8,7 +8,7 @@ use core::{
 };
 
 /// Default number of element slots per block for [`crate::UBQ`].
-pub const DEFAULT_BLOCK_SIZE: usize = 2047;
+pub const DEFAULT_BLOCK_SIZE: usize = 511;
 
 pub const WRITE: u8 = 1;
 pub(crate) const SKIP: u8 = u8::MAX;

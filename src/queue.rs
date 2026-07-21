@@ -1,5 +1,5 @@
 use crate::{
-    align::A4096,
+    align::{A1024, A4096},
     backoff::{BackoffPolicy, Crossbeam},
     block::{Block, DEFAULT_BLOCK_SIZE, SKIP, WRITE},
 };
@@ -9,7 +9,7 @@ use core::{
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::DerefMut,
-    ptr::{null_mut, with_exposed_provenance_mut},
+    ptr::{NonNull, null_mut, with_exposed_provenance_mut},
     sync::atomic::{
         AtomicPtr, AtomicUsize,
         Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
@@ -19,7 +19,7 @@ use core::{
 use crossbeam_utils::CachePadded;
 
 /// Default number of pooled blocks retained by [`crate::UBQ`].
-pub const DEFAULT_POOL_SIZE: usize = 1;
+pub const DEFAULT_POOL_SIZE: usize = 8;
 
 /// A lock-free, unbounded multi-producer/multi-consumer (MPMC) queue.
 ///
@@ -53,7 +53,7 @@ pub struct ConfiguredUBQ<
     B = Crossbeam,
     const POOL: usize = DEFAULT_POOL_SIZE,
     const BLOCK_SIZE: usize = DEFAULT_BLOCK_SIZE,
-    A = A4096,
+    A = A1024,
 > {
     /// Atomic pointer to phead: the block currently accepting producer pushes.
     phead: CachePadded<AtomicUsize>,
@@ -142,13 +142,22 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
     pub const BLOCK_LENGTH: usize = BLOCK_SIZE;
 
     #[inline]
-    fn release_block(&self, block: *mut Block<T, BLOCK_SIZE, A>) {
+    fn give_to_pool(&self, block: *mut Block<T, BLOCK_SIZE, A>) {
         if !self.pool.iter().any(|slot| {
             slot.compare_exchange(null_mut(), block, Release, Relaxed)
                 .is_ok()
         }) {
             drop_spare_block(block);
         }
+    }
+
+    #[inline]
+    fn take_from_pool(&self) -> Option<Box<Block<T, BLOCK_SIZE, A>>> {
+        self.pool.iter().find_map(|slot| {
+            let ptr = slot.swap(null_mut(), AcqRel);
+
+            (!ptr.is_null()).then(|| unsafe { Box::from_raw(ptr) })
+        })
     }
 
     fn acquire_phead(&self) -> Head<T, BLOCK_SIZE, A> {
@@ -233,9 +242,10 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         // There exists a minimum number of blocks needed to fit all items.
         // Note: A completely full block must link a new empty one.
         let min_blocks = 1 + len / BLOCK_SIZE;
+
         // Preallocate all the blocks we will (potentially) need.
-        // Worst case we have to allocate and free one block erroneously.
-        let blocks = iter::repeat_with(Block::new_zeroed)
+        let blocks = iter::from_fn(|| self.take_from_pool())
+            .chain(iter::repeat_with(Block::new_zeroed))
             .take(min_blocks)
             .collect::<Box<_>>();
 
@@ -318,11 +328,12 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
             let first_block = ref_to_mut_ptr(unsafe { &**blocks.get_unchecked(0) });
             let last_block = ref_to_mut_ptr(unsafe { &**blocks.get_unchecked(new_blocks - 1) });
 
-            // The linked blocks are now queue-owned. Consuming the boxed slice
-            // drops any unused preallocated blocks.
-            for block in blocks.into_iter().take(new_blocks) {
-                let _ = Box::into_raw(block);
-            }
+            blocks
+                .into_iter()
+                .map(Box::into_raw)
+                .enumerate()
+                .filter_map(|(i, block)| (i >= new_blocks).then_some(block))
+                .for_each(|block| self.give_to_pool(block));
 
             unsafe {
                 (*phead.block).next.store(first_block, Release);
@@ -340,9 +351,9 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         // At this point we are guaranteed to have `len` slots available, whether that be in the current block
         // or if that overflows into the subsequent blocks we have just allocated. These are all ours.
         for i in 0..len {
-            let item = items.next().expect(&format!(
-                "ExactSizeIterator gave len == {len}, but only produced {i} items"
-            ));
+            let item = items.next().unwrap_or_else(|| {
+                panic!("ExactSizeIterator gave len == {len}, but only produced {i} items")
+            });
 
             let slot = unsafe { (*phead.block).slots.get_unchecked(phead.index) };
 
@@ -424,18 +435,10 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         }
 
         if phead.index + 1 == BLOCK_SIZE {
-            // We are, at this point, guaranteed to be the only consuming accessor of pool.
-            // That is, no other producers are interfacing with the pool until we have stored the new phead.
-
             let new = next_block
                 .take()
                 .map(Box::into_raw)
-                .or_else(|| {
-                    self.pool
-                        .iter()
-                        .find(|slot| !slot.load(Relaxed).is_null())
-                        .map(|slot| slot.swap(null_mut(), AcqRel))
-                })
+                .or_else(|| self.take_from_pool().map(Box::into_raw))
                 .unwrap_or_else(|| Box::into_raw(Block::new_zeroed()));
 
             unsafe { (*phead.block).next.store(new, Release) };
@@ -455,7 +458,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         slot.state.store(state, Release);
 
         if let Some(block) = next_block {
-            self.release_block(Box::into_raw(block))
+            self.give_to_pool(Box::into_raw(block))
         }
     }
 
@@ -552,7 +555,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
 
         if unsafe { (*chead.block).consumed.fetch_add(1, Relaxed) } + 1 == BLOCK_SIZE {
             unsafe { Block::reset(chead.block) };
-            self.release_block(chead.block);
+            self.give_to_pool(chead.block);
         }
 
         out.or_else(|| self.pop())

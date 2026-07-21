@@ -260,8 +260,8 @@ macro_rules! ubq {
             @parse
             type = $ty,
             backoff = $crate::backoff::Crossbeam,
-            pool = 1,
-            block = 2047,
+            pool = 8,
+            block = 511,
             align = [];
             $($($rest)*)?
         )
