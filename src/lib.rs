@@ -71,6 +71,8 @@ pub mod backoff;
 #[cfg(feature = "bench_tools")]
 pub mod bench_harness;
 pub(crate) mod block;
+#[cfg(feature = "bench_tools")]
+pub(crate) mod dynamic;
 #[cfg(feature = "jni")]
 mod jni;
 pub(crate) mod queue;
@@ -267,3 +269,14 @@ macro_rules! ubq {
         )
     };
 }
+
+/*
+CARGO_TARGET_DIR=/home/nicolas/UBQ/target/vtune \
+CARGO_PROFILE_RELEASE_DEBUG=2 \
+RUSTFLAGS="-C force-frame-pointers=yes" \
+cargo build --release \
+  --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq \
+  --bin bench_matrix \
+  --bin bench_atomic_updates \
+  --bin bench_head_reload
+*/

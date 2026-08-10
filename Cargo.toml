@@ -19,7 +19,7 @@ bench = false
 [dependencies]
 concurrent-queue = { version = "2", optional = true }
 core_affinity = { version = "0.8", optional = true }
-crossbeam-queue = { version = "0.3", optional = true }
+crossbeam-queue = { git = "https://github.com/Orkking2/crossbeam", branch = "batch", optional = true }
 crossbeam-utils = { version = "0.8.21", default-features = false }
 lfqueue = { version = "0.8.1", optional = true }
 rbbq = { version = "0.1.0", optional = true }
@@ -27,11 +27,14 @@ serde = { version = "1", features = ["derive"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
-toml = { version = "0.8", optional = true }
 wcq = { version = "0.1.0", optional = true }
+portable-atomic = { version = "1.13.1", optional = true }
+
+[patch.crates-io]
+lfqueue = { git = "https://github.com/khyperia/lfqueue", branch = "allocscqring-usize" }
 
 [features]
-default = ["std"]
+default = ["std","bench_tools"]
 std = ["crossbeam-utils/std"]
 jni = ["std"]
 bench_tools = [
@@ -40,10 +43,10 @@ bench_tools = [
     "dep:concurrent-queue",
     "dep:core_affinity",
     "dep:crossbeam-queue",
+    "dep:portable-atomic",
     "dep:serde",
     "dep:serde_json",
     "dep:tokio",
-    "dep:toml",
 ]
 bench_fastfifo = ["bench_tools", "dep:rbbq"]
 bench_rbbq = ["bench_fastfifo"]
@@ -64,8 +67,13 @@ path = "src/bin/bench_matrix.rs"
 required-features = ["bench_tools"]
 
 [[bin]]
-name = "full_bench_fleet"
-path = "src/bin/full_bench_fleet.rs"
+name = "bench_atomic_updates"
+path = "src/bin/bench_atomic_updates.rs"
+required-features = ["bench_tools"]
+
+[[bin]]
+name = "bench_head_reload"
+path = "src/bin/bench_head_reload.rs"
 required-features = ["bench_tools"]
 
 [[bin]]
@@ -73,9 +81,9 @@ name = "io_uring_queue_bench"
 path = "src/bin/io_uring_queue_bench.rs"
 required-features = ["bench_tools"]
 
-[[bench]]
-name = "ubq_bench"
-harness = false
+[[bin]]
+name = "laot"
+path = "src/bin/long_atm_offset_test.rs"
 required-features = ["bench_tools"]
 
 [[bench]]

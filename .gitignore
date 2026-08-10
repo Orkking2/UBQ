@@ -1,6 +1,5 @@
 /target
-/bench_results
-/legacy_bench_results
+/bench_results*
 .*/
 __pycache__/
 *.pyc

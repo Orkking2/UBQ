@@ -15,21 +15,28 @@ about complete production applications.
   a worker queue and receive completions through a shared response queue. The
   mode reports completed requests per second and average round-trip latency.
 
-These modes use the schema-v3 benchmark JSON format. Throughput is stored in
+These modes use the schema-v6 benchmark JSON format. Throughput is stored in
 `ops_per_sec`, average latency in `avg_data_latency_ns`, and producer/consumer
 elapsed timing in `push_elapsed_ns` and `pop_elapsed_ns`.
 
-Each scheduled queue sample has a watchdog timeout. The default is 300 seconds
-per sample and can be overridden with `UBQ_BENCH_JOB_TIMEOUT_SECS`. If a queue
-hangs or panics, the scheduler still writes a result record for that sample with
-`status` set to `timed_out` or `failed`, no throughput value, and a
-`failure_reason`, then continues evaluating the remaining queues.
+Each scheduled queue sample has a hard process timeout. The default is 300
+seconds per sample and can be overridden with
+`UBQ_BENCH_JOB_TIMEOUT_SECS`. If a queue hangs, the parent kills and reaps the
+worker process—including all of its benchmark threads—then starts a fresh
+worker for the next sample. A timed-out or failed result has no throughput
+value, records `consumed_items = 0` because a trustworthy partial count is not
+available after termination, and remains eligible for retry. There is no
+shorter no-progress watchdog.
 
-Run the configured fleet:
+Run the application modes directly:
 
 ```bash
-cargo run --release --features bench_tools --bin full_bench_fleet -- \
-  --config bench_fleet_app.toml \
-  --machines local \
+cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue --bin bench_matrix -- \
+  --machine-label local \
+  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue \
+  --ubq-label balanced,8,127,crossbeam \
+  --scenarios 1p1c,4p1c,1p4c,4p4c,8p8c,16p16c \
+  --modes app_log_fan_in,app_pipeline,app_task_roundtrip \
+  --items-per-producer 100000 \
   --repeats 3
 ```

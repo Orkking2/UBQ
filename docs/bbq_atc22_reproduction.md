@@ -30,7 +30,7 @@ semantics, so UBQ does not have directly comparable operations.
 ## Plot coverage
 
 The plotting helpers generate both generic per-scenario plots and BBQ-style
-family scaling plots from the same schema-v3 JSON files:
+family scaling plots from the same schema-v6 JSON files:
 
 - SPSC throughput/latency/fairness-style bars:
   `plots/<machine>/<mode>/1p1c_<metric>.png`
@@ -104,16 +104,19 @@ cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq
   --parallelism 60
 ```
 
-Fleet run:
+Reproducible sparse-grid run:
 
 ```bash
-cargo run --release --features bench_tools --bin full_bench_fleet -- \
-  --config bench_fleet_bbq_atc22.toml \
-  --machines local,lab,hebrides \
+cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_grid -- \
+  --machine-label local \
+  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
+  --scenarios bbq-atc22-x86-88t \
+  --modes throughput,complex_throughput,data_latency,fairness \
+  --items-per-producer 1000000 \
   --repeats 3
 ```
 
-For reproducible UBQ variation coverage, use `bench_grid` or
-`full_bench_fleet`; both default to the sparse grid, with `-d` selecting the
-dense grid. For fixed paper-style comparisons, use `bench_matrix` with explicit
-`--ubq-label` values for each UBQ variant you want in the paper plots.
+For reproducible UBQ variation coverage, use `bench_grid`; it defaults to the
+sparse grid, with `-d` selecting the dense grid. For fixed paper-style
+comparisons, use `bench_matrix` with explicit `--ubq-label` values for each UBQ
+variant you want in the paper plots.

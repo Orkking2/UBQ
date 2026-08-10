@@ -161,7 +161,7 @@ version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
- "crossbeam-utils",
+ "crossbeam-utils 0.8.21",
 ]
 
 [[package]]
@@ -186,11 +186,10 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-queue"
-version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f58bbc28f91df819d0aa2a2c00cd19754769c2fad90579b3592b1c9ba7a3115"
+version = "0.3.13"
+source = "git+https://github.com/Orkking2/crossbeam?branch=batch#232b761edadf5e4f1f8713d33d79205fdca41a7c"
 dependencies = [
- "crossbeam-utils",
+ "crossbeam-utils 0.8.22",
 ]
 
 [[package]]
@@ -198,6 +197,11 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.22"
+source = "git+https://github.com/Orkking2/crossbeam?branch=batch#232b761edadf5e4f1f8713d33d79205fdca41a7c"
 
 [[package]]
 name = "derive_arbitrary"
@@ -338,11 +342,10 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 [[package]]
 name = "lfqueue"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd2428deffda00a40476b014ca530737e59cb4ad98bbd7a634dcf165e0b8b08e"
+source = "git+https://github.com/khyperia/lfqueue?branch=allocscqring-usize#d072f929187e9628d0b9f8b19216bbd0cab47f96"
 dependencies = [
  "arbitrary",
- "crossbeam-utils",
+ "crossbeam-utils 0.8.21",
  "haphazard",
  "loom",
 ]
@@ -575,15 +578,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_spanned"
-version = "0.6.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -638,47 +632,6 @@ checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
 dependencies = [
  "pin-project-lite",
 ]
-
-[[package]]
-name = "toml"
-version = "0.8.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
-dependencies = [
- "serde",
- "serde_spanned",
- "toml_datetime",
- "toml_edit",
-]
-
-[[package]]
-name = "toml_datetime"
-version = "0.6.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "toml_edit"
-version = "0.22.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
-dependencies = [
- "indexmap",
- "serde",
- "serde_spanned",
- "toml_datetime",
- "toml_write",
- "winnow",
-]
-
-[[package]]
-name = "toml_write"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tracing"
@@ -737,13 +690,13 @@ dependencies = [
  "concurrent-queue",
  "core_affinity",
  "crossbeam-queue",
- "crossbeam-utils",
+ "crossbeam-utils 0.8.21",
  "lfqueue",
+ "portable-atomic",
  "rbbq",
  "serde",
  "serde_json",
  "tokio",
- "toml",
  "wcq",
 ]
 
@@ -829,7 +782,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bc313f41016013dfec51896a09f66cd35f68a242421289345b1351cb58d2b52"
 dependencies = [
- "crossbeam-utils",
+ "crossbeam-utils 0.8.21",
  "loom",
  "portable-atomic",
 ]
@@ -878,15 +831,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "winnow"
-version = "0.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
-dependencies = [
- "memchr",
 ]
 
 [[package]]

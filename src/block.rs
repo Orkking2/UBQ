@@ -1,22 +1,27 @@
-use crate::align::A4096;
+use crate::{align::A4096, backoff::BackoffPolicy};
 use alloc::boxed::Box;
 use core::{
     cell::UnsafeCell,
     mem::{MaybeUninit, align_of, size_of},
     ptr::null_mut,
-    sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{
+        AtomicPtr, AtomicU8, AtomicUsize,
+        Ordering::{Acquire, Relaxed, Release},
+        fence,
+    },
 };
 
 /// Default number of element slots per block for [`crate::UBQ`].
 pub const DEFAULT_BLOCK_SIZE: usize = 511;
 
+const ZERO: u8 = 0;
 pub const WRITE: u8 = 1;
 pub(crate) const SKIP: u8 = u8::MAX;
 
 /// A fixed-size ring-buffer segment.
 pub(crate) struct Block<T, const BLOCK_SIZE: usize = DEFAULT_BLOCK_SIZE, A = A4096> {
     /// Alignment marker used to reserve pointer-tag bits in the block address.
-    pub _align: A,
+    pub _align: A, // TODO: Should this be changed to PhantomData<A>?
     /// Link to the successor block used by producer-head advancement/recycling.
     pub next: AtomicPtr<Self>,
     /// Per-slot storage for values in this block.
@@ -28,6 +33,16 @@ pub(crate) struct Block<T, const BLOCK_SIZE: usize = DEFAULT_BLOCK_SIZE, A = A40
 pub(crate) struct Slot<T> {
     pub value: UnsafeCell<MaybeUninit<T>>,
     pub state: AtomicU8,
+}
+
+impl<T> Slot<T> {
+    pub(crate) fn busy_wait_state<B: BackoffPolicy>(&self, backoff: &B) -> &Self {
+        while self.state.load(Acquire) == ZERO {
+            backoff.snooze();
+        }
+
+        self
+    }
 }
 
 impl<T, const BLOCK_SIZE: usize, A> Block<T, BLOCK_SIZE, A> {
@@ -52,13 +67,13 @@ impl<T, const BLOCK_SIZE: usize, A> Block<T, BLOCK_SIZE, A> {
     };
 
     #[inline]
-    pub(crate) fn block_align() -> usize {
+    pub(crate) const fn block_align() -> usize {
         let () = Self::LAYOUT_CHECKS;
         align_of::<Self>()
     }
 
     #[inline]
-    pub(crate) fn block_mask() -> usize {
+    pub(crate) const fn block_mask() -> usize {
         Self::block_align() - 1
     }
 
@@ -67,19 +82,23 @@ impl<T, const BLOCK_SIZE: usize, A> Block<T, BLOCK_SIZE, A> {
         unsafe { Box::new_zeroed().assume_init() }
     }
 
-    pub(crate) unsafe fn reset(this: *mut Self) {
+    pub(crate) fn reset(this: *mut Self) -> *mut Self {
         let () = Self::LAYOUT_CHECKS;
 
         let block = unsafe { &*this };
 
-        block.next.store(null_mut(), Ordering::Relaxed);
-        block.consumed.store(0, Ordering::Relaxed);
+        block.next.store(null_mut(), Relaxed);
+        block.consumed.store(0, Relaxed);
 
         for slot in &block.slots {
-            if slot.state.load(Ordering::Relaxed) != 0 {
-                slot.state.store(0, Ordering::Relaxed);
+            if slot.state.load(Relaxed) != 0 {
+                slot.state.store(0, Relaxed);
             }
         }
+
+        fence(Release);
+
+        this
     }
 }
 

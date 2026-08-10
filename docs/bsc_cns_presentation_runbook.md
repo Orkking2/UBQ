@@ -55,31 +55,22 @@ Run the hebrides preview from a networked shell where that host resolves.
 
 ## Preview Run On Local Or Hebrides
 
-Use the small preview config when you need a fast presentation dry run:
+Run the preview directly on the target machine:
 
 ```bash
-cargo run --release --features bench_tools --bin full_bench_fleet -- \
-  --config bench_fleet_preview.toml \
-  --machines local \
-  --plot-partial \
-  --grid-arg=--parallelism=$(nproc)
+cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue --bin bench_grid -- \
+  --machine-label local-preview \
+  --runs-dir bench_results/presentation_runs \
+  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue \
+  --scenarios 1p4c,4p4c,16p16c,64p64c \
+  --modes throughput \
+  --items-per-producer 100000 \
+  --repeats 1 \
+  --parallelism=<hardware-thread-count>
 ```
 
-For hebrides:
-
-```bash
-cargo run --release --features bench_tools --bin full_bench_fleet -- \
-  --config bench_fleet_preview.toml \
-  --machines hebrides \
-  --plot-partial
-```
-
-If hebrides reports too little available parallelism, add the same forwarded
-argument:
-
-```bash
---grid-arg=--parallelism=<hardware-thread-count>
-```
+Use a machine-specific label such as `hebrides-preview` when running the same
+command after logging into another host.
 
 Preview output locations:
 
@@ -91,37 +82,37 @@ Preview output locations:
 On the BSC-CNS machine, clone or update this repository, then run:
 
 ```bash
-cargo run --release --features bench_tools --bin full_bench_fleet -- \
-  --config bench_fleet_bsc_cns.toml \
-  --machines bsc-cns \
+cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_grid -- \
+  --machine-label bsc-cns \
+  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
+  --modes throughput,complex_throughput,data_latency,fairness \
   --repeats 3 \
-  --plot-partial \
-  --grid-arg=--parallelism=$(nproc)
+  --parallelism=<hardware-thread-count>
 ```
 
 This uses:
 
-- all 49 producer/consumer grid points from 1 to 64 threads,
+- every feasible power-of-two producer/consumer pair for the detected thread
+  count,
 - `throughput`, `complex_throughput`, `data_latency`, and `fairness`,
 - the 40-configuration sparse UBQ grid, including scalar and all configured
   `push_batch` sizes for throughput,
 - SegQueue, concurrent-queue, RBBQ/BBQ, LSCQ, and wCQ baselines,
 - three repeats for the paper run.
 
-If the full run is too long, first run the preview config on BSC-CNS:
-
-```bash
-cargo run --release --features bench_tools --bin full_bench_fleet -- \
-  --config bench_fleet_preview.toml \
-  --machines bsc-cns \
-  --plot-partial \
-  --grid-arg=--parallelism=$(nproc)
-```
+If the full run is too long, use the explicit preview command above with
+`--machine-label bsc-cns-preview`.
 
 ## Paper Figures From BSC-CNS Results
 
-After `full_bench_fleet` renders standard plots, generate paper-oriented
-advantage plots from the BSC-CNS CSVs:
+First render the standard plots, then generate paper-oriented advantage plots
+from the BSC-CNS CSVs:
+
+```bash
+python3 scripts/plot_runs_folder.py \
+  --runs-dir bench_results/runs \
+  --out-dir bench_results/plots
+```
 
 ```bash
 python3 scripts/plot_paper_advantages.py \

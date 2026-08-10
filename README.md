@@ -89,51 +89,123 @@ TODO
 
 ## Benchmarks
 
-This repo includes a benchmark harness that compares UBQ against established
+This repo includes a benchmark harness that compares static UBQ, the opt-in
+experimental dynamic implementation (`dubq`), and established
 MPMC queue implementations (`segqueue`, `concurrent-queue`, and optional
-RBBQ/BBQ, `lfqueue`/LSCQ, and wCQ variants) in
-`1p1c`, `4p1c`, `1p4c`, `4p4c`, `8p1c`, `8p4c`, `8p8c`, `1p8c`, `4p8c`,
-`16p1c`, `1p16c`, `8p16c`, `16p8c`, `16p16c`, `32p1c`, `1p32c`, `16p32c`,
-`32p16c`, `32p32c`, `64p1c`, `1p64c`, `32p64c`, `64p32c`, and `64p64c`
-scenarios.
+RBBQ/BBQ, `lfqueue`/LSCQ, and wCQ variants). Unless `--scenarios` is supplied,
+each machine benchmarks the complete power-of-two producer/consumer grid:
+`2^n p 2^m c` for every `n,m >= 0` whose producer and consumer thread sum does
+not exceed detected available parallelism. For example, a 16-thread machine
+runs all 16 combinations of `1,2,4,8` producers and consumers.
 
 The Rust benchmark harness and binaries are isolated behind the `bench_tools`
 feature. Benchmark-specific features such as `bench_registry`, `bench_rbbq`,
 `bench_lfqueue`, and `bench_wcq` enable it automatically.
 
-The schema-v3 harness has two execution paths:
+The schema-v6 comparative harness has two front ends:
 
 - `bench_matrix`: direct matrix execution. It dispatches through the
-  precompiled benchmark registry and writes schema-v3 JSON files under
+  precompiled benchmark registry and writes schema-v6 JSON files under
   `bench_results/runs`.
-- `bench_grid`: reproducible UBQ grid execution. Its default sparse grid is
+- `bench_grid`: reproducible UBQ/DUBQ grid execution. Its default sparse grid is
   `pool=[0,1,8,64]` × `block=[31,127,511,2047,4095]` × both backoffs (40
   configurations). `-d` selects the dense grid containing all 8 pool values ×
   all 8 block values × both backoffs (128 configurations). Configurations whose
   block is smaller than a scenario's producer count are excluded before jobs
-  are counted.
+  are counted for static UBQ. DUBQ interprets this dimension as a minimum block
+  size and retains every grid point. Sparse and dense select configuration
+  coverage only; both run the same complete scenario grid.
 
-For throughput, every UBQ configuration measures scalar `push` and
-`push_batch` at batch sizes `2,4,8,16,32,64,128,256,512,1024,2048`. Thus an
-unconstrained scenario has 480 sparse or 1,536 dense UBQ throughput jobs per
-repeat; selected baseline queues are measured once rather than once per UBQ
-configuration. Other benchmark modes remain scalar.
+For throughput, every selected UBQ or DUBQ configuration measures a
+scalar-compatible operation and, by default, paired `push_batch`/`pop_batch`
+operations at batch sizes `8,32,256`. When `segqueue` is selected, its normal
+`SegQueue::push`/`pop` run remains scalar and the same batch-size grid is run
+through the fork's separate `BatchQueue::push`/`pop` API. `--batch-sizes`
+replaces that shared batch-size list while retaining scalar measurements. DUBQ
+has a batch-only API, so its scalar-compatible variant uses one-item batches
+and is recorded without a batch size. Thus the static-UBQ default grid
+has 160 sparse or 512 dense UBQ throughput jobs per unconstrained scenario and
+repeat. Scalar baselines are measured once rather than once per UBQ
+configuration, while the Crossbeam batch queue is measured once per requested
+batch size. Other benchmark modes remain scalar.
 
-`bench_grid` reuses successful schema-v3 samples by default, writes each
+For workload-specific modes, when `--items-per-producer` is omitted,
+`bench_grid` uses the versioned
+`scenario_scaled_v1` workload: 1–8 producers get 1,000,000 items each, 9–16
+get 250,000, 17–32 get 62,500, and larger producer counts get 15,625. Every
+queue, UBQ/DUBQ configuration, batch size, mode, and repeat in a scenario receives
+the same resolved count. Supplying one or more `--items-per-producer` values
+selects the `explicit` policy and runs every supplied value in every scenario.
+The selected policy and scenario mapping are printed before execution and
+recorded in each output file.
+
+`bench_grid` reuses successful schema-v6 samples with a compatible measurement
+fingerprint by default. Scenario, queue/configuration, mode, batch-size, and
+repeat selection do not change that fingerprint; the exact sample key still
+has to match, so narrower and wider plans reuse their overlap. It writes each
 completed job through an atomic checkpoint, and retries failed or timed-out
-jobs after an interruption. `--rerun` ignores existing samples. Its stdout is a
-fixed-width job table with the queue, scenario, mode, batch size, thread use,
-pending count, and percentage of the complete plan.
+jobs after an interruption. `--rerun` ignores existing samples. Jobs execute
+sequentially on the same core range so separate queue measurements cannot
+contend with one another. Within each job, producer and consumer threads are
+interleaved over the assigned core IDs until one role is exhausted; the actual
+role-to-core map is printed before execution and recorded as
+`core_placement = "interleaved"`. Authoritative throughput requires every
+worker thread to pin successfully. `--core-ids 0-7,16-23` selects an explicit
+ordered CPU set; `--allow-unpinned` is a diagnostic escape hatch whose records
+are excluded from winner claims. Hard timeouts are derived only from the
+declared measurement budget: at least 30 seconds and otherwise five times the
+warmup plus three measured phases. `--job-timeout-secs` overrides that value.
+Each job runs in a reusable worker process; if it exceeds its hard
+timeout, the parent kills and reaps the entire worker, checkpoints a timed-out
+sample, starts a fresh worker, and continues. Schema-v5 and older results are
+not reused or aggregated with schema-v6 data. Stdout is a fixed-width
+job table with the queue, scenario, mode, batch size, thread use, pending count,
+and percentage of the complete plan; each row advances from `Pending...` to
+`Pending...DONE`.
+
+`bench_matrix` uses the same overlap rule when `--reuse-existing` is supplied.
+
+`throughput` is an adaptive sustained protocol. A disposable doubling pilot
+selects an empty-to-empty round size (100 ms target, 8,388,608-item cap), then
+excluded warmup rounds accumulate 250 ms. Measured handoff rounds accumulate
+at least one second and stop timing at the last real dequeue; sentinel delivery
+and joins cannot change the headline rate. Paired producer-only fill and
+consumer-only drain cycles independently accumulate at least one second and
+report enqueue and dequeue ceilings. Hot-loop counters are thread-local and
+exact totals are validated after every round. The timing budgets can be changed
+with `--throughput-warmup-ms`, `--throughput-phase-ms`,
+`--throughput-pilot-ms`, and `--throughput-max-round-items`. Complex, fairness,
+latency, and application modes remain workload-specific measurements rather
+than upper-bound claims.
+
+`data_latency` timestamps immediately before enqueue and immediately after
+dequeue without credits or producer throttling. It therefore measures latency
+under an unbounded saturated workload; backlog and item count can affect the
+average, so compare subjects using the same scenario and resolved workload.
 
 UBQ labels are 4-part identifiers:
 
 - `preset,pool,block,backoff`
 - Example: `balanced,8,127,crossbeam`
 
+DUBQ labels are 3-part runtime configurations:
+
+- `pool,min_block,backoff`
+- Example: `8,127,crossbeam`
+
+Select them directly with `--queues dubq --dubq-label 8,127,crossbeam`, or add
+`dubq` to `bench_grid --queues` to sweep the selected sparse/dense grid. DUBQ is
+opt-in and does not change either binary's default queue selection. Its current
+mixed-width atomic head accesses are an experimental hardware design outside
+Rust's supported overlapping-atomic memory model; results should be treated as
+experimental rather than production-safety evidence.
+
 Publication-backed baseline labels are emitted with their sizing knob:
 
-- RBBQ/BBQ: `fastfifo_<block_size>`, for example `fastfifo_256`
-  (default grid `64,256,1024,4096`).
+- RBBQ/BBQ: `fastfifo_b<block_size>_c<requested_capacity>`, for example
+  `fastfifo_b256_c1048576` (default block grid `64,256,1024,4096` and default
+  explicit capacity 1,048,576). Use `--fastfifo-capacities` to cross capacities
+  with the selected block sizes.
 - LSCQ via `lfqueue`: `lfqueue_<segment_size>`, for example `lfqueue_256`
   (default grid `32,256,1024`).
 - wCQ: `wcq_<capacity>`, for example `wcq_65536`
@@ -153,13 +225,14 @@ Run an explicit direct matrix:
 ```bash
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_matrix -- \
   --machine-label local \
-  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
+  --queues ubq,dubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
   --ubq-label balanced,8,127,crossbeam \
+  --dubq-label 8,127,crossbeam \
   --rbbq-block-sizes 64,256,1024,4096 \
   --lfqueue-segment-sizes 32,256,1024 \
   --wcq-capacities 4096,65536,1048576 \
   --scenarios 1p1c,8p8c \
-  --modes throughput,fill_drain \
+  --modes throughput \
   --items-per-producer 1000000
 ```
 
@@ -167,8 +240,8 @@ For BBQ ATC 2022-style microbenchmarks, the scenario parser also accepts
 `spsc`, `mpsc:N-M`, `spmc:N-M`, `mpmc:N-M`, `bbq-atc22-x86-88t`, and
 `bbq-atc22-oversub-x86-12t`. The paper-style metric modes are
 `throughput`, `complex_throughput`, `data_latency`, and `fairness`. See
-[docs/bbq_atc22_reproduction.md](docs/bbq_atc22_reproduction.md) and
-`bench_fleet_bbq_atc22.toml` for the ready-to-run suite.
+[docs/bbq_atc22_reproduction.md](docs/bbq_atc22_reproduction.md) for the
+ready-to-run suite.
 
 The harness also includes synthetic application-level queue experiments. These
 are still controlled benchmarks, not full production workload models, but they
@@ -201,36 +274,147 @@ Run the sparse grid on one machine:
 ```bash
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_grid -- \
   --machine-label local \
-  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
+  --queues ubq,dubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
+  --batch-sizes 8,32,128,512 \
   --rbbq-block-sizes 64,256,1024,4096 \
   --lfqueue-segment-sizes 32,256,1024 \
   --wcq-capacities 4096,65536,1048576
 ```
 
 Add `-d` for the dense grid or `--rerun` to benchmark every job without using
-compatible existing results.
+compatible existing results. Batch sizes must be integers of at least 2;
+duplicates are removed. The scalar-compatible variant is always included.
 
-Run the configured fleet grid:
+To benchmark only scalar SegQueue and the forked BatchQueue—without scheduling
+any UBQ/DUBQ configurations—select `segqueue` by itself:
 
 ```bash
-cargo run --release --features bench_tools --bin full_bench_fleet -- \
-  --machines local,lab,hebrides \
+cargo run --release --features bench_registry --bin bench_grid -- \
+  --machine-label local \
+  --queues segqueue \
+  --batch-sizes 8,32,256 \
+  --scenarios 1p1c,4p1c,1p4c,4p4c \
   --repeats 3
 ```
 
-`full_bench_fleet` runs `bench_grid` per machine with the sparse grid by
-default. Its own `-d` flag selects the dense grid, and `--rerun` is forwarded
-to each machine. The typed TOML alternative is `ubq_grid = "dense"` under
-`[defaults]`. It syncs
-`bench_results/runs`, and refreshes plots under `bench_results/plots`.
-`--repeats` overrides the `defaults.repeats` value from `bench_fleet.toml`.
+Omit `--scenarios` to use the complete feasible machine grid. This schedules
+one scalar `SegQueue` sample and one native `BatchQueue` sample per requested
+batch size, scenario, and repeat.
+
+Measure word-sized atomic update contention independently of the queue grid:
+
+```bash
+cargo run --release --features bench_tools --bin bench_atomic_updates -- \
+  --machine-label local
+```
+
+`bench_atomic_updates` models UBQ's incremental traversal across block sizes
+`31,127,511,2047,4095` by default. The updater reserving the final slot
+publishes the next block while threads observing the full block snooze. It
+compares FAA, CAS, and CAS with `crossbeam_utils::Backoff::spin()` for both a
+plain `AtomicU64` and an experimental shared allocation encoded as a 64-bit
+synthetic block pointer plus a 32-bit generation and 32-bit index. A seventh,
+U64-only case models Crossbeam `SegQueue`'s reservation mechanism: indices are
+shifted by one metadata bit, advanced with a CAS and spin backoff, and skip a
+sentinel position between block laps. Mixed-layout RMWs use the low
+`AtomicU64` view. Each worker initially loads the full `AtomicU128`, caches its
+pointer and generation, then reloads the full value only when a narrow load or
+failed CAS reports a different generation. Boundary publication remains a full
+`AtomicU128` store.
+
+FAA additionally records reservations invalidated by a full block. Workers are
+pinned where supported; CAS retries, boundary waits, and wide loads/stores are
+recorded; case and block order rotate between repeats; and updater counts are
+every power of two through detected available parallelism. Use
+`--block-sizes` and `--alignment` to change the sweep. The default `ubq`
+ordering profile uses UBQ's current Acquire FAA, SeqCst CAS, Acquire
+load/failure, and Release publication orderings; pass `--ordering relaxed` to
+isolate raw atomic costs. Results are written under
+`bench_results/runs/<machine>/atomic_updates`.
+
+The mixed-width layout is a hardware experiment, not a Rust-memory-model-safe
+implementation: Rust does not support concurrent overlapping atomics of
+different sizes. The benchmark refuses targets where `AtomicU128` is not
+lock-free and records this limitation in its JSON metadata.
+
+To isolate the retry-time role of a low-word token, run the focused head reload
+experiment:
+
+```bash
+cargo run --release --features bench_tools --bin bench_head_reload -- \
+  --machine-label local
+python3 scripts/plot_head_reload.py \
+  --runs-dir bench_results/runs/local/head_reload \
+  --out-dir bench_results/plots
+```
+
+This models `pop_batch`'s reservation CAS with a 64-bit pointer plus a low word
+split into a 16-bit token and 48-bit index. Both strategies acquire the full
+head once per reservation. After a failed low-word CAS, `always_wide` acquires
+the full head again; `token_gated` reuses the returned low word while its token
+matches. The synthetic pointer and token deliberately remain fixed, measuring
+the steady-frontier upper bound of the optimization. The binary sweeps powers
+of two thread counts and counter increments (batch sizes), records CAS failures
+and wide-load rates, and rotates strategy order across paired repeats. The
+plotter emits a ratio grid where purple favors token gating, blue favors
+unconditional wide reloads, and white is equal.
+
+Generate a light-to-dark single-hue block-size graph for every layout/method,
+a comparison graph using each type's normalized best block weighted by updater
+count, its selected CAS-retry graph, and CSVs containing all samples and
+selected winners with:
+
+```bash
+python3 scripts/plot_atomic_updates.py \
+  --runs-dir bench_results/runs \
+  --out-dir bench_results/plots
+```
+
+To plot only selected runs, pass their JSON paths separately or as one
+comma-separated argument:
+
+```bash
+python3 scripts/plot_atomic_updates.py \
+  /path/to/file1.json,/path/to/file2.json \
+  --out-dir bench_results/plots
+```
+
+When `--runs-dir` is also supplied, selected files can be written as basenames;
+the directory is searched recursively and the discovered runs are filtered by
+those names:
+
+```bash
+python3 scripts/plot_atomic_updates.py \
+  file1.json,file2.json \
+  --runs-dir /path/to/runs \
+  --out-dir bench_results/plots
+```
+
+Omit the filenames to plot every JSON run discovered under `--runs-dir`.
+
 Python is only needed for the plotting helpers.
 
-Throughput plots retain every measured configuration and batch size in their
-per-scenario CSV while displaying the best scalar UBQ configuration and the
-best configuration/batch-size pair as distinct series. A green badge reports
-that the declared grid is exhausted; a red badge reports incomplete or legacy
-coverage while the plotted winners remain the best measurements present.
+Per-scenario CSVs retain every measured configuration, while plots display one
+best variation per queue family. Scalar and batched SegQueue, UBQ, and DUBQ are
+separate families. When both method kinds are present, each scenario also gets
+`*_scalar` and `*_batched` CSVs and bar graphs so scalar queue operations are
+not compared in the same panel as native batch operations. The original
+combined artifact remains available for compatibility.
+Single-scenario plots maximize throughput and minimize elapsed/latency/fairness
+metrics. Scaling plots choose each family's representative using normalized
+relative performance weighted toward higher-contention scenarios. A green
+badge reports that the declared grid is exhausted; a red badge reports
+incomplete or legacy coverage while the plotted winners remain the best
+measurements present.
+
+The MPSC and SPMC throughput outputs also include `*_batchcomp` and
+`*_dubq_batchcomp` plots. These show the best scalar-compatible configuration,
+the scalar counterpart of the best batched configuration, and every measured
+batch size for that underlying UBQ or DUBQ configuration. Duplicate scalar
+configurations are shown only once. Cool
+shades group batches below the selected winner, warm shades group larger
+batches, the winning batch uses a green star, the best scalar is black, and a
+distinct scalar counterpart is dashed gray.
 
 Set up a minimal plotting environment:
 
@@ -245,53 +429,47 @@ Generate plots manually (PNG + CSV when `matplotlib` is installed, CSV-only othe
 ```bash
 ./.venv/bin/python scripts/plot_bench.py --out-dir bench_results/plots path/to/run.json
 
-# Optional: choose error bars from repeated samples (default: sem).
+# Optional: choose non-default error bars (default: SEM).
 ./.venv/bin/python scripts/plot_bench.py --error-bars stddev --out-dir bench_results/plots path/to/run.json
 
 # Render plots from all JSON files under bench_results/runs recursively.
 ./.venv/bin/python scripts/plot_runs_folder.py --runs-dir bench_results/runs --out-dir bench_results/plots
 
-# Render PNGs from existing generated CSV machine folders and emit merged paper figures.
+# Render PNGs from existing generated CSV machine folders.
 ./.venv/bin/python scripts/plot_bench.py \
   --csv-dir bench_results/plots/grace/csv \
   --csv-dir bench_results/plots/hebrides/csv \
   --csv-dir bench_results/plots/mn5/csv \
   --out-dir bench_results/plots
-
-# Optional: cap how many configs appear in the per-machine scaling line chart.
-./.venv/bin/python scripts/plot_runs_folder.py --runs-dir bench_results/runs --out-dir bench_results/plots --max-line-series 10
 ```
 
 Outputs are grouped by `meta.machine_label` and mode, e.g.:
 
 - `bench_results/plots/local/throughput/1p1c_throughput.png`
+- `bench_results/plots/local/throughput/1p1c_throughput_scalar.png`
+- `bench_results/plots/local/throughput/1p1c_throughput_batched.png`
 - `bench_results/plots/local/throughput/scenarios_line_throughput.png`
-- `bench_results/plots/local/throughput_push_elapsed/1p1c_push_elapsed.png`
-- `bench_results/plots/local/fill_drain_drain_elapsed/1p1c_drain_elapsed.png`
+- `bench_results/plots/local/throughput_enqueue_ceiling/1p1c_enqueue_ceiling.png`
+- `bench_results/plots/local/throughput_dequeue_ceiling/1p1c_dequeue_ceiling.png`
 - `bench_results/plots/lab/throughput/1p1c_throughput.png`
 - `bench_results/plots/hebrides/csv/throughput/1p1c_throughput.csv`
 - `bench_results/plots/hebrides/csv/throughput/scenarios_line_throughput.csv`
 - `bench_results/plots/hebrides/csv/throughput/queue_metadata.csv`
 - `bench_results/plots/grace/throughput/mpsc_line_throughput.png`
-- `bench_results/plots/paper/mpsc_producer_throughput.png`
-- `bench_results/plots/paper/mpsc_push_elapsed_log.png`
+- `bench_results/plots/grace/throughput/mpsc_line_throughput_batchcomp.png`
+- `bench_results/plots/grace/throughput/spmc_line_throughput_batchcomp.png`
 
-When records contain the newer timing fields, the plotter also emits derived
-metric folders such as `throughput_push_elapsed`,
-`throughput_pop_elapsed`, `fill_drain_fill_elapsed`, and
-`fill_drain_drain_elapsed`. Timing, latency, and fairness-ratio charts sort
-lower values first; throughput charts still sort higher values first.
+Schema-v6 plotting deduplicates reruns, keeps fingerprints isolated, summarizes
+repeats by median, and emits separate handoff, enqueue-ceiling, and
+dequeue-ceiling CSVs/plots. Fewer than three repeats are marked provisional.
 
 Per-scenario UBQ outputs also emit a companion CSV named
 `<scenario>_immediate_variants_throughput.csv` that marks each required
 winner-adjacent variant, including the matching `pool=0` no-pool comparison, as
 `present` or `missing`.
 
-The standalone benchmark target can be inspected with:
-
-```bash
-cargo bench --bench ubq_bench --features bench_tools -- --help
-```
+`bench_matrix` and `bench_grid` are the sole comparative harness. The separate
+`push_batch` microbenchmark remains available for its focused API measurement.
 
 ## License
 

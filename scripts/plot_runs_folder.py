@@ -73,7 +73,7 @@ def main() -> int:
         "--max-line-series",
         type=int,
         default=10,
-        help="Maximum configs shown in per-machine scenario line charts; <=0 shows all (default: 10)",
+        help="Deprecated compatibility option; plots now show one best variation per queue family",
     )
     args = parser.parse_args()
 

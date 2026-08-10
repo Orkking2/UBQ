@@ -2,9 +2,9 @@
 
 #[cfg(feature = "bench_registry")]
 use crate::align;
-use crate::{ConfiguredUBQ, backoff};
+use crate::{ConfiguredUBQ, backoff, dynamic::DUBQ};
 use concurrent_queue::{ConcurrentQueue, PopError};
-use crossbeam_queue::SegQueue;
+use crossbeam_queue::{BatchQueue, SegQueue};
 use crossbeam_utils::Backoff;
 #[cfg(feature = "bench_lfqueue")]
 use lfqueue::UnboundedQueue as LfUnboundedQueue;
@@ -16,13 +16,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::marker::PhantomData;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
     Arc, Barrier, OnceLock,
-    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     mpsc,
 };
 use std::thread;
@@ -30,21 +31,66 @@ use std::thread::available_parallelism;
 
 fn bench_core_ids() -> &'static [core_affinity::CoreId] {
     static IDS: OnceLock<Vec<core_affinity::CoreId>> = OnceLock::new();
-    IDS.get_or_init(|| core_affinity::get_core_ids().unwrap_or_default())
+    IDS.get_or_init(|| {
+        let discovered = core_affinity::get_core_ids().unwrap_or_default();
+        let Ok(raw) = std::env::var("UBQ_BENCH_CORE_IDS") else {
+            return discovered;
+        };
+        let requested = parse_core_ids(&raw).unwrap_or_default();
+        requested
+            .into_iter()
+            .filter_map(|id| discovered.iter().find(|core| core.id == id).copied())
+            .collect()
+    })
+}
+
+fn producer_core_slot(producers: usize, consumers: usize, producer_id: usize) -> usize {
+    let paired = producers.min(consumers);
+    if producer_id < paired {
+        producer_id * 2
+    } else {
+        paired * 2 + producer_id - paired
+    }
+}
+
+fn consumer_core_slot(producers: usize, consumers: usize, consumer_id: usize) -> usize {
+    let paired = producers.min(consumers);
+    if consumer_id < paired {
+        consumer_id * 2 + 1
+    } else {
+        paired * 2 + consumer_id - paired
+    }
+}
+
+fn producer_core_id(
+    core_offset: usize,
+    producers: usize,
+    consumers: usize,
+    producer_id: usize,
+) -> Option<core_affinity::CoreId> {
+    bench_core_ids()
+        .get(core_offset + producer_core_slot(producers, consumers, producer_id))
+        .copied()
+}
+
+fn consumer_core_id(
+    core_offset: usize,
+    producers: usize,
+    consumers: usize,
+    consumer_id: usize,
+) -> Option<core_affinity::CoreId> {
+    bench_core_ids()
+        .get(core_offset + consumer_core_slot(producers, consumers, consumer_id))
+        .copied()
 }
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::task::JoinSet;
 
-pub const RUN_SCHEMA_VERSION: u32 = 3;
-pub const PLAN_SCHEMA_VERSION: u32 = 2;
+pub const RUN_SCHEMA_VERSION: u32 = 6;
+pub const PLAN_SCHEMA_VERSION: u32 = 6;
 pub const DEFAULT_ITEMS_PER_PRODUCER: u64 = 1_000_000;
 pub const DEFAULT_RUNS_DIR: &str = "bench_results/runs";
 pub const DEFAULT_PLOTS_DIR: &str = "bench_results/plots";
-pub const DEFAULT_SCENARIOS: &[&str] = &[
-    "1p1c", "4p1c", "1p4c", "4p4c", "8p1c", "8p4c", "8p8c", "1p8c", "4p8c", "16p1c", "1p16c",
-    "8p16c", "16p8c", "16p16c", "32p1c", "1p32c", "16p32c", "32p16c", "32p32c", "64p1c", "1p64c",
-    "32p64c", "64p32c", "64p64c",
-];
+pub const DEFAULT_SCENARIOS: &[&str] = &["pow2:machine"];
 pub const BBQ_ATC22_X86_88T_SCENARIO_SUITE: &str = "bbq-atc22-x86-88t";
 pub const BBQ_ATC22_OVERSUB_X86_12T_SCENARIO_SUITE: &str = "bbq-atc22-oversub-x86-12t";
 
@@ -66,65 +112,56 @@ const LOG_MESSAGES: [&str; 8] = [
     "released request context",
 ];
 const DEFAULT_FASTFIFO_BLOCK_SIZES: [usize; 4] = [64, 256, 1024, 4096];
-#[cfg(feature = "bench_fastfifo")]
-const RBBQ_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(feature = "bench_wcq")]
-const WCQ_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_BENCH_JOB_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_BENCH_JOB_TIMEOUT_SECS: u64 = 30;
+const BENCH_WORKER_ENV: &str = "UBQ_BENCH_INTERNAL_WORKER";
+const BENCH_WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const DEFAULT_THROUGHPUT_WARMUP_MS: u64 = 250;
+pub const DEFAULT_THROUGHPUT_PHASE_MS: u64 = 1_000;
+pub const DEFAULT_THROUGHPUT_PILOT_MS: u64 = 100;
+pub const DEFAULT_THROUGHPUT_MAX_ROUND_ITEMS: u64 = 8_388_608;
+pub const DEFAULT_SCHEDULE_SEED: u64 = 0x5542_5106;
+pub const DEFAULT_FASTFIFO_CAPACITY: usize = 1_048_576;
+const INITIAL_THROUGHPUT_PILOT_ITEMS_PER_PRODUCER: u64 = 4_096;
+
+fn default_schedule_seed() -> u64 {
+    DEFAULT_SCHEDULE_SEED
+}
+
+fn default_fastfifo_capacities() -> Vec<usize> {
+    vec![DEFAULT_FASTFIFO_CAPACITY]
+}
 const UBQ_POOL_VALUES: [u8; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
 const UBQ_BLOCK_VALUES: [u16; 8] = [31, 63, 127, 255, 511, 1023, 2047, 4095];
 const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
 const UBQ_SPARSE_POOL_VALUES: [u8; 4] = [0, 1, 8, 64];
 const UBQ_SPARSE_BLOCK_VALUES: [u16; 5] = [31, 127, 511, 2047, 4095];
-pub const DEFAULT_UBQ_BATCH_SIZES: [usize; 11] = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+pub const DEFAULT_UBQ_BATCH_SIZES: [usize; 3] = [8, 32, 256];
 const DEFAULT_LFQUEUE_SEGMENT_SIZES: [usize; 3] = [32, 256, 1024];
 const DEFAULT_WCQ_CAPACITIES: [usize; 3] = [4096, 65536, 1048576];
 const SUPPORTED_WCQ_CAPACITIES: [usize; 8] =
     [256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304];
 const WCQ_MAX_THREADS: usize = 256;
 
-thread_local! {
-    static BENCH_JOB_DEADLINE: std::cell::Cell<Option<Instant>> =
-        const { std::cell::Cell::new(None) };
-}
-
-fn bench_job_timeout() -> Duration {
-    std::env::var("UBQ_BENCH_JOB_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
+fn bench_job_timeout(plan: &MatrixPlan) -> Duration {
+    let configured_budget = plan
+        .throughput_policy
+        .warmup_duration()
+        .checked_add(plan.throughput_policy.pilot_duration())
+        .unwrap_or(Duration::MAX)
+        .checked_add(plan.throughput_policy.phase_duration().saturating_mul(3))
+        .unwrap_or(Duration::MAX)
+        .saturating_mul(5)
+        .max(Duration::from_secs(DEFAULT_BENCH_JOB_TIMEOUT_SECS));
+    plan.job_timeout_secs
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(DEFAULT_BENCH_JOB_TIMEOUT_SECS))
-}
-
-fn current_bench_job_deadline() -> Option<Instant> {
-    BENCH_JOB_DEADLINE.with(std::cell::Cell::get)
-}
-
-fn with_bench_job_deadline<T>(deadline: Option<Instant>, f: impl FnOnce() -> T) -> T {
-    struct DeadlineGuard(Option<Instant>);
-
-    impl Drop for DeadlineGuard {
-        fn drop(&mut self) {
-            BENCH_JOB_DEADLINE.with(|slot| slot.set(self.0));
-        }
-    }
-
-    BENCH_JOB_DEADLINE.with(|slot| {
-        let previous = slot.replace(deadline);
-        let _guard = DeadlineGuard(previous);
-        f()
-    })
-}
-
-fn check_bench_job_deadline(operation: &str) {
-    let Some(deadline) = current_bench_job_deadline() else {
-        return;
-    };
-    assert!(
-        Instant::now() < deadline,
-        "benchmark job timed out while {operation}"
-    );
+        .or_else(|| {
+            std::env::var("UBQ_BENCH_JOB_TIMEOUT_SECS")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .filter(|secs| *secs > 0)
+                .map(Duration::from_secs)
+        })
+        .unwrap_or(configured_budget)
 }
 
 fn spawn_bench_thread<F, T>(f: F) -> thread::JoinHandle<T>
@@ -132,8 +169,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    let deadline = current_bench_job_deadline();
-    thread::spawn(move || with_bench_job_deadline(deadline, f))
+    thread::spawn(f)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,32 +262,91 @@ pub trait LogQueue: LogQueueOps {
 }
 
 pub trait BenchQueueOps: Send + Sync + 'static {
-    fn send_value(&self, value: u64);
+    fn try_send_value(&self, value: u64) -> bool;
+    fn send_value(&self, value: u64) {
+        let backoff = Backoff::new();
+        while !self.try_send_value(value) {
+            backoff.snooze();
+        }
+    }
     fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
         for offset in offsets {
             self.send_value(base + offset as u64);
         }
     }
-    fn recv_value(&self) -> u64;
+    fn try_recv_value(&self) -> Option<u64>;
+    fn try_recv_batch(&self, request_size: usize) -> usize {
+        let mut received = 0;
+        for _ in 0..request_size {
+            if self.try_recv_value().is_none() {
+                break;
+            }
+
+            received += 1;
+        }
+        received
+    }
+    fn bounded_capacity(&self) -> Option<usize> {
+        None
+    }
+    fn recv_value(&self) -> u64 {
+        let backoff = Backoff::new();
+        loop {
+            if let Some(value) = self.try_recv_value() {
+                return value;
+            }
+            backoff.snooze();
+        }
+    }
 }
 
 pub trait BenchQueueThreadOps: Send + 'static {
-    fn send_value(&self, value: u64);
+    fn try_send_value(&self, value: u64) -> bool;
+    fn send_value(&self, value: u64) {
+        let backoff = Backoff::new();
+        while !self.try_send_value(value) {
+            backoff.snooze();
+        }
+    }
     fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>);
-    fn recv_value(&self) -> u64;
+    fn try_recv_value(&self) -> Option<u64>;
+    fn try_recv_batch(&self, request_size: usize) -> usize {
+        let mut received = 0;
+        for _ in 0..request_size {
+            if self.try_recv_value().is_none() {
+                break;
+            }
+
+            received += 1;
+        }
+        received
+    }
+    fn recv_value(&self) -> u64 {
+        let backoff = Backoff::new();
+        loop {
+            if let Some(value) = self.try_recv_value() {
+                return value;
+            }
+            backoff.snooze();
+        }
+    }
 }
 
 impl<Q: BenchQueueOps> BenchQueueThreadOps for Arc<Q> {
-    fn send_value(&self, value: u64) {
-        (**self).send_value(value);
+    fn try_send_value(&self, value: u64) -> bool {
+        (**self).try_send_value(value)
     }
 
     fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
         (**self).send_batch(base, offsets);
     }
 
-    fn recv_value(&self) -> u64 {
-        (**self).recv_value()
+    fn try_recv_value(&self) -> Option<u64> {
+        (**self).try_recv_value()
+    }
+
+    fn try_recv_batch(&self, request_size: usize) -> usize {
+        (**self).try_recv_batch(request_size)
     }
 }
 
@@ -259,6 +354,9 @@ pub trait BenchQueueHandleFactory: Send + Sync + 'static {
     type ThreadHandle: BenchQueueThreadOps;
 
     fn thread_handle(self: &Arc<Self>) -> Self::ThreadHandle;
+    fn bounded_capacity(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl<Q: BenchQueueOps> BenchQueueHandleFactory for Q {
@@ -266,6 +364,10 @@ impl<Q: BenchQueueOps> BenchQueueHandleFactory for Q {
 
     fn thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
         self.clone()
+    }
+
+    fn bounded_capacity(&self) -> Option<usize> {
+        BenchQueueOps::bounded_capacity(self)
     }
 }
 
@@ -275,31 +377,77 @@ pub trait BenchQueue: BenchQueueOps {
         Self: Sized;
 }
 
+struct DubqBenchQueue<T, B> {
+    inner: Arc<DUBQ<T>>,
+    _backoff: PhantomData<fn() -> B>,
+}
+
+impl<T, B> DubqBenchQueue<T, B> {
+    fn new(pool_size: usize, min_block_size: u16) -> Arc<Self> {
+        Arc::new(Self {
+            inner: DUBQ::new(pool_size, min_block_size),
+            _backoff: PhantomData,
+        })
+    }
+}
+
+impl<B: backoff::BackoffPolicy + 'static> BenchQueueOps for DubqBenchQueue<u64, B> {
+    fn try_send_value(&self, value: u64) -> bool {
+        self.inner.push_batch::<_, B>(core::iter::once(value));
+        true
+    }
+
+    fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
+        self.inner
+            .push_batch::<_, B>(offsets.map(move |offset| base + offset as u64));
+    }
+
+    fn try_recv_value(&self) -> Option<u64> {
+        self.inner.pop_batch::<B>(1).next()
+    }
+
+    fn try_recv_batch(&self, request_size: usize) -> usize {
+        self.inner.pop_batch::<B>(request_size).count()
+    }
+}
+
+impl<B: backoff::BackoffPolicy + 'static> LogQueueOps for DubqBenchQueue<LogRecord, B> {
+    fn send_log(&self, record: LogRecord) {
+        self.inner.push_batch::<_, B>(core::iter::once(record));
+    }
+
+    fn recv_log(&self) -> LogRecord {
+        let backoff = B::new();
+        loop {
+            if let Some(record) = self.inner.pop_batch::<B>(1).next() {
+                return record;
+            }
+            backoff.snooze();
+        }
+    }
+}
+
 impl<B, const POOL: usize, const BLOCK: usize, A> BenchQueueOps
     for ConfiguredUBQ<u64, B, POOL, BLOCK, A>
 where
     B: backoff::BackoffPolicy + 'static,
     A: Send + Sync + 'static,
 {
-    fn send_value(&self, value: u64) {
-        check_bench_job_deadline("pushing to UBQ");
+    fn try_send_value(&self, value: u64) -> bool {
         self.push(value);
+        true
     }
 
     fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
-        check_bench_job_deadline("batch-pushing to UBQ");
         self.push_batch(offsets.map(move |offset| base + offset as u64));
     }
 
-    fn recv_value(&self) -> u64 {
-        let backoff = Backoff::new();
-        loop {
-            check_bench_job_deadline("popping from UBQ");
-            if let Some(value) = self.pop() {
-                return value;
-            }
-            backoff.snooze();
-        }
+    fn try_recv_value(&self) -> Option<u64> {
+        self.pop()
+    }
+
+    fn try_recv_batch(&self, request_size: usize) -> usize {
+        self.pop_batch(request_size).count()
     }
 }
 
@@ -321,14 +469,12 @@ where
     A: Send + Sync + 'static,
 {
     fn send_log(&self, record: LogRecord) {
-        check_bench_job_deadline("pushing log record to UBQ");
         self.push(record);
     }
 
     fn recv_log(&self) -> LogRecord {
         let backoff = Backoff::new();
         loop {
-            check_bench_job_deadline("popping log record from UBQ");
             if let Some(record) = self.pop() {
                 return record;
             }
@@ -349,20 +495,13 @@ where
 }
 
 impl BenchQueueOps for SegQueue<u64> {
-    fn send_value(&self, value: u64) {
-        check_bench_job_deadline("pushing to SegQueue");
+    fn try_send_value(&self, value: u64) -> bool {
         self.push(value);
+        true
     }
 
-    fn recv_value(&self) -> u64 {
-        let backoff = Backoff::new();
-        loop {
-            check_bench_job_deadline("popping from SegQueue");
-            if let Some(value) = self.pop() {
-                return value;
-            }
-            backoff.snooze();
-        }
+    fn try_recv_value(&self) -> Option<u64> {
+        self.pop()
     }
 }
 
@@ -372,16 +511,39 @@ impl BenchQueue for SegQueue<u64> {
     }
 }
 
+impl BenchQueueOps for BatchQueue<u64> {
+    fn try_send_value(&self, value: u64) -> bool {
+        self.push(core::iter::once(value));
+        true
+    }
+
+    fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
+        self.push(offsets.map(move |offset| base + offset as u64));
+    }
+
+    fn try_recv_value(&self) -> Option<u64> {
+        self.pop(1).next()
+    }
+
+    fn try_recv_batch(&self, request_size: usize) -> usize {
+        self.pop(request_size).count()
+    }
+}
+
+impl BenchQueue for BatchQueue<u64> {
+    fn new_queue() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+}
+
 impl LogQueueOps for SegQueue<LogRecord> {
     fn send_log(&self, record: LogRecord) {
-        check_bench_job_deadline("pushing log record to SegQueue");
         self.push(record);
     }
 
     fn recv_log(&self) -> LogRecord {
         let backoff = Backoff::new();
         loop {
-            check_bench_job_deadline("popping log record from SegQueue");
             if let Some(record) = self.pop() {
                 return record;
             }
@@ -397,21 +559,16 @@ impl LogQueue for SegQueue<LogRecord> {
 }
 
 impl BenchQueueOps for ConcurrentQueue<u64> {
-    fn send_value(&self, value: u64) {
-        check_bench_job_deadline("pushing to concurrent-queue");
+    fn try_send_value(&self, value: u64) -> bool {
         self.push(value).expect("send failed");
+        true
     }
 
-    fn recv_value(&self) -> u64 {
-        let backoff = Backoff::new();
-        loop {
-            check_bench_job_deadline("popping from concurrent-queue");
-            match self.pop() {
-                Ok(value) => return value,
-                Err(PopError::Empty) => {}
-                Err(PopError::Closed) => panic!("recv failed: queue closed"),
-            }
-            backoff.snooze();
+    fn try_recv_value(&self) -> Option<u64> {
+        match self.pop() {
+            Ok(value) => Some(value),
+            Err(PopError::Empty) => None,
+            Err(PopError::Closed) => panic!("recv failed: queue closed"),
         }
     }
 }
@@ -424,14 +581,12 @@ impl BenchQueue for ConcurrentQueue<u64> {
 
 impl LogQueueOps for ConcurrentQueue<LogRecord> {
     fn send_log(&self, record: LogRecord) {
-        check_bench_job_deadline("pushing log record to concurrent-queue");
         self.push(record).expect("send failed");
     }
 
     fn recv_log(&self) -> LogRecord {
         let backoff = Backoff::new();
         loop {
-            check_bench_job_deadline("popping log record from concurrent-queue");
             match self.pop() {
                 Ok(record) => return record,
                 Err(PopError::Empty) => {}
@@ -464,20 +619,13 @@ impl LfQueueBenchQueue {
 
 #[cfg(feature = "bench_lfqueue")]
 impl BenchQueueOps for LfQueueBenchQueue {
-    fn send_value(&self, value: u64) {
-        check_bench_job_deadline("pushing to lfqueue");
+    fn try_send_value(&self, value: u64) -> bool {
         self.inner.enqueue(value);
+        true
     }
 
-    fn recv_value(&self) -> u64 {
-        let backoff = Backoff::new();
-        loop {
-            check_bench_job_deadline("popping from lfqueue");
-            if let Some(value) = self.inner.dequeue() {
-                return value;
-            }
-            backoff.snooze();
-        }
+    fn try_recv_value(&self) -> Option<u64> {
+        self.inner.dequeue()
     }
 }
 
@@ -498,14 +646,12 @@ impl LogLfQueueBenchQueue {
 #[cfg(feature = "bench_lfqueue")]
 impl LogQueueOps for LogLfQueueBenchQueue {
     fn send_log(&self, record: LogRecord) {
-        check_bench_job_deadline("pushing log record to lfqueue");
         self.inner.enqueue(record);
     }
 
     fn recv_log(&self) -> LogRecord {
         let backoff = Backoff::new();
         loop {
-            check_bench_job_deadline("popping log record from lfqueue");
             if let Some(record) = self.inner.dequeue() {
                 return record;
             }
@@ -525,7 +671,7 @@ impl<const CAPACITY: usize> WcqBenchQueue<CAPACITY> {
         // Queue<u64, CAPACITY, WCQ_MAX_THREADS> is stored inline, so Arc::new()
         // must construct it on the calling thread's stack before promoting it to
         // the heap. For large CAPACITY values (e.g. 1M cells × ~48 B each = ~48 MB)
-        // this overflows the default tokio spawn_blocking stack (8 MB on Linux/macOS).
+        // this can overflow a normal benchmark-worker thread stack.
         // Use a dedicated OS thread with a generous stack reservation whenever the
         // struct exceeds 4 MiB; virtual pages are committed lazily on Linux/macOS.
         const STACK_THRESHOLD: usize = 4 * 1024 * 1024;
@@ -567,86 +713,62 @@ impl<const CAPACITY: usize> BenchQueueHandleFactory for WcqBenchQueue<CAPACITY> 
             handle,
         }
     }
+
+    fn bounded_capacity(&self) -> Option<usize> {
+        Some(CAPACITY)
+    }
 }
 
 #[cfg(feature = "bench_wcq")]
 impl<const CAPACITY: usize> BenchQueueThreadOps for WcqThreadHandle<CAPACITY> {
-    fn send_value(&self, value: u64) {
-        let deadline = Instant::now() + WCQ_WAIT_TIMEOUT;
-        let backoff = Backoff::new();
-        loop {
-            check_bench_job_deadline("pushing to wCQ");
-            if self.queue.inner.enqueue(self.handle, value).is_ok() {
-                return;
-            }
-            assert!(Instant::now() < deadline, "timed out pushing to wCQ");
-            backoff.snooze();
+    fn try_send_value(&self, value: u64) -> bool {
+        self.queue.inner.enqueue(self.handle, value).is_ok()
+    }
+
+    fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
+        for offset in offsets {
+            self.send_value(base + offset as u64);
         }
     }
 
-    fn recv_value(&self) -> u64 {
-        let backoff = Backoff::new();
-        loop {
-            check_bench_job_deadline("popping from wCQ");
-            if let Some(value) = self.queue.inner.dequeue(self.handle) {
-                return value;
-            }
-            backoff.snooze();
-        }
+    fn try_recv_value(&self) -> Option<u64> {
+        self.queue.inner.dequeue(self.handle)
     }
 }
 
 #[cfg(feature = "bench_fastfifo")]
 struct RbbqBenchQueue {
     inner: FastFifo<u64>,
+    capacity: usize,
 }
 
 #[cfg(feature = "bench_fastfifo")]
 impl RbbqBenchQueue {
-    fn new(scenario: &ScenarioConfig, items_per_producer: u64, block_size: usize) -> Arc<Self> {
-        let total_items = usize::try_from(total_items(items_per_producer, scenario.producers))
-            .expect("total items must fit usize for RBBQ capacity");
-        let required_capacity = total_items
-            .checked_add(scenario.consumers)
-            .and_then(|value| value.checked_add(block_size))
-            .expect("RBBQ required capacity overflow");
-        let num_blocks = required_capacity
-            .div_ceil(block_size)
-            .checked_add(2)
-            .expect("RBBQ block count overflow")
-            .max(2);
+    fn new(block_size: usize, requested_capacity: usize) -> Arc<Self> {
+        let data_blocks = requested_capacity.div_ceil(block_size).max(1);
+        // FastFifo needs three control/transition blocks beyond the usable
+        // data capacity (the prior workload-sized adapter used this same
+        // safety margin implicitly).
+        let num_blocks = data_blocks.checked_add(3).expect("FastFifo block overflow");
         Arc::new(Self {
             inner: FastFifo::new(num_blocks, block_size),
+            capacity: data_blocks * block_size,
         })
     }
 }
 
 #[cfg(feature = "bench_fastfifo")]
 impl BenchQueueOps for RbbqBenchQueue {
-    fn send_value(&self, value: u64) {
-        let deadline = Instant::now() + RBBQ_WAIT_TIMEOUT;
-        let backoff = Backoff::new();
-        loop {
-            check_bench_job_deadline("pushing to RBBQ");
-            if self.inner.push(value).is_ok() {
-                return;
-            }
-            assert!(Instant::now() < deadline, "timed out pushing to RBBQ");
-            backoff.snooze();
-        }
+    fn try_send_value(&self, value: u64) -> bool {
+        self.inner.push(value).is_ok()
     }
 
-    fn recv_value(&self) -> u64 {
-        let deadline = Instant::now() + RBBQ_WAIT_TIMEOUT;
-        let backoff = Backoff::new();
-        loop {
-            check_bench_job_deadline("popping from RBBQ");
-            if let Ok(value) = self.inner.pop() {
-                return value;
-            }
-            assert!(Instant::now() < deadline, "timed out popping from RBBQ");
-            backoff.snooze();
-        }
+    fn try_recv_value(&self) -> Option<u64> {
+        self.inner.pop().ok()
+    }
+
+    fn bounded_capacity(&self) -> Option<usize> {
+        Some(self.capacity)
     }
 }
 
@@ -657,18 +779,9 @@ struct LogRbbqBenchQueue {
 
 #[cfg(feature = "bench_fastfifo")]
 impl LogRbbqBenchQueue {
-    fn new(scenario: &ScenarioConfig, items_per_producer: u64, block_size: usize) -> Arc<Self> {
-        let total_items = usize::try_from(total_items(items_per_producer, scenario.producers))
-            .expect("total items must fit usize for RBBQ capacity");
-        let required_capacity = total_items
-            .checked_add(scenario.consumers)
-            .and_then(|value| value.checked_add(block_size))
-            .expect("RBBQ required capacity overflow");
-        let num_blocks = required_capacity
-            .div_ceil(block_size)
-            .checked_add(2)
-            .expect("RBBQ block count overflow")
-            .max(2);
+    fn new(block_size: usize, requested_capacity: usize) -> Arc<Self> {
+        let data_blocks = requested_capacity.div_ceil(block_size).max(1);
+        let num_blocks = data_blocks.checked_add(3).expect("FastFifo block overflow");
         Arc::new(Self {
             inner: FastFifo::new(num_blocks, block_size),
         })
@@ -678,27 +791,21 @@ impl LogRbbqBenchQueue {
 #[cfg(feature = "bench_fastfifo")]
 impl LogQueueOps for LogRbbqBenchQueue {
     fn send_log(&self, record: LogRecord) {
-        let deadline = Instant::now() + RBBQ_WAIT_TIMEOUT;
         let backoff = Backoff::new();
         loop {
-            check_bench_job_deadline("pushing log record to RBBQ");
             if self.inner.push(record).is_ok() {
                 return;
             }
-            assert!(Instant::now() < deadline, "timed out pushing to RBBQ");
             backoff.snooze();
         }
     }
 
     fn recv_log(&self) -> LogRecord {
-        let deadline = Instant::now() + RBBQ_WAIT_TIMEOUT;
         let backoff = Backoff::new();
         loop {
-            check_bench_job_deadline("popping log record from RBBQ");
             if let Ok(record) = self.inner.pop() {
                 return record;
             }
-            assert!(Instant::now() < deadline, "timed out popping from RBBQ");
             backoff.snooze();
         }
     }
@@ -711,11 +818,70 @@ pub enum Mode {
     ComplexThroughput,
     DataLatency,
     Fairness,
-    FillDrain,
     AppLogFanIn,
     AppPipeline,
     AppTaskRoundtrip,
     AppLogMpscFile,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemPolicy {
+    #[default]
+    Explicit,
+    ScenarioScaledV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ThroughputPolicy {
+    pub warmup_ms: u64,
+    pub phase_ms: u64,
+    pub pilot_ms: u64,
+    pub max_round_items: u64,
+}
+
+impl Default for ThroughputPolicy {
+    fn default() -> Self {
+        Self {
+            warmup_ms: DEFAULT_THROUGHPUT_WARMUP_MS,
+            phase_ms: DEFAULT_THROUGHPUT_PHASE_MS,
+            pilot_ms: DEFAULT_THROUGHPUT_PILOT_MS,
+            max_round_items: DEFAULT_THROUGHPUT_MAX_ROUND_ITEMS,
+        }
+    }
+}
+
+impl ThroughputPolicy {
+    pub fn warmup_duration(self) -> Duration {
+        Duration::from_millis(self.warmup_ms)
+    }
+
+    pub fn phase_duration(self) -> Duration {
+        Duration::from_millis(self.phase_ms)
+    }
+
+    pub fn pilot_duration(self) -> Duration {
+        Duration::from_millis(self.pilot_ms)
+    }
+
+    pub fn validate(self) -> Result<(), String> {
+        if self.warmup_ms == 0 || self.phase_ms == 0 || self.pilot_ms == 0 {
+            return Err("throughput timing values must be greater than zero".to_string());
+        }
+        if self.max_round_items == 0 {
+            return Err("throughput max round items must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl ItemPolicy {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::ScenarioScaledV1 => "scenario_scaled_v1",
+        }
+    }
 }
 
 impl Mode {
@@ -725,7 +891,6 @@ impl Mode {
             Mode::ComplexThroughput => "complex_throughput",
             Mode::DataLatency => "data_latency",
             Mode::Fairness => "fairness",
-            Mode::FillDrain => "fill_drain",
             Mode::AppLogFanIn => "app_log_fan_in",
             Mode::AppPipeline => "app_pipeline",
             Mode::AppTaskRoundtrip => "app_task_roundtrip",
@@ -741,7 +906,6 @@ impl Mode {
             }
             "data_latency" | "data-latency" => Some(Self::DataLatency),
             "fairness" => Some(Self::Fairness),
-            "fill_drain" | "fill-drain" => Some(Self::FillDrain),
             "app_log_fan_in" | "app-log-fan-in" => Some(Self::AppLogFanIn),
             "app_pipeline" | "app-pipeline" => Some(Self::AppPipeline),
             "app_task_roundtrip" | "app-task-roundtrip" => Some(Self::AppTaskRoundtrip),
@@ -761,6 +925,7 @@ impl Mode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum QueueKind {
     Ubq,
+    Dubq,
     SegQueue,
     ConcurrentQueue,
     FastFifo,
@@ -772,6 +937,7 @@ impl QueueKind {
     pub fn name(self) -> &'static str {
         match self {
             QueueKind::Ubq => "ubq",
+            QueueKind::Dubq => "dubq",
             QueueKind::SegQueue => "segqueue",
             QueueKind::ConcurrentQueue => "concurrent-queue",
             QueueKind::FastFifo => "fastfifo",
@@ -783,6 +949,7 @@ impl QueueKind {
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
             "ubq" => Some(Self::Ubq),
+            "dubq" | "dynamic-ubq" | "dynamic" => Some(Self::Dubq),
             "segqueue" | "crossbeam" | "crossbeam-segqueue" => Some(Self::SegQueue),
             "concurrent-queue" | "concurrent" => Some(Self::ConcurrentQueue),
             "fastfifo" | "fast-fifo" | "rbbq" | "bbq" => Some(Self::FastFifo),
@@ -793,7 +960,7 @@ impl QueueKind {
     }
 
     pub fn is_baseline(self) -> bool {
-        !matches!(self, QueueKind::Ubq)
+        !matches!(self, QueueKind::Ubq | QueueKind::Dubq)
     }
 }
 
@@ -848,11 +1015,32 @@ pub struct UbqLabel {
     pub backoff: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct DubqLabel {
+    pub pool: usize,
+    pub min_block_size: u16,
+    pub backoff: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UbqGrid {
     Sparse,
     Dense,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorePlacement {
+    Interleaved,
+}
+
+impl CorePlacement {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Interleaved => "interleaved",
+        }
+    }
 }
 
 impl UbqGrid {
@@ -882,6 +1070,26 @@ impl UbqGrid {
         }
         labels
     }
+
+    pub fn dubq_labels(self) -> Vec<String> {
+        let pools: &[u8] = match self {
+            Self::Sparse => &UBQ_SPARSE_POOL_VALUES,
+            Self::Dense => &UBQ_POOL_VALUES,
+        };
+        let blocks: &[u16] = match self {
+            Self::Sparse => &UBQ_SPARSE_BLOCK_VALUES,
+            Self::Dense => &UBQ_BLOCK_VALUES,
+        };
+        let mut labels = Vec::with_capacity(pools.len() * blocks.len() * UBQ_BACKOFF_VALUES.len());
+        for pool in pools {
+            for block in blocks {
+                for backoff in UBQ_BACKOFF_VALUES {
+                    labels.push(format!("{pool},{block},{backoff}"));
+                }
+            }
+        }
+        labels
+    }
 }
 
 impl UbqLabel {
@@ -900,6 +1108,16 @@ impl UbqLabel {
     }
 }
 
+impl DubqLabel {
+    pub fn text(&self) -> String {
+        format!("{},{},{}", self.pool, self.min_block_size, self.backoff)
+    }
+
+    pub fn safe(&self) -> String {
+        format!("{}_{}_{}", self.pool, self.min_block_size, self.backoff)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct JobSpec {
     pub scenario: ScenarioConfig,
@@ -909,12 +1127,46 @@ pub struct JobSpec {
     pub queue: QueueKind,
     pub ubq_label: Option<String>,
     #[serde(default)]
+    pub dubq_label: Option<String>,
+    #[serde(default)]
     pub batch_size: Option<usize>,
     pub fastfifo_block_size: Option<usize>,
+    #[serde(default)]
+    pub fastfifo_capacity: Option<usize>,
     #[serde(default)]
     pub lfqueue_segment_size: Option<usize>,
     #[serde(default)]
     pub wcq_capacity: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkerRequest {
+    protocol_version: u32,
+    request_id: u64,
+    command: WorkerCommand,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+enum WorkerCommand {
+    Run { spec: JobSpec },
+    Shutdown,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkerResponse {
+    protocol_version: u32,
+    request_id: u64,
+    result: WorkerResult,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+enum WorkerResult {
+    Completed { record: BenchRecord },
+    Failed { reason: String },
+    ShuttingDown,
+    ProtocolError { reason: String },
 }
 
 impl JobSpec {
@@ -922,14 +1174,21 @@ impl JobSpec {
         match (
             &self.queue,
             &self.ubq_label,
+            &self.dubq_label,
             self.fastfifo_block_size,
+            self.fastfifo_capacity,
             self.lfqueue_segment_size,
             self.wcq_capacity,
         ) {
-            (QueueKind::Ubq, Some(label), _, _, _) => format!("ubq_{label}"),
-            (QueueKind::FastFifo, _, Some(block_size), _, _) => fastfifo_queue_label(block_size),
-            (QueueKind::LfQueue, _, _, Some(segment_size), _) => lfqueue_queue_label(segment_size),
-            (QueueKind::Wcq, _, _, _, Some(capacity)) => wcq_queue_label(capacity),
+            (QueueKind::Ubq, Some(label), _, _, _, _, _) => format!("ubq_{label}"),
+            (QueueKind::Dubq, _, Some(label), _, _, _, _) => format!("dubq_{label}"),
+            (QueueKind::FastFifo, _, _, Some(block_size), Some(capacity), _, _) => {
+                fastfifo_queue_label(block_size, capacity)
+            }
+            (QueueKind::LfQueue, _, _, _, _, Some(segment_size), _) => {
+                lfqueue_queue_label(segment_size)
+            }
+            (QueueKind::Wcq, _, _, _, _, _, Some(capacity)) => wcq_queue_label(capacity),
             _ => self.queue.name().to_string(),
         }
     }
@@ -992,6 +1251,8 @@ pub struct PlanBundle {
     pub scenario: ScenarioConfig,
     pub repeat_index: usize,
     pub ubq_label: Option<String>,
+    #[serde(default)]
+    pub dubq_label: Option<String>,
     pub modes: Vec<Mode>,
     pub items_per_producer_values: Vec<u64>,
 }
@@ -999,12 +1260,27 @@ pub struct PlanBundle {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MatrixPlan {
     pub plan_schema_version: u32,
+    pub core_placement: CorePlacement,
+    #[serde(default)]
+    pub item_policy: ItemPolicy,
     pub machine_label: String,
     pub runs_dir: PathBuf,
     pub available_parallelism: usize,
+    #[serde(default)]
+    pub core_ids: Vec<usize>,
+    #[serde(default)]
+    pub allow_unpinned: bool,
+    #[serde(default = "default_schedule_seed")]
+    pub schedule_seed: u64,
+    #[serde(default)]
+    pub throughput_policy: ThroughputPolicy,
+    #[serde(default)]
+    pub job_timeout_secs: Option<u64>,
     pub baseline_queues: Vec<QueueKind>,
     #[serde(default)]
     pub fastfifo_block_sizes: Vec<usize>,
+    #[serde(default = "default_fastfifo_capacities")]
+    pub fastfifo_capacities: Vec<usize>,
     #[serde(default)]
     pub lfqueue_segment_sizes: Vec<usize>,
     #[serde(default)]
@@ -1035,16 +1311,14 @@ pub struct FrontierConfig {
     pub available_parallelism: usize,
 }
 
-/// Outcome returned by [`build_and_run_matrix_plan`] after the generated
-/// scheduler subprocess exits. Infrastructure errors (compile failure, spawn
-/// failure) still propagate as `Err`.
+/// Outcome returned after a matrix scheduler finishes. Infrastructure errors
+/// such as worker spawn or protocol failures still propagate as `Err`.
 #[derive(Debug)]
 pub struct BatchOutcome {
-    /// `true` if the scheduler subprocess exited with a success code.
+    /// `true` if the scheduler itself completed successfully.
     pub exit_success: bool,
-    /// If the scheduler crashed and a specific UBQ job was identified as the
-    /// in-flight victim, its `(queue_label, scenario_name)` is stored here.
-    /// `None` on success or when no UBQ victim could be identified.
+    /// Legacy generated schedulers may identify an in-flight UBQ victim here.
+    /// The persistent-worker scheduler checkpoints failures per sample instead.
     pub crashed_job: Option<(String, String)>,
 }
 
@@ -1057,14 +1331,37 @@ pub struct OutputMeta {
     pub consumers: usize,
     pub repeat_index: usize,
     pub available_parallelism: usize,
+    pub core_placement: CorePlacement,
+    #[serde(default)]
+    pub selected_core_ids: Vec<usize>,
+    #[serde(default)]
+    pub producer_core_ids: Vec<usize>,
+    #[serde(default)]
+    pub consumer_core_ids: Vec<usize>,
+    #[serde(default)]
+    pub affinity_authoritative: bool,
+    #[serde(default = "default_schedule_seed")]
+    pub schedule_seed: u64,
+    #[serde(default)]
+    pub throughput_policy: ThroughputPolicy,
+    #[serde(default)]
+    pub experiment_fingerprint: String,
+    #[serde(default)]
+    pub item_policy: ItemPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ubq_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ubq_block_size: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dubq_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dubq_min_block_size: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ubq_grid: Option<UbqGrid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_ubq_configurations: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_dubq_configurations: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ubq_batch_sizes: Vec<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1079,6 +1376,35 @@ pub enum BenchRecordStatus {
     Completed,
     Failed,
     TimedOut,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThroughputMetrics {
+    pub requested_items_per_producer: u64,
+    pub pilot_items_per_producer: u64,
+    pub calibration_elapsed_ns: u64,
+    pub warmup_elapsed_ns: u64,
+    pub warmup_rounds: usize,
+    pub handoff_items: u64,
+    pub handoff_elapsed_ns: u64,
+    pub handoff_rounds: usize,
+    pub enqueue_items: u64,
+    pub enqueue_elapsed_ns: u64,
+    pub enqueue_rounds: usize,
+    pub dequeue_items: u64,
+    pub dequeue_elapsed_ns: u64,
+    pub dequeue_rounds: usize,
+    pub enqueue_ops_per_sec: f64,
+    pub dequeue_ops_per_sec: f64,
+    pub affinity_authoritative: bool,
+    pub schedule_seed: u64,
+    pub execution_ordinal: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_queue_capacity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_queue_capacity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ceiling_warning: Option<String>,
 }
 
 impl BenchRecordStatus {
@@ -1134,6 +1460,8 @@ pub struct BenchRecord {
     pub failure_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throughput_metrics: Option<ThroughputMetrics>,
 }
 
 impl BenchRecord {
@@ -1166,6 +1494,9 @@ impl fmt::Debug for JobFactory {
 #[derive(Default)]
 pub struct ExistingRunsIndex {
     pub records: BTreeMap<SampleKey, BenchRecord>,
+    record_timestamps: BTreeMap<SampleKey, u128>,
+    active_fingerprint: Option<String>,
+    active_fingerprint_timestamp: u128,
 }
 
 #[derive(Clone)]
@@ -1214,7 +1545,7 @@ impl BundleOutputState {
                 .filter_map(|key| self.records.get(key).cloned())
                 .collect(),
         };
-        let json = serde_json::to_string_pretty(&output)
+        let json = serde_json::to_string(&output)
             .map_err(|err| format!("failed to serialize output: {err}"))?;
         atomic_write_string(&self.path, &json)?;
         self.dirty = false;
@@ -1317,17 +1648,20 @@ impl IncrementalOutputWriter {
             }
         }
 
-        progress_line(format!(
-            "scheduler: wrote {} output snapshot(s)",
-            self.write_count
-        ));
+        progress_line(format!("wrote {} output snapshot(s)", self.write_count));
         Ok(self.write_count)
     }
 }
 
 enum OutputWriterMessage {
-    Completed { key: SampleKey, record: BenchRecord },
-    Finish { expect_complete: bool },
+    Completed {
+        key: SampleKey,
+        record: BenchRecord,
+        persisted: mpsc::Sender<Result<(), String>>,
+    },
+    Finish {
+        expect_complete: bool,
+    },
 }
 
 struct OutputWriterHandle {
@@ -1343,8 +1677,14 @@ impl OutputWriterHandle {
             let mut writer = writer;
             while let Ok(message) = rx.recv() {
                 match message {
-                    OutputWriterMessage::Completed { key, record } => {
-                        writer.handle_completed_record(key, record)?;
+                    OutputWriterMessage::Completed {
+                        key,
+                        record,
+                        persisted,
+                    } => {
+                        let result = writer.handle_completed_record(key, record);
+                        let _ = persisted.send(result.clone());
+                        result?;
                     }
                     OutputWriterMessage::Finish { expect_complete } => {
                         return writer.finish(expect_complete);
@@ -1362,11 +1702,19 @@ impl OutputWriterHandle {
 
     fn submit(&self, key: SampleKey, record: BenchRecord) -> Result<(), String> {
         let label = key.queue_label.clone();
+        let (persisted_tx, persisted_rx) = mpsc::channel();
         self.tx
             .as_ref()
             .expect("output writer sender available")
-            .send(OutputWriterMessage::Completed { key, record })
-            .map_err(|_| format!("output writer stopped before persisting {label}"))
+            .send(OutputWriterMessage::Completed {
+                key,
+                record,
+                persisted: persisted_tx,
+            })
+            .map_err(|_| format!("output writer stopped before persisting {label}"))?;
+        persisted_rx
+            .recv()
+            .map_err(|_| format!("output writer stopped while persisting {label}"))?
     }
 
     fn close(mut self, expect_complete: bool) -> Result<usize, String> {
@@ -1416,11 +1764,102 @@ pub fn parse_csv_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse an ordered CPU selection such as `0-7,16-23`.
+pub fn parse_core_ids(raw: &str) -> Result<Vec<usize>, String> {
+    let mut ids = Vec::new();
+    let mut seen = BTreeSet::new();
+    for token in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if let Some((start, end)) = token.split_once('-') {
+            let start = start
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CPU range start `{start}`"))?;
+            let end = end
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CPU range end `{end}`"))?;
+            if start > end {
+                return Err(format!("CPU range `{token}` is descending"));
+            }
+            for id in start..=end {
+                if !seen.insert(id) {
+                    return Err(format!("CPU {id} is selected more than once"));
+                }
+                ids.push(id);
+            }
+        } else {
+            let id = token
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CPU id `{token}`"))?;
+            if !seen.insert(id) {
+                return Err(format!("CPU {id} is selected more than once"));
+            }
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Err("at least one CPU id must be selected".to_string());
+    }
+    Ok(ids)
+}
+
+pub fn parse_schedule_seed(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16)
+            .map_err(|_| format!("invalid hexadecimal schedule seed `{raw}`"))
+    } else {
+        raw.parse::<u64>()
+            .map_err(|_| format!("invalid schedule seed `{raw}`"))
+    }
+}
+
+pub fn power_of_two_scenarios(available_parallelism: usize) -> Result<Vec<ScenarioConfig>, String> {
+    if available_parallelism < 2 {
+        return Err(
+            "the power-of-two scenario grid requires available_parallelism >= 2".to_string(),
+        );
+    }
+
+    let mut thread_counts = Vec::new();
+    let mut count = 1usize;
+    while count < available_parallelism {
+        thread_counts.push(count);
+        let Some(next) = count.checked_mul(2) else {
+            break;
+        };
+        count = next;
+    }
+
+    let mut scenarios = Vec::new();
+    for &producers in &thread_counts {
+        for &consumers in &thread_counts {
+            if producers
+                .checked_add(consumers)
+                .is_some_and(|total| total <= available_parallelism)
+            {
+                scenarios.push(ScenarioConfig::new(producers, consumers));
+            }
+        }
+    }
+    scenarios.sort_by_key(|scenario| {
+        (
+            scenario.total_threads(),
+            scenario.producers,
+            scenario.consumers,
+        )
+    });
+    Ok(scenarios)
+}
+
 pub fn default_scenarios() -> Vec<ScenarioConfig> {
-    DEFAULT_SCENARIOS
-        .iter()
-        .filter_map(|scenario| parse_scenario_token(scenario))
-        .collect()
+    detect_available_parallelism()
+        .and_then(power_of_two_scenarios)
+        .unwrap_or_else(|_| vec![ScenarioConfig::new(1, 1)])
 }
 
 fn parse_positive_range(input: &str) -> Option<(usize, usize)> {
@@ -1493,6 +1932,13 @@ fn expand_scenario_selector_with_parallelism(
         let parallelism = machine_parallelism
             .ok_or_else(|| "mpsc:machine requires detected machine parallelism".to_string())?;
         return machine_mpsc_scenarios(parallelism);
+    }
+    if matches!(normalized.as_str(), "pow2:machine" | "power-of-two:machine") {
+        let parallelism = match machine_parallelism {
+            Some(value) => value,
+            None => detect_available_parallelism()?,
+        };
+        return power_of_two_scenarios(parallelism);
     }
     if normalized == BBQ_ATC22_X86_88T_SCENARIO_SUITE {
         let mut out = vec![ScenarioConfig::new(1, 1)];
@@ -1598,6 +2044,16 @@ pub fn parse_items_per_producer(raw: Option<&str>) -> Result<Vec<u64>, String> {
     Ok(out)
 }
 
+pub fn scenario_scaled_items_per_producer(producers: usize) -> u64 {
+    match producers {
+        0 => panic!("a benchmark scenario must have at least one producer"),
+        1..=8 => 1_000_000,
+        9..=16 => 250_000,
+        17..=32 => 62_500,
+        _ => 15_625,
+    }
+}
+
 pub fn parse_fastfifo_block_sizes(raw: Option<&str>) -> Result<Vec<usize>, String> {
     let source = raw.map(parse_csv_list).unwrap_or_else(|| {
         DEFAULT_FASTFIFO_BLOCK_SIZES
@@ -1624,8 +2080,28 @@ pub fn parse_fastfifo_block_sizes(raw: Option<&str>) -> Result<Vec<usize>, Strin
     Ok(out)
 }
 
-fn fastfifo_queue_label(block_size: usize) -> String {
-    format!("fastfifo_{block_size}")
+fn fastfifo_queue_label(block_size: usize, capacity: usize) -> String {
+    format!("fastfifo_b{block_size}_c{capacity}")
+}
+
+pub fn parse_fastfifo_capacities(raw: Option<&str>) -> Result<Vec<usize>, String> {
+    let source = raw
+        .map(parse_csv_list)
+        .unwrap_or_else(|| vec![DEFAULT_FASTFIFO_CAPACITY.to_string()]);
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for token in source {
+        let parsed = token
+            .parse::<usize>()
+            .map_err(|_| format!("invalid FastFifo capacity `{token}`"))?;
+        if parsed == 0 {
+            return Err("FastFifo capacities must be > 0".to_string());
+        }
+        if seen.insert(parsed) {
+            out.push(parsed);
+        }
+    }
+    Ok(out)
 }
 
 pub fn parse_lfqueue_segment_sizes(raw: Option<&str>) -> Result<Vec<usize>, String> {
@@ -1713,50 +2189,14 @@ fn validate_mode_for_scenario(mode: Mode, scenario: &ScenarioConfig) -> Result<(
 }
 
 fn wcq_mode_supported(
-    mode: Mode,
-    capacity: usize,
-    scenario: &ScenarioConfig,
-    items_per_producer: u64,
+    _mode: Mode,
+    _capacity: usize,
+    _scenario: &ScenarioConfig,
+    _items_per_producer: u64,
 ) -> bool {
-    match mode {
-        // wCQ throughput mode is disabled due to two bugs in the wcq crate:
-        //
-        // 1. `Queue::len()` scans linearly from cell 0 and stops at the first
-        //    empty cell.  Once the ring has wrapped (head past slot 0), cell 0
-        //    can be empty while cells 1..N-1 hold valid items.  `is_empty()`
-        //    then returns true for a non-empty queue.  The dequeue fast-path
-        //    uses `!nonempty` to decide whether to short-circuit; with a
-        //    spuriously empty-looking queue it advances head past valid items,
-        //    permanently losing them, and producers eventually time out.
-        //
-        // 2. `AtomicPositionPair::compare_exchange` performs two *separate*
-        //    atomic CAS operations (one on `entry`, one on `phase2`) with a
-        //    non-atomic rollback when the second CAS fails.  Other threads can
-        //    observe the inconsistent intermediate state, causing the slow-path
-        //    helping mechanism to stall under concurrent producer/consumer load.
-        //
-        // Fill-drain mode is unaffected: the queue is fully loaded before any
-        // consumer runs, so the ring never wraps during the fill phase, and
-        // concurrency on head/tail is minimal during the drain phase.
-        Mode::Throughput
-        | Mode::ComplexThroughput
-        | Mode::DataLatency
-        | Mode::Fairness
-        | Mode::AppLogFanIn
-        | Mode::AppPipeline
-        | Mode::AppTaskRoundtrip
-        | Mode::AppLogMpscFile => false,
-        Mode::FillDrain => {
-            let Ok(total_items) =
-                usize::try_from(total_items(items_per_producer, scenario.producers))
-            else {
-                return false;
-            };
-            total_items
-                .checked_add(scenario.consumers)
-                .is_some_and(|required| required <= capacity)
-        }
-    }
+    // The current wCQ dependency remains excluded from comparative jobs due
+    // to its known wrapped-ring emptiness and split-CAS correctness issues.
+    false
 }
 
 fn baseline_queue_labels_for_sample(
@@ -1773,10 +2213,9 @@ fn baseline_queue_labels_for_sample(
         match queue {
             QueueKind::FastFifo => {
                 labels.extend(
-                    fastfifo_block_sizes
-                        .iter()
-                        .copied()
-                        .map(fastfifo_queue_label),
+                    fastfifo_block_sizes.iter().copied().map(|block_size| {
+                        fastfifo_queue_label(block_size, DEFAULT_FASTFIFO_CAPACITY)
+                    }),
                 );
             }
             QueueKind::LfQueue => {
@@ -1843,6 +2282,40 @@ pub fn parse_ubq_label(token: &str, require_valid: bool) -> Result<UbqLabel, Str
         return Err(format!("invalid UBQ label '{token}'"));
     }
     Ok(label)
+}
+
+pub fn parse_dubq_label(token: &str) -> Result<DubqLabel, String> {
+    let text = token.trim().to_ascii_lowercase();
+    let parts: Vec<&str> = text
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "invalid DUBQ label '{token}'; expected pool,min_block,backoff"
+        ));
+    }
+    let pool = parts[0]
+        .parse::<usize>()
+        .map_err(|_| format!("invalid DUBQ pool size in '{token}'"))?;
+    let min_block_size = parts[1]
+        .parse::<u16>()
+        .map_err(|_| format!("invalid DUBQ minimum block size in '{token}'"))?;
+    if min_block_size == 0 {
+        return Err("DUBQ minimum block size must be >= 1".to_string());
+    }
+    let backoff = parts[2].to_string();
+    if !UBQ_BACKOFF_VALUES.contains(&backoff.as_str()) {
+        return Err(format!(
+            "invalid DUBQ backoff '{backoff}'; expected crossbeam or yield"
+        ));
+    }
+    Ok(DubqLabel {
+        pool,
+        min_block_size,
+        backoff,
+    })
 }
 
 pub fn is_valid_ubq_label(label: &UbqLabel) -> bool {
@@ -2029,6 +2502,40 @@ pub fn build_direct_matrix_plan(
     repeats: usize,
     reuse_existing: bool,
 ) -> Result<MatrixPlan, String> {
+    build_direct_matrix_plan_with_dubq(
+        machine_label,
+        runs_dir,
+        available_parallelism,
+        selected_queues,
+        ubq_labels,
+        &[],
+        fastfifo_block_sizes,
+        lfqueue_segment_sizes,
+        wcq_capacities,
+        scenarios,
+        modes,
+        items_per_producer_values,
+        repeats,
+        reuse_existing,
+    )
+}
+
+pub fn build_direct_matrix_plan_with_dubq(
+    machine_label: &str,
+    runs_dir: PathBuf,
+    available_parallelism: usize,
+    selected_queues: &[QueueKind],
+    ubq_labels: &[String],
+    dubq_labels: &[String],
+    fastfifo_block_sizes: &[usize],
+    lfqueue_segment_sizes: &[usize],
+    wcq_capacities: &[usize],
+    scenarios: &[ScenarioConfig],
+    modes: &[Mode],
+    items_per_producer_values: &[u64],
+    repeats: usize,
+    reuse_existing: bool,
+) -> Result<MatrixPlan, String> {
     if machine_label.trim().is_empty() {
         return Err("machine_label is required".to_string());
     }
@@ -2041,6 +2548,9 @@ pub fn build_direct_matrix_plan(
         .filter(|queue| queue.is_baseline())
         .collect();
     let include_ubq = selected_queues.iter().any(|queue| *queue == QueueKind::Ubq);
+    let include_dubq = selected_queues
+        .iter()
+        .any(|queue| *queue == QueueKind::Dubq);
     let include_fastfifo = selected_queues
         .iter()
         .any(|queue| *queue == QueueKind::FastFifo);
@@ -2050,6 +2560,11 @@ pub fn build_direct_matrix_plan(
     let include_wcq = selected_queues.iter().any(|queue| *queue == QueueKind::Wcq);
     if include_ubq && ubq_labels.is_empty() {
         return Err("at least one --ubq-label is required when queue set includes ubq".to_string());
+    }
+    if include_dubq && dubq_labels.is_empty() {
+        return Err(
+            "at least one --dubq-label is required when queue set includes dubq".to_string(),
+        );
     }
     if include_fastfifo && fastfifo_block_sizes.is_empty() {
         return Err(
@@ -2144,6 +2659,19 @@ pub fn build_direct_matrix_plan(
     };
     let normalized_ubq_labels: Vec<String> =
         parsed_ubq_labels.iter().map(|label| label.text()).collect();
+    let normalized_dubq_labels = if include_dubq {
+        let mut labels = Vec::new();
+        let mut seen = BTreeSet::new();
+        for label in dubq_labels {
+            let normalized = parse_dubq_label(label)?.text();
+            if seen.insert(normalized.clone()) {
+                labels.push(normalized);
+            }
+        }
+        labels
+    } else {
+        Vec::new()
+    };
     for scenario in scenarios {
         if scenario.total_threads() > available_parallelism {
             return Err(format!(
@@ -2197,15 +2725,30 @@ pub fn build_direct_matrix_plan(
                         scenario: scenario.clone(),
                         repeat_index,
                         ubq_label: Some(normalized.clone()),
+                        dubq_label: None,
                         modes: modes.to_vec(),
                         items_per_producer_values: items_per_producer_values.to_vec(),
                     });
                 }
-            } else {
+            }
+            if include_dubq {
+                for label in &normalized_dubq_labels {
+                    bundles.push(PlanBundle {
+                        scenario: scenario.clone(),
+                        repeat_index,
+                        ubq_label: None,
+                        dubq_label: Some(label.clone()),
+                        modes: modes.to_vec(),
+                        items_per_producer_values: items_per_producer_values.to_vec(),
+                    });
+                }
+            }
+            if !baseline_queues.is_empty() {
                 bundles.push(PlanBundle {
                     scenario: scenario.clone(),
                     repeat_index,
                     ubq_label: None,
+                    dubq_label: None,
                     modes: modes.to_vec(),
                     items_per_producer_values: items_per_producer_values.to_vec(),
                 });
@@ -2215,11 +2758,19 @@ pub fn build_direct_matrix_plan(
 
     Ok(MatrixPlan {
         plan_schema_version: PLAN_SCHEMA_VERSION,
+        core_placement: CorePlacement::Interleaved,
+        item_policy: ItemPolicy::Explicit,
         machine_label: normalize_machine(machine_label),
         runs_dir,
         available_parallelism,
+        core_ids: Vec::new(),
+        allow_unpinned: false,
+        schedule_seed: DEFAULT_SCHEDULE_SEED,
+        throughput_policy: ThroughputPolicy::default(),
+        job_timeout_secs: None,
         baseline_queues,
         fastfifo_block_sizes: normalized_fastfifo_block_sizes,
+        fastfifo_capacities: default_fastfifo_capacities(),
         lfqueue_segment_sizes: normalized_lfqueue_segment_sizes,
         wcq_capacities: normalized_wcq_capacities,
         ubq_grid: None,
@@ -2242,7 +2793,7 @@ pub fn build_grid_matrix_plan(
     wcq_capacities: &[usize],
     scenarios: &[ScenarioConfig],
     modes: &[Mode],
-    items_per_producer_values: &[u64],
+    explicit_items_per_producer_values: Option<&[u64]>,
     repeats: usize,
     reuse_existing: bool,
 ) -> Result<MatrixPlan, String> {
@@ -2251,45 +2802,60 @@ pub fn build_grid_matrix_plan(
     for &batch_size in batch_sizes {
         if batch_size < 2 {
             return Err(
-                "UBQ batch sizes must be >= 2; scalar push is measured separately".to_string(),
+                "queue batch sizes must be >= 2; scalar-compatible runs are measured separately"
+                    .to_string(),
             );
         }
         if seen.insert(batch_size) {
             normalized_batch_sizes.push(batch_size);
         }
     }
+    let item_policy = if explicit_items_per_producer_values.is_some() {
+        ItemPolicy::Explicit
+    } else {
+        ItemPolicy::ScenarioScaledV1
+    };
+    let explicit_items = explicit_items_per_producer_values.unwrap_or(&[]);
+    if matches!(item_policy, ItemPolicy::Explicit) && explicit_items.is_empty() {
+        return Err("at least one explicit items-per-producer value is required".to_string());
+    }
+    let direct_items = if matches!(item_policy, ItemPolicy::Explicit) {
+        explicit_items
+    } else {
+        std::slice::from_ref(&DEFAULT_ITEMS_PER_PRODUCER)
+    };
     let labels = grid.labels();
-    let mut plan = build_direct_matrix_plan(
+    let dubq_labels = grid.dubq_labels();
+    let mut plan = build_direct_matrix_plan_with_dubq(
         machine_label,
         runs_dir,
         available_parallelism,
         selected_queues,
         &labels,
+        &dubq_labels,
         fastfifo_block_sizes,
         lfqueue_segment_sizes,
         wcq_capacities,
         scenarios,
         modes,
-        items_per_producer_values,
+        direct_items,
         repeats,
         reuse_existing,
     )?;
-    plan.ubq_grid = Some(grid);
-    plan.ubq_batch_sizes = normalized_batch_sizes;
-    plan.planned_repeats = repeats;
-    if !plan.baseline_queues.is_empty() {
-        for scenario in scenarios {
-            for repeat_index in 1..=repeats {
-                plan.bundles.push(PlanBundle {
-                    scenario: scenario.clone(),
-                    repeat_index,
-                    ubq_label: None,
-                    modes: modes.to_vec(),
-                    items_per_producer_values: items_per_producer_values.to_vec(),
-                });
-            }
+    plan.item_policy = item_policy;
+    if matches!(item_policy, ItemPolicy::ScenarioScaledV1) {
+        for bundle in &mut plan.bundles {
+            bundle.items_per_producer_values = vec![scenario_scaled_items_per_producer(
+                bundle.scenario.producers,
+            )];
         }
     }
+    plan.ubq_grid = selected_queues
+        .iter()
+        .any(|queue| matches!(queue, QueueKind::Ubq | QueueKind::Dubq))
+        .then_some(grid);
+    plan.ubq_batch_sizes = normalized_batch_sizes;
+    plan.planned_repeats = repeats;
     Ok(plan)
 }
 
@@ -2302,12 +2868,27 @@ pub fn parse_embedded_plan(raw: &str) -> Result<MatrixPlan, String> {
             plan.plan_schema_version
         ));
     }
+    if plan
+        .bundles
+        .iter()
+        .any(|bundle| bundle.ubq_label.is_some() && bundle.dubq_label.is_some())
+    {
+        return Err("a plan bundle cannot contain both ubq_label and dubq_label".to_string());
+    }
     Ok(plan)
 }
 
 pub fn load_existing_runs(
     runs_dir: &Path,
     machine_label: &str,
+) -> Result<ExistingRunsIndex, String> {
+    load_existing_runs_for_fingerprint(runs_dir, machine_label, None)
+}
+
+fn load_existing_runs_for_fingerprint(
+    runs_dir: &Path,
+    machine_label: &str,
+    expected_fingerprint: Option<&str>,
 ) -> Result<ExistingRunsIndex, String> {
     let mut files = Vec::new();
     collect_run_jsons_recursive(runs_dir, &mut files)?;
@@ -2330,27 +2911,58 @@ pub fn load_existing_runs(
         if normalize_machine(&parsed.meta.machine_label) != machine_label {
             continue;
         }
+        if expected_fingerprint
+            .is_some_and(|expected| parsed.meta.experiment_fingerprint != expected)
+        {
+            continue;
+        }
+        if expected_fingerprint.is_none() {
+            let fingerprint = &parsed.meta.experiment_fingerprint;
+            if index.active_fingerprint.as_ref() != Some(fingerprint) {
+                if parsed.meta.timestamp_unix_ms < index.active_fingerprint_timestamp {
+                    continue;
+                }
+                index.records.clear();
+                index.record_timestamps.clear();
+                index.active_fingerprint = Some(fingerprint.clone());
+            }
+            index.active_fingerprint_timestamp = index
+                .active_fingerprint_timestamp
+                .max(parsed.meta.timestamp_unix_ms);
+        }
         for record in parsed.results {
             if !record.completed() {
                 continue;
             }
-            let queue_label = if record.queue == "ubq" {
-                match parsed.meta.ubq_label.as_deref() {
+            let queue_label = match record.queue.as_str() {
+                "ubq" => match parsed.meta.ubq_label.as_deref() {
                     Some(label) => format!("ubq_{label}"),
                     None => continue,
-                }
-            } else {
-                record.queue.clone()
+                },
+                "dubq" => match parsed.meta.dubq_label.as_deref() {
+                    Some(label) => format!("dubq_{label}"),
+                    None => continue,
+                },
+                _ => record.queue.clone(),
             };
+            let requested_items_per_producer = record
+                .throughput_metrics
+                .as_ref()
+                .map(|metrics| metrics.requested_items_per_producer)
+                .unwrap_or(record.items_per_producer);
             let key = SampleKey {
                 scenario: parsed.meta.scenario.clone(),
                 repeat_index: parsed.meta.repeat_index,
                 mode: Mode::parse(&record.mode).unwrap_or(Mode::Throughput),
-                items_per_producer: record.items_per_producer,
+                items_per_producer: requested_items_per_producer,
                 queue_label,
                 batch_size: record.batch_size,
             };
-            index.records.entry(key).or_insert(record);
+            let timestamp = parsed.meta.timestamp_unix_ms;
+            if timestamp >= index.record_timestamps.get(&key).copied().unwrap_or(0) {
+                index.record_timestamps.insert(key.clone(), timestamp);
+                index.records.insert(key, record);
+            }
         }
     }
 
@@ -2381,49 +2993,62 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
     let mut out = BTreeSet::new();
     for bundle in &plan.bundles {
         for mode in &bundle.modes {
-            for &items_per_producer in &bundle.items_per_producer_values {
-                for &baseline_queue in &plan.baseline_queues {
-                    match baseline_queue {
-                        QueueKind::FastFifo => {
-                            for &block_size in &plan.fastfifo_block_sizes {
-                                out.insert(JobSpec {
+            let item_values = if *mode == Mode::Throughput {
+                &bundle.items_per_producer_values[..bundle.items_per_producer_values.len().min(1)]
+            } else {
+                bundle.items_per_producer_values.as_slice()
+            };
+            for &items_per_producer in item_values {
+                if bundle.ubq_label.is_none() && bundle.dubq_label.is_none() {
+                    for &baseline_queue in &plan.baseline_queues {
+                        match baseline_queue {
+                            QueueKind::SegQueue => {
+                                let spec = JobSpec {
                                     scenario: bundle.scenario.clone(),
                                     repeat_index: bundle.repeat_index,
                                     mode: *mode,
                                     items_per_producer,
                                     queue: baseline_queue,
                                     ubq_label: None,
-                                    batch_size: None,
-                                    fastfifo_block_size: Some(block_size),
-                                    lfqueue_segment_size: None,
-                                    wcq_capacity: None,
-                                });
-                            }
-                        }
-                        QueueKind::LfQueue => {
-                            for &segment_size in &plan.lfqueue_segment_sizes {
-                                out.insert(JobSpec {
-                                    scenario: bundle.scenario.clone(),
-                                    repeat_index: bundle.repeat_index,
-                                    mode: *mode,
-                                    items_per_producer,
-                                    queue: baseline_queue,
-                                    ubq_label: None,
+                                    dubq_label: None,
                                     batch_size: None,
                                     fastfifo_block_size: None,
-                                    lfqueue_segment_size: Some(segment_size),
+                                    fastfifo_capacity: None,
+                                    lfqueue_segment_size: None,
                                     wcq_capacity: None,
-                                });
+                                };
+                                out.insert(spec.clone());
+                                if *mode == Mode::Throughput {
+                                    for &batch_size in &plan.ubq_batch_sizes {
+                                        out.insert(JobSpec {
+                                            batch_size: Some(batch_size),
+                                            ..spec.clone()
+                                        });
+                                    }
+                                }
                             }
-                        }
-                        QueueKind::Wcq => {
-                            for &capacity in &plan.wcq_capacities {
-                                if wcq_mode_supported(
-                                    *mode,
-                                    capacity,
-                                    &bundle.scenario,
-                                    items_per_producer,
-                                ) {
+                            QueueKind::FastFifo => {
+                                for &block_size in &plan.fastfifo_block_sizes {
+                                    for &capacity in &plan.fastfifo_capacities {
+                                        out.insert(JobSpec {
+                                            scenario: bundle.scenario.clone(),
+                                            repeat_index: bundle.repeat_index,
+                                            mode: *mode,
+                                            items_per_producer,
+                                            queue: baseline_queue,
+                                            ubq_label: None,
+                                            dubq_label: None,
+                                            batch_size: None,
+                                            fastfifo_block_size: Some(block_size),
+                                            fastfifo_capacity: Some(capacity),
+                                            lfqueue_segment_size: None,
+                                            wcq_capacity: None,
+                                        });
+                                    }
+                                }
+                            }
+                            QueueKind::LfQueue => {
+                                for &segment_size in &plan.lfqueue_segment_sizes {
                                     out.insert(JobSpec {
                                         scenario: bundle.scenario.clone(),
                                         repeat_index: bundle.repeat_index,
@@ -2431,27 +3056,56 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                         items_per_producer,
                                         queue: baseline_queue,
                                         ubq_label: None,
+                                        dubq_label: None,
                                         batch_size: None,
                                         fastfifo_block_size: None,
-                                        lfqueue_segment_size: None,
-                                        wcq_capacity: Some(capacity),
+                                        fastfifo_capacity: None,
+                                        lfqueue_segment_size: Some(segment_size),
+                                        wcq_capacity: None,
                                     });
                                 }
                             }
-                        }
-                        _ => {
-                            out.insert(JobSpec {
-                                scenario: bundle.scenario.clone(),
-                                repeat_index: bundle.repeat_index,
-                                mode: *mode,
-                                items_per_producer,
-                                queue: baseline_queue,
-                                ubq_label: None,
-                                batch_size: None,
-                                fastfifo_block_size: None,
-                                lfqueue_segment_size: None,
-                                wcq_capacity: None,
-                            });
+                            QueueKind::Wcq => {
+                                for &capacity in &plan.wcq_capacities {
+                                    if wcq_mode_supported(
+                                        *mode,
+                                        capacity,
+                                        &bundle.scenario,
+                                        items_per_producer,
+                                    ) {
+                                        out.insert(JobSpec {
+                                            scenario: bundle.scenario.clone(),
+                                            repeat_index: bundle.repeat_index,
+                                            mode: *mode,
+                                            items_per_producer,
+                                            queue: baseline_queue,
+                                            ubq_label: None,
+                                            dubq_label: None,
+                                            batch_size: None,
+                                            fastfifo_block_size: None,
+                                            fastfifo_capacity: None,
+                                            lfqueue_segment_size: None,
+                                            wcq_capacity: Some(capacity),
+                                        });
+                                    }
+                                }
+                            }
+                            _ => {
+                                out.insert(JobSpec {
+                                    scenario: bundle.scenario.clone(),
+                                    repeat_index: bundle.repeat_index,
+                                    mode: *mode,
+                                    items_per_producer,
+                                    queue: baseline_queue,
+                                    ubq_label: None,
+                                    dubq_label: None,
+                                    batch_size: None,
+                                    fastfifo_block_size: None,
+                                    fastfifo_capacity: None,
+                                    lfqueue_segment_size: None,
+                                    wcq_capacity: None,
+                                });
+                            }
                         }
                     }
                 }
@@ -2463,8 +3117,10 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                         items_per_producer,
                         queue: QueueKind::Ubq,
                         ubq_label: Some(label.clone()),
+                        dubq_label: None,
                         batch_size: None,
                         fastfifo_block_size: None,
+                        fastfifo_capacity: None,
                         lfqueue_segment_size: None,
                         wcq_capacity: None,
                     });
@@ -2477,8 +3133,44 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                 items_per_producer,
                                 queue: QueueKind::Ubq,
                                 ubq_label: Some(label.clone()),
+                                dubq_label: None,
                                 batch_size: Some(batch_size),
                                 fastfifo_block_size: None,
+                                fastfifo_capacity: None,
+                                lfqueue_segment_size: None,
+                                wcq_capacity: None,
+                            });
+                        }
+                    }
+                }
+                if let Some(label) = bundle.dubq_label.as_ref() {
+                    out.insert(JobSpec {
+                        scenario: bundle.scenario.clone(),
+                        repeat_index: bundle.repeat_index,
+                        mode: *mode,
+                        items_per_producer,
+                        queue: QueueKind::Dubq,
+                        ubq_label: None,
+                        dubq_label: Some(label.clone()),
+                        batch_size: None,
+                        fastfifo_block_size: None,
+                        fastfifo_capacity: None,
+                        lfqueue_segment_size: None,
+                        wcq_capacity: None,
+                    });
+                    if *mode == Mode::Throughput {
+                        for &batch_size in &plan.ubq_batch_sizes {
+                            out.insert(JobSpec {
+                                scenario: bundle.scenario.clone(),
+                                repeat_index: bundle.repeat_index,
+                                mode: *mode,
+                                items_per_producer,
+                                queue: QueueKind::Dubq,
+                                ubq_label: None,
+                                dubq_label: Some(label.clone()),
+                                batch_size: Some(batch_size),
+                                fastfifo_block_size: None,
+                                fastfifo_capacity: None,
                                 lfqueue_segment_size: None,
                                 wcq_capacity: None,
                             });
@@ -2509,8 +3201,10 @@ pub fn make_ubq_job_factory<Q: BenchQueue, L: LogQueue>(
         items_per_producer,
         queue: QueueKind::Ubq,
         ubq_label: Some(normalized),
+        dubq_label: None,
         batch_size,
         fastfifo_block_size: None,
+        fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
     };
@@ -2544,9 +3238,6 @@ pub fn make_ubq_job_factory<Q: BenchQueue, L: LogQueue>(
         Mode::Fairness => {
             bench_fairness_for::<Q>(&queue_name, &run_scenario, items_per_producer, core_offset)
         }
-        Mode::FillDrain => {
-            bench_fill_drain_for::<Q>(&queue_name, &run_scenario, items_per_producer, core_offset)
-        }
         Mode::AppLogFanIn => bench_app_log_fan_in_for::<Q>(
             &queue_name,
             &run_scenario,
@@ -2572,12 +3263,150 @@ pub fn make_ubq_job_factory<Q: BenchQueue, L: LogQueue>(
     JobFactory { spec, run }
 }
 
+fn make_dubq_job_factory_typed<B: backoff::BackoffPolicy + 'static>(
+    parsed: DubqLabel,
+    scenario: ScenarioConfig,
+    repeat_index: usize,
+    mode: Mode,
+    items_per_producer: u64,
+    batch_size: Option<usize>,
+) -> JobFactory {
+    let normalized = parsed.text();
+    let spec = JobSpec {
+        scenario: scenario.clone(),
+        repeat_index,
+        mode,
+        items_per_producer,
+        queue: QueueKind::Dubq,
+        ubq_label: None,
+        dubq_label: Some(normalized),
+        batch_size,
+        fastfifo_block_size: None,
+        fastfifo_capacity: None,
+        lfqueue_segment_size: None,
+        wcq_capacity: None,
+    };
+    let queue_name = QueueKind::Dubq.name().to_string();
+    let run_scenario = scenario.clone();
+    let pool = parsed.pool;
+    let min_block = parsed.min_block_size;
+    let run = Arc::new(move |core_offset: usize| {
+        let queue = || DubqBenchQueue::<u64, B>::new(pool, min_block);
+        match mode {
+            Mode::Throughput => bench_throughput_with_queue_variant(
+                queue(),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                batch_size,
+                core_offset,
+            ),
+            Mode::ComplexThroughput => bench_complex_throughput_with_queue(
+                queue(),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::DataLatency => bench_data_latency_with_queue(
+                queue(),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::Fairness => bench_fairness_with_queue(
+                queue(),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppLogFanIn => bench_app_log_fan_in_with_queue(
+                queue(),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppPipeline => bench_app_pipeline_with_queues(
+                queue(),
+                queue(),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppTaskRoundtrip => bench_app_task_roundtrip_with_queues(
+                queue(),
+                queue(),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+            Mode::AppLogMpscFile => bench_app_log_mpsc_file_with_queue(
+                DubqBenchQueue::<LogRecord, B>::new(pool, min_block),
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+        }
+    });
+    JobFactory { spec, run }
+}
+
+pub fn make_dubq_job_factory(
+    label: &str,
+    scenario: ScenarioConfig,
+    repeat_index: usize,
+    mode: Mode,
+    items_per_producer: u64,
+    batch_size: Option<usize>,
+) -> Result<JobFactory, String> {
+    let parsed = parse_dubq_label(label)?;
+    match parsed.backoff.as_str() {
+        "crossbeam" => Ok(make_dubq_job_factory_typed::<backoff::Crossbeam>(
+            parsed,
+            scenario,
+            repeat_index,
+            mode,
+            items_per_producer,
+            batch_size,
+        )),
+        "yield" => Ok(make_dubq_job_factory_typed::<backoff::Yield>(
+            parsed,
+            scenario,
+            repeat_index,
+            mode,
+            items_per_producer,
+            batch_size,
+        )),
+        _ => unreachable!("parse_dubq_label validates backoff"),
+    }
+}
+
 pub fn make_segqueue_job_factory(
     scenario: ScenarioConfig,
     repeat_index: usize,
     mode: Mode,
     items_per_producer: u64,
 ) -> JobFactory {
+    make_segqueue_job_factory_variant(scenario, repeat_index, mode, items_per_producer, None)
+}
+
+pub fn make_segqueue_job_factory_variant(
+    scenario: ScenarioConfig,
+    repeat_index: usize,
+    mode: Mode,
+    items_per_producer: u64,
+    batch_size: Option<usize>,
+) -> JobFactory {
+    assert!(
+        batch_size.is_none() || mode == Mode::Throughput,
+        "batched SegQueue jobs are supported only in throughput mode"
+    );
     let spec = JobSpec {
         scenario: scenario.clone(),
         repeat_index,
@@ -2585,20 +3414,31 @@ pub fn make_segqueue_job_factory(
         items_per_producer,
         queue: QueueKind::SegQueue,
         ubq_label: None,
-        batch_size: None,
+        dubq_label: None,
+        batch_size,
         fastfifo_block_size: None,
+        fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
     };
     let queue_name = QueueKind::SegQueue.name().to_string();
     let run_scenario = scenario.clone();
     let run = Arc::new(move |core_offset: usize| match mode {
-        Mode::Throughput => bench_throughput_for::<SegQueue<u64>>(
-            &queue_name,
-            &run_scenario,
-            items_per_producer,
-            core_offset,
-        ),
+        Mode::Throughput => match batch_size {
+            Some(batch_size) => bench_throughput_batched_for::<BatchQueue<u64>>(
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                batch_size,
+                core_offset,
+            ),
+            None => bench_throughput_for::<SegQueue<u64>>(
+                &queue_name,
+                &run_scenario,
+                items_per_producer,
+                core_offset,
+            ),
+        },
         Mode::ComplexThroughput => bench_complex_throughput_for::<SegQueue<u64>>(
             &queue_name,
             &run_scenario,
@@ -2612,12 +3452,6 @@ pub fn make_segqueue_job_factory(
             core_offset,
         ),
         Mode::Fairness => bench_fairness_for::<SegQueue<u64>>(
-            &queue_name,
-            &run_scenario,
-            items_per_producer,
-            core_offset,
-        ),
-        Mode::FillDrain => bench_fill_drain_for::<SegQueue<u64>>(
             &queue_name,
             &run_scenario,
             items_per_producer,
@@ -2664,8 +3498,10 @@ pub fn make_concurrent_queue_job_factory(
         items_per_producer,
         queue: QueueKind::ConcurrentQueue,
         ubq_label: None,
+        dubq_label: None,
         batch_size: None,
         fastfifo_block_size: None,
+        fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
     };
@@ -2691,12 +3527,6 @@ pub fn make_concurrent_queue_job_factory(
             core_offset,
         ),
         Mode::Fairness => bench_fairness_for::<ConcurrentQueue<u64>>(
-            &queue_name,
-            &run_scenario,
-            items_per_producer,
-            core_offset,
-        ),
-        Mode::FillDrain => bench_fill_drain_for::<ConcurrentQueue<u64>>(
             &queue_name,
             &run_scenario,
             items_per_producer,
@@ -2746,8 +3576,10 @@ pub fn make_lfqueue_job_factory(
         items_per_producer,
         queue: QueueKind::LfQueue,
         ubq_label: None,
+        dubq_label: None,
         batch_size: None,
         fastfifo_block_size: None,
+        fastfifo_capacity: None,
         lfqueue_segment_size: Some(segment_size),
         wcq_capacity: None,
     };
@@ -2778,13 +3610,6 @@ pub fn make_lfqueue_job_factory(
                 core_offset,
             ),
             Mode::Fairness => bench_fairness_with_queue(
-                queue_handle,
-                &queue_name,
-                &run_scenario,
-                items_per_producer,
-                core_offset,
-            ),
-            Mode::FillDrain => bench_fill_drain_with_queue(
                 queue_handle,
                 &queue_name,
                 &run_scenario,
@@ -2840,8 +3665,10 @@ fn make_wcq_job_factory_typed<const CAPACITY: usize>(
         items_per_producer,
         queue: QueueKind::Wcq,
         ubq_label: None,
+        dubq_label: None,
         batch_size: None,
         fastfifo_block_size: None,
+        fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: Some(CAPACITY),
     };
@@ -2872,13 +3699,6 @@ fn make_wcq_job_factory_typed<const CAPACITY: usize>(
                 core_offset,
             ),
             Mode::Fairness => bench_fairness_with_queue(
-                queue_handle,
-                &queue_name,
-                &run_scenario,
-                items_per_producer,
-                core_offset,
-            ),
-            Mode::FillDrain => bench_fill_drain_with_queue(
                 queue_handle,
                 &queue_name,
                 &run_scenario,
@@ -2985,6 +3805,7 @@ pub fn make_wcq_job_factory(
 #[cfg(feature = "bench_fastfifo")]
 pub fn make_fastfifo_job_factory(
     block_size: usize,
+    capacity: usize,
     scenario: ScenarioConfig,
     repeat_index: usize,
     mode: Mode,
@@ -2998,15 +3819,17 @@ pub fn make_fastfifo_job_factory(
         items_per_producer,
         queue: QueueKind::FastFifo,
         ubq_label: None,
+        dubq_label: None,
         batch_size: None,
         fastfifo_block_size: Some(block_size),
+        fastfifo_capacity: Some(capacity),
         lfqueue_segment_size: None,
         wcq_capacity: None,
     };
-    let queue_name = fastfifo_queue_label(block_size);
+    let queue_name = fastfifo_queue_label(block_size, capacity);
     let run_scenario = scenario.clone();
     let run = Arc::new(move |core_offset: usize| {
-        let queue_handle = RbbqBenchQueue::new(&run_scenario, items_per_producer, block_size);
+        let queue_handle = RbbqBenchQueue::new(block_size, capacity);
         match mode {
             Mode::Throughput => bench_throughput_with_queue(
                 queue_handle,
@@ -3036,13 +3859,6 @@ pub fn make_fastfifo_job_factory(
                 items_per_producer,
                 core_offset,
             ),
-            Mode::FillDrain => bench_fill_drain_with_queue(
-                queue_handle,
-                &queue_name,
-                &run_scenario,
-                items_per_producer,
-                core_offset,
-            ),
             Mode::AppLogFanIn => bench_app_log_fan_in_with_queue(
                 queue_handle,
                 &queue_name,
@@ -3052,7 +3868,7 @@ pub fn make_fastfifo_job_factory(
             ),
             Mode::AppPipeline => bench_app_pipeline_with_queues(
                 queue_handle,
-                RbbqBenchQueue::new(&run_scenario, items_per_producer, block_size),
+                RbbqBenchQueue::new(block_size, capacity),
                 &queue_name,
                 &run_scenario,
                 items_per_producer,
@@ -3060,14 +3876,14 @@ pub fn make_fastfifo_job_factory(
             ),
             Mode::AppTaskRoundtrip => bench_app_task_roundtrip_with_queues(
                 queue_handle,
-                RbbqBenchQueue::new(&run_scenario, items_per_producer, block_size),
+                RbbqBenchQueue::new(block_size, capacity),
                 &queue_name,
                 &run_scenario,
                 items_per_producer,
                 core_offset,
             ),
             Mode::AppLogMpscFile => bench_app_log_mpsc_file_with_queue(
-                LogRbbqBenchQueue::new(&run_scenario, items_per_producer, block_size),
+                LogRbbqBenchQueue::new(block_size, capacity),
                 &queue_name,
                 &run_scenario,
                 items_per_producer,
@@ -3080,6 +3896,7 @@ pub fn make_fastfifo_job_factory(
 
 pub fn run_embedded_scheduler(plan: MatrixPlan, factories: Vec<JobFactory>) -> Result<(), String> {
     let mut required = required_job_specs(&plan);
+    print_core_placement(&plan);
     let mut factory_by_key: BTreeMap<SampleKey, JobFactory> = BTreeMap::new();
     for factory in factories {
         let key = SampleKey::from_job(&factory.spec);
@@ -3088,8 +3905,15 @@ pub fn run_embedded_scheduler(plan: MatrixPlan, factories: Vec<JobFactory>) -> R
         }
     }
 
+    let fingerprint = experiment_fingerprint(&plan)?;
+    let existing_runs = load_existing_runs_for_fingerprint(
+        &plan.runs_dir,
+        &plan.machine_label,
+        Some(&fingerprint),
+    )?;
+    let timing_estimator = TimingEstimator::from_history(&existing_runs);
     let mut cache = if plan.reuse_existing {
-        load_existing_runs(&plan.runs_dir, &plan.machine_label)?
+        existing_runs
     } else {
         ExistingRunsIndex::default()
     };
@@ -3107,14 +3931,19 @@ pub fn run_embedded_scheduler(plan: MatrixPlan, factories: Vec<JobFactory>) -> R
     }
 
     progress_line(format!(
-        "scheduler: {} bundle(s), {} required sample(s), {} cached, {} pending",
+        "{} bundle(s), {} required sample(s), {} cached, {} pending",
         plan.bundles.len(),
         required.len(),
         required.len().saturating_sub(pending.len()),
         pending.len()
     ));
-    let (executed, crashed_job) =
-        execute_job_factories(&plan, &cache, pending, plan.available_parallelism)?;
+    let (executed, crashed_job) = execute_job_factories(
+        &plan,
+        &cache,
+        pending,
+        plan.available_parallelism,
+        timing_estimator,
+    )?;
     cache.records.extend(executed);
     required.clear();
     if let Some((queue_label, scenario)) = crashed_job {
@@ -3125,27 +3954,660 @@ pub fn run_embedded_scheduler(plan: MatrixPlan, factories: Vec<JobFactory>) -> R
     Ok(())
 }
 
-fn execute_job_factories(
-    plan: &MatrixPlan,
-    cache: &ExistingRunsIndex,
-    pending: Vec<JobFactory>,
-    available_parallelism: usize,
-) -> Result<(BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>), String> {
-    execute_job_factories_with_timeout(
-        plan,
-        cache,
-        pending,
-        available_parallelism,
-        bench_job_timeout(),
+fn selected_plan_core_ids(plan: &MatrixPlan) -> Result<Vec<usize>, String> {
+    let discovered = core_affinity::get_core_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|core| core.id)
+        .collect::<BTreeSet<_>>();
+    let selected = if plan.core_ids.is_empty() {
+        discovered
+            .iter()
+            .copied()
+            .take(plan.available_parallelism)
+            .collect::<Vec<_>>()
+    } else {
+        plan.core_ids.clone()
+    };
+    if selected.is_empty() && !plan.allow_unpinned {
+        return Err(
+            "no CPUs were discovered; use --allow-unpinned only for non-authoritative diagnostics"
+                .to_string(),
+        );
+    }
+    if !plan.allow_unpinned {
+        for id in &selected {
+            if !discovered.contains(id) {
+                return Err(format!(
+                    "selected CPU {id} is not available to this process"
+                ));
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn format_core_binding(core_ids: &[usize], role: char, role_id: usize, slot: usize) -> String {
+    match core_ids.get(slot) {
+        Some(core) => format!("{role}{role_id}->{core}"),
+        None => format!("{role}{role_id}->unbound(slot={slot})"),
+    }
+}
+
+fn print_core_placement(plan: &MatrixPlan) {
+    let core_ids = selected_plan_core_ids(plan).unwrap_or_default();
+    progress_line(format!("core placement: {}", plan.core_placement.name()));
+    let scenarios = plan
+        .bundles
+        .iter()
+        .map(|bundle| bundle.scenario.clone())
+        .collect::<BTreeSet<_>>();
+    for scenario in scenarios {
+        let producers = (0..scenario.producers)
+            .map(|producer_id| {
+                format_core_binding(
+                    &core_ids,
+                    'p',
+                    producer_id,
+                    producer_core_slot(scenario.producers, scenario.consumers, producer_id),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let consumers = (0..scenario.consumers)
+            .map(|consumer_id| {
+                format_core_binding(
+                    &core_ids,
+                    'c',
+                    consumer_id,
+                    consumer_core_slot(scenario.producers, scenario.consumers, consumer_id),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        progress_line(format!(
+            "core map: {} | producers [{}] | consumers [{}]",
+            scenario.name, producers, consumers
+        ));
+    }
+}
+
+/// Runs the private benchmark worker protocol when this process was launched by
+/// the parent scheduler. Binaries must call this before parsing CLI arguments.
+pub fn maybe_run_bench_worker() -> Option<Result<(), String>> {
+    match std::env::var(BENCH_WORKER_ENV).as_deref() {
+        Ok("1") => Some(run_bench_worker_loop()),
+        _ => None,
+    }
+}
+
+fn write_worker_message(writer: &mut impl Write, response: &WorkerResponse) -> Result<(), String> {
+    serde_json::to_writer(&mut *writer, response)
+        .map_err(|err| format!("failed to serialize worker response: {err}"))?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|err| format!("failed to write worker response: {err}"))
+}
+
+fn run_bench_worker_loop() -> Result<(), String> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|err| format!("failed to read worker request: {err}"))?;
+        let request: WorkerRequest = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(err) => {
+                write_worker_message(
+                    &mut writer,
+                    &WorkerResponse {
+                        protocol_version: BENCH_WORKER_PROTOCOL_VERSION,
+                        request_id: 0,
+                        result: WorkerResult::ProtocolError {
+                            reason: format!("malformed worker request: {err}"),
+                        },
+                    },
+                )?;
+                continue;
+            }
+        };
+        if request.protocol_version != BENCH_WORKER_PROTOCOL_VERSION {
+            write_worker_message(
+                &mut writer,
+                &WorkerResponse {
+                    protocol_version: BENCH_WORKER_PROTOCOL_VERSION,
+                    request_id: request.request_id,
+                    result: WorkerResult::ProtocolError {
+                        reason: format!(
+                            "worker protocol version mismatch: parent={}, worker={}",
+                            request.protocol_version, BENCH_WORKER_PROTOCOL_VERSION
+                        ),
+                    },
+                },
+            )?;
+            continue;
+        }
+
+        match request.command {
+            WorkerCommand::Run { spec } => {
+                if std::env::var("UBQ_BENCH_WORKER_TEST_CRASH_QUEUE")
+                    .is_ok_and(|queue| queue == spec.queue_label())
+                {
+                    std::process::abort();
+                }
+                if std::env::var("UBQ_BENCH_WORKER_TEST_STALL_QUEUE")
+                    .is_ok_and(|queue| queue == spec.queue_label())
+                {
+                    let stall_ms = std::env::var("UBQ_BENCH_WORKER_TEST_STALL_MS")
+                        .ok()
+                        .and_then(|raw| raw.parse::<u64>().ok())
+                        .unwrap_or(2_000);
+                    thread::sleep(Duration::from_millis(stall_ms));
+                }
+                let result = match job_factory_for_spec(&spec) {
+                    Ok(factory) => {
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            (factory.run)(0)
+                        })) {
+                            Ok(record) => WorkerResult::Completed { record },
+                            Err(payload) => WorkerResult::Failed {
+                                reason: panic_payload_message(payload),
+                            },
+                        }
+                    }
+                    Err(reason) => WorkerResult::Failed { reason },
+                };
+                write_worker_message(
+                    &mut writer,
+                    &WorkerResponse {
+                        protocol_version: BENCH_WORKER_PROTOCOL_VERSION,
+                        request_id: request.request_id,
+                        result,
+                    },
+                )?;
+            }
+            WorkerCommand::Shutdown => {
+                write_worker_message(
+                    &mut writer,
+                    &WorkerResponse {
+                        protocol_version: BENCH_WORKER_PROTOCOL_VERSION,
+                        request_id: request.request_id,
+                        result: WorkerResult::ShuttingDown,
+                    },
+                )?;
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+enum WorkerRunOutcome {
+    Completed(BenchRecord),
+    Failed(String),
+    TimedOut,
+}
+
+enum WorkerReceiveError {
+    Exited(String),
+    Protocol(String),
+}
+
+fn decode_worker_response(line: &str, request_id: u64) -> Result<WorkerResponse, String> {
+    let response: WorkerResponse = serde_json::from_str(line)
+        .map_err(|err| format!("malformed benchmark worker response: {err}"))?;
+    if response.protocol_version != BENCH_WORKER_PROTOCOL_VERSION {
+        return Err(format!(
+            "worker protocol version mismatch: parent={}, worker={}",
+            BENCH_WORKER_PROTOCOL_VERSION, response.protocol_version
+        ));
+    }
+    if response.request_id != request_id {
+        return Err(format!(
+            "benchmark worker response id mismatch: expected {request_id}, got {}",
+            response.request_id
+        ));
+    }
+    Ok(response)
+}
+
+struct BenchWorker {
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    responses: mpsc::Receiver<Result<String, String>>,
+    reader: Option<thread::JoinHandle<()>>,
+    next_request_id: u64,
+    reaped: bool,
+}
+
+impl BenchWorker {
+    fn spawn_for_plan(plan: &MatrixPlan) -> Result<Self, String> {
+        Self::spawn_with_plan(Some(plan))
+    }
+
+    fn spawn_with_plan(plan: Option<&MatrixPlan>) -> Result<Self, String> {
+        let executable = std::env::current_exe()
+            .map_err(|err| format!("failed to locate benchmark executable: {err}"))?;
+        let mut command = Command::new(&executable);
+        command.env(BENCH_WORKER_ENV, "1");
+        if let Some(plan) = plan {
+            let core_ids = if plan.core_ids.is_empty() {
+                core_affinity::get_core_ids()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|core| core.id)
+                    .take(plan.available_parallelism)
+                    .collect::<Vec<_>>()
+            } else {
+                plan.core_ids.clone()
+            };
+            command
+                .env(
+                    "UBQ_BENCH_CORE_IDS",
+                    core_ids
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+                .env(
+                    "UBQ_BENCH_ALLOW_UNPINNED",
+                    if plan.allow_unpinned { "1" } else { "0" },
+                )
+                .env(
+                    "UBQ_BENCH_THROUGHPUT_WARMUP_MS",
+                    plan.throughput_policy.warmup_ms.to_string(),
+                )
+                .env(
+                    "UBQ_BENCH_THROUGHPUT_PHASE_MS",
+                    plan.throughput_policy.phase_ms.to_string(),
+                )
+                .env(
+                    "UBQ_BENCH_THROUGHPUT_PILOT_MS",
+                    plan.throughput_policy.pilot_ms.to_string(),
+                )
+                .env(
+                    "UBQ_BENCH_THROUGHPUT_MAX_ROUND_ITEMS",
+                    plan.throughput_policy.max_round_items.to_string(),
+                )
+                .env("UBQ_BENCH_SCHEDULE_SEED", plan.schedule_seed.to_string());
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|err| {
+                format!(
+                    "failed to launch benchmark worker {}: {err}",
+                    executable.display()
+                )
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "benchmark worker stdin was not piped".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "benchmark worker stdout was not piped".to_string())?;
+        let (sender, responses) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = sender.send(Err("benchmark worker stdout closed".to_string()));
+                        break;
+                    }
+                    Ok(_) => {
+                        while matches!(line.as_bytes().last(), Some(b'\n' | b'\r')) {
+                            line.pop();
+                        }
+                        if sender.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = sender.send(Err(format!(
+                            "failed to read benchmark worker response: {err}"
+                        )));
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            stdin: BufWriter::new(stdin),
+            responses,
+            reader: Some(reader),
+            next_request_id: 1,
+            reaped: false,
+        })
+    }
+
+    fn send(&mut self, command: WorkerCommand) -> Result<u64, String> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| "benchmark worker request id overflow".to_string())?;
+        serde_json::to_writer(
+            &mut self.stdin,
+            &WorkerRequest {
+                protocol_version: BENCH_WORKER_PROTOCOL_VERSION,
+                request_id,
+                command,
+            },
+        )
+        .map_err(|err| format!("failed to serialize benchmark worker request: {err}"))?;
+        self.stdin
+            .write_all(b"\n")
+            .and_then(|()| self.stdin.flush())
+            .map_err(|err| format!("failed to send benchmark worker request: {err}"))?;
+        Ok(request_id)
+    }
+
+    fn receive(
+        &self,
+        request_id: u64,
+        timeout: Duration,
+    ) -> Result<Option<WorkerResponse>, WorkerReceiveError> {
+        let line = match self.responses.recv_timeout(timeout) {
+            Ok(Ok(line)) => line,
+            Ok(Err(reason)) => return Err(WorkerReceiveError::Exited(reason)),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(WorkerReceiveError::Exited(
+                    "benchmark worker response channel disconnected".to_string(),
+                ));
+            }
+        };
+        let response =
+            decode_worker_response(&line, request_id).map_err(WorkerReceiveError::Protocol)?;
+        Ok(Some(response))
+    }
+
+    fn run_job(&mut self, spec: JobSpec, timeout: Duration) -> Result<WorkerRunOutcome, String> {
+        let expected = spec.clone();
+        let request_id = match self.send(WorkerCommand::Run { spec }) {
+            Ok(request_id) => request_id,
+            Err(reason) => return Ok(WorkerRunOutcome::Failed(reason)),
+        };
+        let response = match self.receive(request_id, timeout) {
+            Ok(response) => response,
+            Err(WorkerReceiveError::Exited(reason)) => {
+                return Ok(WorkerRunOutcome::Failed(reason));
+            }
+            Err(WorkerReceiveError::Protocol(reason)) => return Err(reason),
+        };
+        let Some(response) = response else {
+            return Ok(WorkerRunOutcome::TimedOut);
+        };
+        match response.result {
+            WorkerResult::Completed { record } => {
+                let expected_queue = if matches!(expected.queue, QueueKind::Ubq | QueueKind::Dubq) {
+                    expected.queue.name().to_string()
+                } else {
+                    expected.queue_label()
+                };
+                let counts_match = if expected.mode == Mode::Throughput && record.completed() {
+                    record.throughput_metrics.as_ref().is_some_and(|metrics| {
+                        metrics.requested_items_per_producer == expected.items_per_producer
+                            && metrics.handoff_items == record.total_items
+                            && record.total_items == record.consumed_items
+                    })
+                } else {
+                    record.items_per_producer == expected.items_per_producer
+                        && record.total_items
+                            == total_items(expected.items_per_producer, expected.scenario.producers)
+                };
+                if record.queue != expected_queue
+                    || record.mode != expected.mode.name()
+                    || !counts_match
+                    || record.batch_size != expected.batch_size
+                {
+                    return Err(format!(
+                        "benchmark worker returned a record that does not match request {}",
+                        expected.queue_label()
+                    ));
+                }
+                Ok(WorkerRunOutcome::Completed(record))
+            }
+            WorkerResult::Failed { reason } => Ok(WorkerRunOutcome::Failed(reason)),
+            WorkerResult::ProtocolError { reason } => Err(reason),
+            WorkerResult::ShuttingDown => {
+                Err("benchmark worker shut down during a job".to_string())
+            }
+        }
+    }
+
+    fn terminate(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reaped = true;
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+
+    fn shutdown(mut self) {
+        let clean = match self.send(WorkerCommand::Shutdown) {
+            Ok(request_id) => matches!(
+                self.receive(request_id, Duration::from_secs(5)),
+                Ok(Some(WorkerResponse {
+                    result: WorkerResult::ShuttingDown,
+                    ..
+                }))
+            ),
+            Err(_) => false,
+        };
+        if clean {
+            let _ = self.child.wait();
+            self.reaped = true;
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        } else {
+            self.terminate();
+        }
+    }
+}
+
+impl Drop for BenchWorker {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn terminate_worker(worker: &mut Option<BenchWorker>) {
+    if let Some(mut failed_worker) = worker.take() {
+        failed_worker.terminate();
+    }
+}
+
+fn stable_hash64(seed: u64, bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ seed;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn seeded_job_order_key(spec: &JobSpec, seed: u64) -> (usize, String, String, u64, u64) {
+    let rotation_seed = seed.wrapping_add(spec.repeat_index as u64);
+    let queue_order = stable_hash64(rotation_seed, spec.queue_label().as_bytes());
+    (
+        spec.repeat_index,
+        spec.scenario.name.clone(),
+        spec.mode.name().to_string(),
+        queue_order,
+        stable_hash64(rotation_seed, format!("{:?}", spec).as_bytes()),
     )
 }
 
-fn execute_job_factories_with_timeout(
+fn execute_job_specs_with_timeout(
+    plan: &MatrixPlan,
+    cache: &ExistingRunsIndex,
+    mut pending: Vec<JobSpec>,
+    available_parallelism: usize,
+    timeout_ceiling: Duration,
+    mut timing_estimator: TimingEstimator,
+) -> Result<BTreeMap<SampleKey, BenchRecord>, String> {
+    for spec in &pending {
+        if spec.thread_budget() > available_parallelism {
+            return Err(format!(
+                "job {} requires {} threads but available_parallelism is {}",
+                spec.queue_label(),
+                spec.thread_budget(),
+                available_parallelism
+            ));
+        }
+        job_factory_for_spec(spec)?;
+    }
+
+    pending.sort_by_key(|spec| seeded_job_order_key(spec, plan.schedule_seed));
+    let required_specs = required_job_specs(plan);
+    let total_jobs = required_specs.len();
+    let progress_layout = ProgressLayout::new(required_specs.iter());
+    let initially_complete = total_jobs.saturating_sub(pending.len());
+    if pending.is_empty() {
+        let writer = OutputWriterHandle::start(plan, cache)?;
+        writer.close(true)?;
+        return Ok(BTreeMap::new());
+    }
+
+    let mut worker: Option<BenchWorker> = None;
+    progress_line(format!(
+        "starting {} pending benchmark job(s); {}/{} ({:.2}%) already complete; available parallelism {}; budget-derived hard timeout {}",
+        pending.len(),
+        initially_complete,
+        total_jobs,
+        completion_percent(initially_complete, total_jobs),
+        available_parallelism,
+        format_progress_duration(timeout_ceiling),
+    ));
+    let writer = match OutputWriterHandle::start(plan, cache) {
+        Ok(writer) => writer,
+        Err(reason) => {
+            if let Some(healthy_worker) = worker.take() {
+                healthy_worker.shutdown();
+            }
+            return Err(reason);
+        }
+    };
+
+    let session_started_at = Instant::now();
+    let mut results = BTreeMap::new();
+    let mut completed = initially_complete;
+    let pending_count = pending.len();
+    let execution_result = (|| -> Result<(), String> {
+        for (index, spec) in pending.into_iter().enumerate() {
+            if progress_header_due(index) {
+                progress_layout.print_header();
+            }
+            let key = SampleKey::from_job(&spec);
+            let budget = spec.thread_budget();
+            let remaining = pending_count - index - 1;
+            progress_layout.print_pending_row(&key, budget, remaining, completed + 1, total_jobs);
+            let job_timeout = timeout_ceiling;
+
+            let started_at = Instant::now();
+            if worker.is_none() {
+                worker = Some(BenchWorker::spawn_for_plan(plan)?);
+            }
+            let outcome = worker
+                .as_mut()
+                .expect("worker present")
+                .run_job(spec.clone(), job_timeout)?;
+            let mut record = match outcome {
+                WorkerRunOutcome::Completed(record) => record,
+                WorkerRunOutcome::Failed(reason) => failed_bench_record(
+                    &spec,
+                    BenchRecordStatus::Failed,
+                    reason,
+                    started_at.elapsed().as_nanos() as u64,
+                    None,
+                ),
+                WorkerRunOutcome::TimedOut => failed_bench_record(
+                    &spec,
+                    BenchRecordStatus::TimedOut,
+                    format!(
+                        "benchmark job exceeded {} measurement-budget hard timeout",
+                        format_progress_duration(job_timeout),
+                    ),
+                    started_at.elapsed().as_nanos() as u64,
+                    Some(job_timeout.as_nanos().min(u64::MAX as u128) as u64),
+                ),
+            };
+            if let Some(metrics) = record.throughput_metrics.as_mut() {
+                metrics.schedule_seed = plan.schedule_seed;
+                metrics.execution_ordinal = index + 1;
+                metrics.requested_queue_capacity = match spec.queue {
+                    QueueKind::FastFifo => spec.fastfifo_capacity,
+                    QueueKind::Wcq => spec.wcq_capacity,
+                    _ => None,
+                };
+            }
+
+            completed += 1;
+            let status = match &record.status {
+                BenchRecordStatus::Completed => "DONE",
+                BenchRecordStatus::Failed => "FAILED",
+                BenchRecordStatus::TimedOut => "TIMED OUT",
+            };
+            let trial_duration = started_at.elapsed();
+            if record.completed() {
+                timing_estimator.observe(trial_duration);
+            }
+            progress_layout.print_completed_suffix(
+                trial_duration,
+                session_started_at.elapsed(),
+                timing_estimator.estimate_remaining(remaining),
+                status,
+            );
+            if !record.completed() {
+                if record.status != BenchRecordStatus::TimedOut {
+                    progress_line(format!(
+                        "reason | {}",
+                        record.failure_reason.as_deref().unwrap_or("unknown")
+                    ));
+                }
+                terminate_worker(&mut worker);
+            }
+            writer.submit(key.clone(), record.clone())?;
+            results.insert(key, record);
+        }
+        Ok(())
+    })();
+
+    if let Some(healthy_worker) = worker.take() {
+        healthy_worker.shutdown();
+    }
+    let writer_result = writer.close(execution_result.is_ok());
+    match (execution_result, writer_result) {
+        (Ok(()), Ok(_)) => Ok(results),
+        (Err(exec_err), Ok(_)) => Err(exec_err),
+        (Ok(()), Err(writer_err)) => Err(writer_err),
+        (Err(exec_err), Err(writer_err)) => {
+            Err(format!("{exec_err}; output writer error: {writer_err}"))
+        }
+    }
+}
+
+fn execute_job_factories(
     plan: &MatrixPlan,
     cache: &ExistingRunsIndex,
     mut pending: Vec<JobFactory>,
     available_parallelism: usize,
-    job_timeout: Duration,
+    mut timing_estimator: TimingEstimator,
 ) -> Result<(BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>), String> {
     for job in &pending {
         if job.spec.thread_budget() > available_parallelism {
@@ -3161,10 +4623,10 @@ fn execute_job_factories_with_timeout(
     pending.sort_by(|lhs, rhs| lhs.spec.sort_key().cmp(&rhs.spec.sort_key()));
     let required_specs = required_job_specs(plan);
     let total_jobs = required_specs.len();
-    let progress_layout = ProgressLayout::new(required_specs.iter(), available_parallelism);
+    let progress_layout = ProgressLayout::new(required_specs.iter());
     let initially_complete = total_jobs.saturating_sub(pending.len());
     progress_line(format!(
-        "scheduler: starting {} pending benchmark job(s); {}/{} ({:.2}%) already complete; thread budget {}",
+        "starting {} pending benchmark job(s); {}/{} ({:.2}%) already complete; available parallelism {}",
         pending.len(),
         initially_complete,
         total_jobs,
@@ -3176,150 +4638,66 @@ fn execute_job_factories_with_timeout(
         writer.close(true)?;
         return Ok((BTreeMap::new(), None));
     }
-    progress_layout.print_header();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| format!("failed to build scheduler runtime: {err}"))?;
-
-    // Each task returns (key, record, budget). Panics and timeouts become
-    // failed records so one bad queue does not abort the whole batch.
-    let execution_result: Result<
-        (BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>),
-        String,
-    > = runtime.block_on(async {
+    let session_started_at = Instant::now();
+    let execution_result = (|| -> Result<_, String> {
         let mut results = BTreeMap::new();
-        let mut running: JoinSet<Result<(SampleKey, BenchRecord, usize), String>> = JoinSet::new();
-        let mut used_threads = 0_usize;
         let mut completed = initially_complete;
+        let pending_count = pending.len();
 
-        while !pending.is_empty() || !running.is_empty() {
-            let mut started = false;
-            loop {
-                let Some(index) = pending
-                    .iter()
-                    .position(|job| can_start_job(&job.spec, used_threads, available_parallelism))
-                else {
-                    break;
+        for (index, job) in pending.into_iter().enumerate() {
+            if progress_header_due(index) {
+                progress_layout.print_header();
+            }
+            let key = SampleKey::from_job(&job.spec);
+            let budget = job.spec.thread_budget();
+            let remaining = pending_count - index - 1;
+            progress_layout.print_pending_row(&key, budget, remaining, completed + 1, total_jobs);
+
+            let started_at = Instant::now();
+            let timeout_spec = job.spec.clone();
+            let record =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.run)(0))) {
+                    Ok(record) => record,
+                    Err(payload) => {
+                        let elapsed_ns = started_at.elapsed().as_nanos() as u64;
+                        failed_bench_record(
+                            &timeout_spec,
+                            BenchRecordStatus::Failed,
+                            panic_payload_message(payload),
+                            elapsed_ns,
+                            None,
+                        )
+                    }
                 };
-                let job = pending.remove(index);
-                let key = SampleKey::from_job(&job.spec);
-                let budget = job.spec.thread_budget();
-                used_threads += budget;
-                started = true;
-                progress_layout.print_row(
-                    "start",
-                    &key,
-                    budget,
-                    used_threads,
-                    pending.len(),
-                    completed,
-                    total_jobs,
-                );
-                let core_offset = used_threads - budget;
-                running.spawn(async move {
-                    let timeout_ns = job_timeout.as_nanos() as u64;
-                    let started_at = Instant::now();
-                    let deadline = started_at.checked_add(job_timeout);
-                    let timeout_spec = job.spec.clone();
-                    let panic_spec = job.spec.clone();
-                    let mut handle = tokio::task::spawn_blocking(move || {
-                        with_bench_job_deadline(deadline, || (job.run)(core_offset))
-                    });
-                    let mut timed_out = false;
-                    let join_result = match tokio::time::timeout(job_timeout, &mut handle).await {
-                        Ok(result) => result,
-                        Err(_) => {
-                            timed_out = true;
-                            handle.await
-                        }
-                    };
-                    match join_result {
-                        Ok(_record) if timed_out => {
-                            let elapsed_ns = started_at.elapsed().as_nanos() as u64;
-                            let record = failed_bench_record(
-                                &timeout_spec,
-                                BenchRecordStatus::TimedOut,
-                                format!(
-                                    "benchmark job exceeded {}s timeout",
-                                    job_timeout.as_secs()
-                                ),
-                                elapsed_ns,
-                                Some(timeout_ns),
-                            );
-                            Ok((key, record, budget))
-                        }
-                        Ok(record) => Ok((key, record, budget)),
-                        Err(err) if err.is_panic() => {
-                            let elapsed_ns = started_at.elapsed().as_nanos() as u64;
-                            let reason = panic_payload_message(err.into_panic());
-                            let (status, timeout) =
-                                status_and_timeout_for_failure(&reason, elapsed_ns);
-                            let record = failed_bench_record(
-                                &panic_spec,
-                                status,
-                                reason,
-                                elapsed_ns,
-                                timeout,
-                            );
-                            Ok((key, record, budget))
-                        }
-                        Err(err) => Err(format!("benchmark task join failed: {err}")),
-                    }
-                });
-            }
 
-            if running.is_empty() && !pending.is_empty() {
-                return Err("scheduler stalled with pending work".to_string());
+            completed += 1;
+            let status = match &record.status {
+                BenchRecordStatus::Completed => "DONE",
+                BenchRecordStatus::Failed => "FAILED",
+                BenchRecordStatus::TimedOut => "TIMED OUT",
+            };
+            let trial_duration = started_at.elapsed();
+            if record.completed() {
+                timing_estimator.observe(trial_duration);
             }
-
-            if !started || pending.is_empty() {
-                if let Some(joined) = running.join_next().await {
-                    let (key, record, budget) =
-                        joined.map_err(|err| format!("scheduler task failed: {err}"))??;
-                    used_threads = used_threads.saturating_sub(budget);
-                    completed += 1;
-                    if record.completed() {
-                        progress_layout.print_row(
-                            "done",
-                            &key,
-                            budget,
-                            used_threads,
-                            pending.len(),
-                            completed,
-                            total_jobs,
-                        );
-                    } else {
-                        let state = match &record.status {
-                            BenchRecordStatus::Completed => "done",
-                            BenchRecordStatus::Failed => "failed",
-                            BenchRecordStatus::TimedOut => "timed out",
-                        };
-                        progress_layout.print_row(
-                            state,
-                            &key,
-                            budget,
-                            used_threads,
-                            pending.len(),
-                            completed,
-                            total_jobs,
-                        );
-                        progress_line(format!(
-                            "scheduler: reason {:<width$} | {}",
-                            "",
-                            record.failure_reason.as_deref().unwrap_or("unknown"),
-                            width = progress_layout.state_width
-                        ));
-                    }
-                    writer.submit(key.clone(), record.clone())?;
-                    results.insert(key, record);
-                }
+            progress_layout.print_completed_suffix(
+                trial_duration,
+                session_started_at.elapsed(),
+                timing_estimator.estimate_remaining(remaining),
+                status,
+            );
+            if !record.completed() {
+                progress_line(format!(
+                    "reason | {}",
+                    record.failure_reason.as_deref().unwrap_or("unknown")
+                ));
             }
+            writer.submit(key.clone(), record.clone())?;
+            results.insert(key, record);
         }
 
         Ok((results, None))
-    });
-    runtime.shutdown_timeout(Duration::from_secs(1));
+    })();
     let is_fully_complete = matches!(&execution_result, Ok((_, None)));
     let writer_result = writer.close(is_fully_complete);
     match (execution_result, writer_result) {
@@ -3332,18 +4710,15 @@ fn execute_job_factories_with_timeout(
     }
 }
 
-fn can_start_job(spec: &JobSpec, used_threads: usize, available_parallelism: usize) -> bool {
-    used_threads + spec.thread_budget() <= available_parallelism
-}
-
 fn result_key_sort(lhs: &SampleKey, rhs: &SampleKey) -> Ordering {
     let queue_order = |label: &str| match label {
         value if value.starts_with("ubq_") => 0_u8,
-        "segqueue" => 1,
-        "concurrent-queue" => 2,
-        value if value.starts_with("fastfifo_") => 3,
-        value if value.starts_with("lfqueue_") => 4,
-        value if value.starts_with("wcq_") => 5,
+        value if value.starts_with("dubq_") => 1,
+        "segqueue" => 2,
+        "concurrent-queue" => 3,
+        value if value.starts_with("fastfifo_") => 4,
+        value if value.starts_with("lfqueue_") => 5,
+        value if value.starts_with("wcq_") => 6,
         _ => 99,
     };
     let queue_variant = |label: &str| {
@@ -3375,29 +4750,64 @@ fn result_key_sort(lhs: &SampleKey, rhs: &SampleKey) -> Ordering {
 fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<SampleKey> {
     let mut keys = Vec::new();
     for mode in &bundle.modes {
-        for &items_per_producer in &bundle.items_per_producer_values {
-            let baseline_queues = if plan.ubq_grid.is_some() && bundle.ubq_label.is_some() {
+        let item_values = if *mode == Mode::Throughput {
+            &bundle.items_per_producer_values[..bundle.items_per_producer_values.len().min(1)]
+        } else {
+            bundle.items_per_producer_values.as_slice()
+        };
+        for &items_per_producer in item_values {
+            let baseline_queues = if bundle.ubq_label.is_some() || bundle.dubq_label.is_some() {
                 &[][..]
             } else {
                 plan.baseline_queues.as_slice()
             };
             for baseline_queue in baseline_queues {
                 match baseline_queue {
+                    QueueKind::SegQueue => {
+                        let spec = JobSpec {
+                            scenario: bundle.scenario.clone(),
+                            repeat_index: bundle.repeat_index,
+                            mode: *mode,
+                            items_per_producer,
+                            queue: *baseline_queue,
+                            ubq_label: None,
+                            dubq_label: None,
+                            batch_size: None,
+                            fastfifo_block_size: None,
+                            fastfifo_capacity: None,
+                            lfqueue_segment_size: None,
+                            wcq_capacity: None,
+                        };
+                        keys.push(SampleKey::from_job(&spec));
+                        if *mode == Mode::Throughput {
+                            for &batch_size in &plan.ubq_batch_sizes {
+                                let spec = JobSpec {
+                                    batch_size: Some(batch_size),
+                                    ..spec.clone()
+                                };
+                                keys.push(SampleKey::from_job(&spec));
+                            }
+                        }
+                    }
                     QueueKind::FastFifo => {
                         for &block_size in &plan.fastfifo_block_sizes {
-                            let spec = JobSpec {
-                                scenario: bundle.scenario.clone(),
-                                repeat_index: bundle.repeat_index,
-                                mode: *mode,
-                                items_per_producer,
-                                queue: *baseline_queue,
-                                ubq_label: None,
-                                batch_size: None,
-                                fastfifo_block_size: Some(block_size),
-                                lfqueue_segment_size: None,
-                                wcq_capacity: None,
-                            };
-                            keys.push(SampleKey::from_job(&spec));
+                            for &capacity in &plan.fastfifo_capacities {
+                                let spec = JobSpec {
+                                    scenario: bundle.scenario.clone(),
+                                    repeat_index: bundle.repeat_index,
+                                    mode: *mode,
+                                    items_per_producer,
+                                    queue: *baseline_queue,
+                                    ubq_label: None,
+                                    dubq_label: None,
+                                    batch_size: None,
+                                    fastfifo_block_size: Some(block_size),
+                                    fastfifo_capacity: Some(capacity),
+                                    lfqueue_segment_size: None,
+                                    wcq_capacity: None,
+                                };
+                                keys.push(SampleKey::from_job(&spec));
+                            }
                         }
                     }
                     QueueKind::LfQueue => {
@@ -3409,8 +4819,10 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                                 items_per_producer,
                                 queue: *baseline_queue,
                                 ubq_label: None,
+                                dubq_label: None,
                                 batch_size: None,
                                 fastfifo_block_size: None,
+                                fastfifo_capacity: None,
                                 lfqueue_segment_size: Some(segment_size),
                                 wcq_capacity: None,
                             };
@@ -3432,8 +4844,10 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                                     items_per_producer,
                                     queue: *baseline_queue,
                                     ubq_label: None,
+                                    dubq_label: None,
                                     batch_size: None,
                                     fastfifo_block_size: None,
+                                    fastfifo_capacity: None,
                                     lfqueue_segment_size: None,
                                     wcq_capacity: Some(capacity),
                                 };
@@ -3449,8 +4863,10 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                             items_per_producer,
                             queue: *baseline_queue,
                             ubq_label: None,
+                            dubq_label: None,
                             batch_size: None,
                             fastfifo_block_size: None,
+                            fastfifo_capacity: None,
                             lfqueue_segment_size: None,
                             wcq_capacity: None,
                         };
@@ -3466,8 +4882,10 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                     items_per_producer,
                     queue: QueueKind::Ubq,
                     ubq_label: Some(label.clone()),
+                    dubq_label: None,
                     batch_size: None,
                     fastfifo_block_size: None,
+                    fastfifo_capacity: None,
                     lfqueue_segment_size: None,
                     wcq_capacity: None,
                 };
@@ -3481,10 +4899,38 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                             items_per_producer,
                             queue: QueueKind::Ubq,
                             ubq_label: Some(label.clone()),
+                            dubq_label: None,
                             batch_size: Some(batch_size),
                             fastfifo_block_size: None,
+                            fastfifo_capacity: None,
                             lfqueue_segment_size: None,
                             wcq_capacity: None,
+                        };
+                        keys.push(SampleKey::from_job(&spec));
+                    }
+                }
+            }
+            if let Some(label) = bundle.dubq_label.as_ref() {
+                let spec = JobSpec {
+                    scenario: bundle.scenario.clone(),
+                    repeat_index: bundle.repeat_index,
+                    mode: *mode,
+                    items_per_producer,
+                    queue: QueueKind::Dubq,
+                    ubq_label: None,
+                    dubq_label: Some(label.clone()),
+                    batch_size: None,
+                    fastfifo_block_size: None,
+                    fastfifo_capacity: None,
+                    lfqueue_segment_size: None,
+                    wcq_capacity: None,
+                };
+                keys.push(SampleKey::from_job(&spec));
+                if *mode == Mode::Throughput {
+                    for &batch_size in &plan.ubq_batch_sizes {
+                        let spec = JobSpec {
+                            batch_size: Some(batch_size),
+                            ..spec.clone()
                         };
                         keys.push(SampleKey::from_job(&spec));
                     }
@@ -3496,10 +4942,94 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
     keys
 }
 
+fn command_output(program: &str, args: &[&str]) -> String {
+    Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn experiment_fingerprint(plan: &MatrixPlan) -> Result<String, String> {
+    static SOURCE_IDENTITY: OnceLock<String> = OnceLock::new();
+    static MACHINE_IDENTITY: OnceLock<String> = OnceLock::new();
+    let selected_core_ids = selected_plan_core_ids(plan)?;
+    let source_identity = SOURCE_IDENTITY.get_or_init(|| {
+        let cargo_lock = fs::read("Cargo.lock").unwrap_or_default();
+        let git_head = command_output("git", &["rev-parse", "HEAD"]);
+        let git_status = command_output(
+            "git",
+            &[
+                "status", "--porcelain=v1", "--untracked-files=all", "--", "Cargo.toml",
+                "Cargo.lock", "build.rs", "src", "benches", "scripts",
+            ],
+        );
+        let git_diff = command_output(
+            "git",
+            &[
+                "diff", "--binary", "HEAD", "--", "Cargo.toml", "Cargo.lock", "build.rs",
+                "src", "benches", "scripts",
+            ],
+        );
+        let rustc = command_output("rustc", &["--version", "--verbose"]);
+        format!(
+            "git_head={git_head};git_status={git_status};git_diff={git_diff};rustc={rustc};cargo_lock={cargo_lock:?}"
+        )
+    });
+    let machine_identity = MACHINE_IDENTITY.get_or_init(|| {
+        format!(
+            "uname={};cpu={};model={};lscpu={}",
+            command_output("uname", &["-a"]),
+            command_output("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            command_output("sysctl", &["-n", "hw.model"]),
+            command_output("lscpu", &[]),
+        )
+    });
+    // This fingerprint describes the environment and measurement protocol, not
+    // the requested coverage. SampleKey already identifies the scenario,
+    // repeat, mode, workload size, queue configuration, and batch size. Keeping
+    // selection-only fields out lets a narrower or wider plan reuse its exact
+    // overlap without accepting measurements made under different conditions.
+    let identity = format!(
+        "compatibility=v1;schema={RUN_SCHEMA_VERSION};plan={PLAN_SCHEMA_VERSION};package={}@{};target={};debug={};features=registry:{}-fastfifo:{}-lfqueue:{}-wcq:{};machine={};os={};machine_identity={machine_identity};available_parallelism={};cores={:?};placement={:?};allow_unpinned={};schedule_seed={};item_policy={:?};throughput_policy={:?};job_timeout={:?};effective_job_timeout={:?};source={source_identity}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        host_target(),
+        cfg!(debug_assertions),
+        cfg!(feature = "bench_registry"),
+        cfg!(feature = "bench_fastfifo"),
+        cfg!(feature = "bench_lfqueue"),
+        cfg!(feature = "bench_wcq"),
+        normalize_machine(&plan.machine_label),
+        std::env::consts::OS,
+        plan.available_parallelism,
+        selected_core_ids,
+        plan.core_placement,
+        plan.allow_unpinned,
+        plan.schedule_seed,
+        plan.item_policy,
+        plan.throughput_policy,
+        plan.job_timeout_secs,
+        bench_job_timeout(plan),
+    );
+    Ok(format!(
+        "{:016x}",
+        stable_hash64(0x5542_5106, identity.as_bytes())
+    ))
+}
+
 fn bundle_output_meta(plan: &MatrixPlan, bundle: &PlanBundle) -> Result<OutputMeta, String> {
+    let selected_core_ids = selected_plan_core_ids(plan)?;
     let ubq_label = bundle.ubq_label.clone();
     let ubq_block_size = match ubq_label.as_deref() {
         Some(label) => Some(parse_ubq_label(label, true)?.block),
+        None => None,
+    };
+    let dubq_label = bundle.dubq_label.clone();
+    let dubq_min_block_size = match dubq_label.as_deref() {
+        Some(label) => Some(parse_dubq_label(label)?.min_block_size),
         None => None,
     };
     let expected_ubq_configurations = plan.ubq_grid.map(|_| {
@@ -3507,6 +5037,14 @@ fn bundle_output_meta(plan: &MatrixPlan, bundle: &PlanBundle) -> Result<OutputMe
             .iter()
             .filter(|candidate| candidate.scenario == bundle.scenario)
             .filter_map(|candidate| candidate.ubq_label.as_deref())
+            .collect::<BTreeSet<_>>()
+            .len()
+    });
+    let expected_dubq_configurations = plan.ubq_grid.map(|_| {
+        plan.bundles
+            .iter()
+            .filter(|candidate| candidate.scenario == bundle.scenario)
+            .filter_map(|candidate| candidate.dubq_label.as_deref())
             .collect::<BTreeSet<_>>()
             .len()
     });
@@ -3529,10 +5067,42 @@ fn bundle_output_meta(plan: &MatrixPlan, bundle: &PlanBundle) -> Result<OutputMe
         consumers: bundle.scenario.consumers,
         repeat_index: bundle.repeat_index,
         available_parallelism: plan.available_parallelism,
+        core_placement: plan.core_placement,
+        producer_core_ids: (0..bundle.scenario.producers)
+            .filter_map(|producer_id| {
+                selected_core_ids
+                    .get(producer_core_slot(
+                        bundle.scenario.producers,
+                        bundle.scenario.consumers,
+                        producer_id,
+                    ))
+                    .copied()
+            })
+            .collect(),
+        consumer_core_ids: (0..bundle.scenario.consumers)
+            .filter_map(|consumer_id| {
+                selected_core_ids
+                    .get(consumer_core_slot(
+                        bundle.scenario.producers,
+                        bundle.scenario.consumers,
+                        consumer_id,
+                    ))
+                    .copied()
+            })
+            .collect(),
+        selected_core_ids,
+        affinity_authoritative: !plan.allow_unpinned,
+        schedule_seed: plan.schedule_seed,
+        throughput_policy: plan.throughput_policy,
+        experiment_fingerprint: experiment_fingerprint(plan)?,
+        item_policy: plan.item_policy,
         ubq_label,
         ubq_block_size,
+        dubq_label,
+        dubq_min_block_size,
         ubq_grid: plan.ubq_grid,
         expected_ubq_configurations,
+        expected_dubq_configurations,
         ubq_batch_sizes: plan.ubq_batch_sizes.clone(),
         planned_repeats: plan.ubq_grid.map(|_| plan.planned_repeats),
         planned_items_per_producer,
@@ -3578,11 +5148,16 @@ fn atomic_write_string(path: &Path, contents: &str) -> Result<(), String> {
 }
 
 fn output_path_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle, run_id: &str) -> PathBuf {
-    let label = bundle
-        .ubq_label
-        .as_deref()
-        .map(|value| parse_ubq_label(value, true).expect("valid label").safe())
-        .unwrap_or_else(|| "baseline".to_string());
+    let label = if let Some(value) = bundle.ubq_label.as_deref() {
+        parse_ubq_label(value, true).expect("valid label").safe()
+    } else if let Some(value) = bundle.dubq_label.as_deref() {
+        format!(
+            "dubq_{}",
+            parse_dubq_label(value).expect("valid DUBQ label").safe()
+        )
+    } else {
+        "baseline".to_string()
+    };
     plan.runs_dir
         .join(sanitize_name(&plan.machine_label))
         .join(sanitize_name(&bundle.scenario.name))
@@ -3590,7 +5165,7 @@ fn output_path_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle, run_id: &str) 
         .join(format!("{run_id}_r{}.json", bundle.repeat_index))
 }
 
-/// Parses a scheduler stdout tracking line of the form
+/// Parses a legacy scheduler stdout tracking line of the form
 /// `"scheduler: start <label> scenario=<s> repeat=<n> ..."` or
 /// `"scheduler: done <label> scenario=<s> repeat=<n> ..."`.
 /// Returns `("start"|"done", queue_label, scenario, repeat_index)` or `None`.
@@ -3769,8 +5344,8 @@ fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
         match spec.queue {
             QueueKind::SegQueue => {
                 out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_segqueue_job_factory({scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
-                    spec.repeat_index, spec.mode, spec.items_per_producer
+                    "    jobs.push(bench_harness::make_segqueue_job_factory_variant({scenario_expr}, {}, bench_harness::Mode::{:?}, {}, {:?}));\n",
+                    spec.repeat_index, spec.mode, spec.items_per_producer, spec.batch_size
                 ));
             }
             QueueKind::ConcurrentQueue => {
@@ -3783,9 +5358,12 @@ fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
                 let block_size = spec
                     .fastfifo_block_size
                     .expect("RBBQ block size must be present");
+                let capacity = spec
+                    .fastfifo_capacity
+                    .expect("FastFifo capacity must be present");
                 out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_fastfifo_job_factory({}, {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
-                    block_size, spec.repeat_index, spec.mode, spec.items_per_producer
+                    "    jobs.push(bench_harness::make_fastfifo_job_factory({}, {}, {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
+                    block_size, capacity, spec.repeat_index, spec.mode, spec.items_per_producer
                 ));
             }
             QueueKind::LfQueue => {
@@ -3823,6 +5401,20 @@ fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
                     spec.batch_size
                 ));
             }
+            QueueKind::Dubq => {
+                let label = spec
+                    .dubq_label
+                    .as_deref()
+                    .expect("DUBQ labels must be present");
+                out.push_str(&format!(
+                    "    jobs.push(bench_harness::make_dubq_job_factory(\"{}\", {scenario_expr}, {}, bench_harness::Mode::{:?}, {}, {:?}).expect(\"valid DUBQ label\"));\n",
+                    label,
+                    spec.repeat_index,
+                    spec.mode,
+                    spec.items_per_producer,
+                    spec.batch_size
+                ));
+            }
         }
     }
 
@@ -3841,6 +5433,24 @@ fn progress_line(message: impl AsRef<str>) {
     let _ = io::stdout().flush();
 }
 
+fn progress_row_start(message: impl AsRef<str>) {
+    print!("{}", message.as_ref());
+    let _ = io::stdout().flush();
+}
+
+fn progress_row_suffix(message: impl AsRef<str>) {
+    println!("{}", message.as_ref());
+    let _ = io::stdout().flush();
+}
+
+const PROGRESS_HEADER_INTERVAL: usize = 50;
+const PROGRESS_TIME_WIDTH: usize = 9;
+const PROGRESS_STATUS_WIDTH: usize = 9;
+
+fn progress_header_due(row_index: usize) -> bool {
+    row_index % PROGRESS_HEADER_INTERVAL == 0
+}
+
 fn decimal_width(value: usize) -> usize {
     value.max(1).ilog10() as usize + 1
 }
@@ -3853,8 +5463,64 @@ fn completion_percent(completed: usize, total: usize) -> f64 {
     }
 }
 
+fn format_progress_duration(duration: Duration) -> String {
+    if duration.is_zero() {
+        return "0s".to_string();
+    }
+    let seconds = duration.as_secs();
+    if seconds >= 86_400 {
+        format!("{}d{:02}h", seconds / 86_400, (seconds % 86_400) / 3_600)
+    } else if seconds >= 3_600 {
+        format!("{}h{:02}m", seconds / 3_600, (seconds % 3_600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else if duration >= Duration::from_secs(10) {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else if duration >= Duration::from_secs(1) {
+        format!("{:.2}s", duration.as_secs_f64())
+    } else if duration >= Duration::from_millis(1) {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{}us", duration.as_micros())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct TimingEstimator {
+    observed: Duration,
+    samples: usize,
+}
+
+impl TimingEstimator {
+    fn from_history(history: &ExistingRunsIndex) -> Self {
+        let mut estimator = Self::default();
+        for record in history.records.values() {
+            if record.completed() && record.elapsed_ns > 0 {
+                estimator.observe(Duration::from_nanos(record.elapsed_ns));
+            }
+        }
+        estimator
+    }
+
+    fn observe(&mut self, duration: Duration) {
+        self.observed += duration;
+        self.samples += 1;
+    }
+
+    fn estimate_remaining(&self, remaining: usize) -> Option<Duration> {
+        if remaining == 0 {
+            return Some(Duration::ZERO);
+        }
+        if self.samples == 0 {
+            return None;
+        }
+        Some(Duration::from_secs_f64(
+            self.observed.as_secs_f64() / self.samples as f64 * remaining as f64,
+        ))
+    }
+}
+
 struct ProgressLayout {
-    state_width: usize,
     queue_width: usize,
     scenario_width: usize,
     repeat_width: usize,
@@ -3863,22 +5529,19 @@ struct ProgressLayout {
     batch_width: usize,
     thread_width: usize,
     count_width: usize,
-    available_parallelism: usize,
 }
 
 impl ProgressLayout {
-    fn new<'a>(specs: impl IntoIterator<Item = &'a JobSpec>, available_parallelism: usize) -> Self {
+    fn new<'a>(specs: impl IntoIterator<Item = &'a JobSpec>) -> Self {
         let mut layout = Self {
-            state_width: "timed out".len(),
             queue_width: "queue".len(),
-            scenario_width: 1,
-            repeat_width: 1,
-            mode_width: 1,
-            items_width: 1,
+            scenario_width: "scenario".len(),
+            repeat_width: "repeat".len(),
+            mode_width: "mode".len(),
+            items_width: "items".len(),
             batch_width: "scalar".len(),
-            thread_width: 1,
+            thread_width: "threads".len(),
             count_width: 1,
-            available_parallelism,
         };
         let mut count = 0_usize;
         for spec in specs {
@@ -3898,80 +5561,27 @@ impl ProgressLayout {
             layout.thread_width = layout.thread_width.max(decimal_width(spec.thread_budget()));
         }
         layout.count_width = decimal_width(count);
-        layout.thread_width = layout
-            .thread_width
-            .max(decimal_width(available_parallelism));
         layout
     }
 
     fn print_header(&self) {
+        let pending_width = self.count_width.max("pending".len());
+        let on_done_width = (self.count_width * 2 + 1 + " (100.00%)".len()).max("on done".len());
         progress_line(format!(
-            "scheduler: {:<state$} {:<queue$} | {:>8} | {:<scenario_col$} | {:<repeat_col$} | {:<mode_col$} | {:<items_col$} | {:<batch_col$} | {:<threads_col$} | {:<active_col$} | {:<pending_col$} | {:<completed_col$}",
-            "state",
+            "{:<queue$} | {:<scenario$} | {:>repeat$} | {:<mode$} | {:>items$} | {:>batch$} | {:>threads$} | {:>pending_width$} | {:>on_done_width$} | {:>time_width$} | {:>time_width$} | {:>time_width$} | {:<status_width$}",
             "queue",
-            "progress",
             "scenario",
             "repeat",
             "mode",
             "items",
             "batch",
             "threads",
-            "active",
             "pending",
-            "completed",
-            state = self.state_width,
-            queue = self.queue_width,
-            scenario_col = self.scenario_width + "scenario=".len(),
-            repeat_col = self.repeat_width + "repeat=".len(),
-            mode_col = self.mode_width + "mode=".len(),
-            items_col = self.items_width + "items=".len(),
-            batch_col = self.batch_width + "batch=".len(),
-            threads_col = self.thread_width + "threads=".len(),
-            active_col = self.thread_width * 2 + 1 + "active=".len(),
-            pending_col = self.count_width + "pending=".len(),
-            completed_col = self.count_width * 2 + 1 + "completed=".len(),
-        ));
-    }
-
-    fn print_row(
-        &self,
-        state: &str,
-        key: &SampleKey,
-        threads: usize,
-        active: usize,
-        pending: usize,
-        completed: usize,
-        total: usize,
-    ) {
-        let batch = key
-            .batch_size
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "scalar".to_string());
-        progress_line(format!(
-            "scheduler: {:<state$} {:<queue$} | {:>7.2}% | scenario={:<scenario$} | repeat={:>repeat$} | mode={:<mode$} | items={:>items$} | batch={:>batch$} | threads={:>threads$} | active={:>active_width$} | pending={:>pending_width$} | completed={:>completed_width$}",
-            state,
-            key.queue_label,
-            completion_percent(completed, total),
-            key.scenario,
-            key.repeat_index,
-            key.mode.name(),
-            key.items_per_producer,
-            batch,
-            threads,
-            format!(
-                "{:>width$}/{:<width$}",
-                active,
-                self.available_parallelism,
-                width = self.thread_width
-            ),
-            pending,
-            format!(
-                "{:>width$}/{:<width$}",
-                completed,
-                total,
-                width = self.count_width
-            ),
-            state = self.state_width,
+            "on done",
+            "δT",
+            "ΔT",
+            "ETA",
+            "status",
             queue = self.queue_width,
             scenario = self.scenario_width,
             repeat = self.repeat_width,
@@ -3979,9 +5589,75 @@ impl ProgressLayout {
             items = self.items_width,
             batch = self.batch_width,
             threads = self.thread_width,
-            active_width = self.thread_width * 2 + 1,
-            pending_width = self.count_width,
-            completed_width = self.count_width * 2 + 1,
+            pending_width = pending_width,
+            on_done_width = on_done_width,
+            time_width = PROGRESS_TIME_WIDTH,
+            status_width = PROGRESS_STATUS_WIDTH,
+        ));
+    }
+
+    fn print_pending_row(
+        &self,
+        key: &SampleKey,
+        threads: usize,
+        pending: usize,
+        completed_on_done: usize,
+        total: usize,
+    ) {
+        let batch = key
+            .batch_size
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "scalar".to_string());
+        let pending_width = self.count_width.max("pending".len());
+        let on_done_width = (self.count_width * 2 + 1 + " (100.00%)".len()).max("on done".len());
+        let on_done = format!(
+            "{:>width$}/{:<width$} ({:>6.2}%)",
+            completed_on_done,
+            total,
+            completion_percent(completed_on_done, total),
+            width = self.count_width
+        );
+        progress_row_start(format!(
+            "{:<queue$} | {:<scenario$} | {:>repeat$} | {:<mode$} | {:>items$} | {:>batch$} | {:>threads$} | {:>pending_width$} | {:>on_done_width$} | ",
+            key.queue_label,
+            key.scenario,
+            key.repeat_index,
+            key.mode.name(),
+            key.items_per_producer,
+            batch,
+            threads,
+            pending,
+            on_done,
+            queue = self.queue_width,
+            scenario = self.scenario_width,
+            repeat = self.repeat_width,
+            mode = self.mode_width,
+            items = self.items_width,
+            batch = self.batch_width,
+            threads = self.thread_width,
+            pending_width = pending_width,
+            on_done_width = on_done_width,
+        ));
+    }
+
+    fn print_completed_suffix(
+        &self,
+        trial_duration: Duration,
+        total_duration: Duration,
+        eta: Option<Duration>,
+        status: &str,
+    ) {
+        let eta = eta
+            .map(format_progress_duration)
+            .unwrap_or_else(|| "—".to_string());
+        progress_row_suffix(format!(
+            "{:>time_width$} | {:>time_width$} | {:>time_width$} | {:<status_width$}",
+            format_progress_duration(trial_duration),
+            format_progress_duration(total_duration),
+            eta,
+            status,
+            time_width = PROGRESS_TIME_WIDTH,
+            status_width = PROGRESS_STATUS_WIDTH,
         ));
     }
 }
@@ -4186,6 +5862,7 @@ pub fn compute_frontier_round_plan(
                     scenario: scenario.clone(),
                     repeat_index,
                     ubq_label: Some(label.clone()),
+                    dubq_label: None,
                     modes: config.modes.clone(),
                     items_per_producer_values: config.items_per_producer_values.clone(),
                 });
@@ -4195,11 +5872,19 @@ pub fn compute_frontier_round_plan(
 
     Ok(MatrixPlan {
         plan_schema_version: PLAN_SCHEMA_VERSION,
+        core_placement: CorePlacement::Interleaved,
+        item_policy: ItemPolicy::Explicit,
         machine_label: config.machine_label.clone(),
         runs_dir: config.runs_dir.clone(),
         available_parallelism: config.available_parallelism,
+        core_ids: Vec::new(),
+        allow_unpinned: false,
+        schedule_seed: DEFAULT_SCHEDULE_SEED,
+        throughput_policy: ThroughputPolicy::default(),
+        job_timeout_secs: None,
         baseline_queues: config.baseline_queues.clone(),
         fastfifo_block_sizes: config.fastfifo_block_sizes.clone(),
+        fastfifo_capacities: default_fastfifo_capacities(),
         lfqueue_segment_sizes: config.lfqueue_segment_sizes.clone(),
         wcq_capacities: config.wcq_capacities.clone(),
         ubq_grid: None,
@@ -4566,143 +6251,586 @@ fn bench_throughput_with_queue_variant<Q: BenchQueueHandleFactory>(
     queue_handle: Arc<Q>,
     queue_name: &str,
     scenario: &ScenarioConfig,
-    items_per_producer: u64,
+    requested_items_per_producer: u64,
     batch_size: Option<usize>,
     core_offset: usize,
 ) -> BenchRecord {
-    let total_items = total_items(items_per_producer, scenario.producers);
-    let total_threads = scenario.total_threads();
-    let ready = Arc::new(Barrier::new(total_threads + 1));
-    let start_gate = Arc::new(Barrier::new(total_threads + 1));
-    let start = Arc::new(OnceLock::new());
-    let producer_max = Arc::new(AtomicU64::new(0));
-    let consumer_max = Arc::new(AtomicU64::new(0));
-    let consumed_total = Arc::new(AtomicU64::new(0));
+    adaptive_throughput(
+        queue_handle,
+        queue_name,
+        scenario,
+        requested_items_per_producer,
+        batch_size,
+        core_offset,
+    )
+    .unwrap_or_else(|(reason, elapsed_ns)| {
+        failed_runtime_bench_record(
+            queue_name,
+            Mode::Throughput,
+            scenario,
+            requested_items_per_producer,
+            reason,
+            elapsed_ns,
+        )
+    })
+}
 
-    let mut producer_handles = Vec::with_capacity(scenario.producers);
+#[derive(Clone, Copy, Debug)]
+struct TimedRound {
+    elapsed: Duration,
+    producer_elapsed: Duration,
+    items: u64,
+    affinity_ok: bool,
+}
+
+fn runtime_throughput_policy() -> ThroughputPolicy {
+    if cfg!(test) {
+        return ThroughputPolicy {
+            warmup_ms: 1,
+            phase_ms: 1,
+            pilot_ms: 1,
+            max_round_items: 16_384,
+        };
+    }
+    let parse = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    };
+    ThroughputPolicy {
+        warmup_ms: parse(
+            "UBQ_BENCH_THROUGHPUT_WARMUP_MS",
+            DEFAULT_THROUGHPUT_WARMUP_MS,
+        ),
+        phase_ms: parse("UBQ_BENCH_THROUGHPUT_PHASE_MS", DEFAULT_THROUGHPUT_PHASE_MS),
+        pilot_ms: parse("UBQ_BENCH_THROUGHPUT_PILOT_MS", DEFAULT_THROUGHPUT_PILOT_MS),
+        max_round_items: parse(
+            "UBQ_BENCH_THROUGHPUT_MAX_ROUND_ITEMS",
+            DEFAULT_THROUGHPUT_MAX_ROUND_ITEMS,
+        ),
+    }
+}
+
+fn runtime_allow_unpinned() -> bool {
+    cfg!(test)
+        || std::env::var("UBQ_BENCH_ALLOW_UNPINNED")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn pin_current_bench_thread(core_id: Option<core_affinity::CoreId>) -> bool {
+    core_id.is_some_and(core_affinity::set_for_current)
+}
+
+fn send_producer_items<T: BenchQueueThreadOps>(
+    queue: &T,
+    producer_id: usize,
+    items_per_producer: u64,
+    batch_size: Option<usize>,
+) {
+    let base = (producer_id as u64)
+        .checked_mul(items_per_producer)
+        .expect("item count overflow");
+    if let Some(batch_size) = batch_size {
+        let item_count =
+            usize::try_from(items_per_producer).expect("batched item count must fit usize");
+        let mut first = 0_usize;
+        while first < item_count {
+            let next = first.saturating_add(batch_size).min(item_count);
+            queue.send_batch(base, first..next);
+            first = next;
+        }
+    } else {
+        let end = base
+            .checked_add(items_per_producer)
+            .expect("item count overflow");
+        for value in base..end {
+            queue.send_value(value);
+        }
+    }
+}
+
+fn receive_consumer_items<T: BenchQueueThreadOps>(
+    queue: &T,
+    batch_size: Option<usize>,
+    producers_done: &AtomicBool,
+    start: Instant,
+) -> (Duration, u64) {
+    let mut consumed = 0_u64;
+    let mut last_data = Duration::ZERO;
+
+    if let Some(batch_size) = batch_size {
+        let backoff = Backoff::new();
+
+        loop {
+            let received = queue.try_recv_batch(batch_size);
+
+            if received != 0 {
+                consumed = consumed
+                    .checked_add(u64::try_from(received).expect("batch size must fit u64"))
+                    .expect("consumed count overflow");
+                last_data = start.elapsed();
+                continue;
+            }
+
+            // Once every producer has returned, an empty reservation means all
+            // remaining values (if any) are already owned by other consumers.
+            // This avoids placing sentinels inside a batch, where one consumer
+            // could otherwise claim termination markers for several workers.
+            if producers_done.load(AtomicOrdering::Acquire) {
+                break;
+            }
+
+            backoff.snooze();
+        }
+    } else {
+        loop {
+            let value = queue.recv_value();
+            if value == SENTINEL {
+                break;
+            }
+            consumed = consumed.checked_add(1).expect("consumed count overflow");
+            last_data = start.elapsed();
+        }
+    }
+
+    (last_data, consumed)
+}
+
+fn run_handoff_round<Q: BenchQueueHandleFactory>(
+    queue_handle: &Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    batch_size: Option<usize>,
+    core_offset: usize,
+) -> Result<TimedRound, String> {
+    let expected = total_items(items_per_producer, scenario.producers);
+    let ready = Arc::new(Barrier::new(scenario.total_threads() + 1));
+    let start_gate = Arc::new(Barrier::new(scenario.total_threads() + 1));
+    let start = Arc::new(OnceLock::new());
+    let producers_done = Arc::new(AtomicBool::new(false));
+    let mut producers = Vec::with_capacity(scenario.producers);
     for producer_id in 0..scenario.producers {
-        let queue_thread = queue_handle.thread_handle();
+        let queue = queue_handle.thread_handle();
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
-        let producer_max = producer_max.clone();
-        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
-        producer_handles.push(spawn_bench_thread(move || {
-            if let Some(id) = core_id {
-                core_affinity::set_for_current(id);
-            }
+        let core_id = producer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            producer_id,
+        );
+        producers.push(spawn_bench_thread(move || {
+            let pinned = pin_current_bench_thread(core_id);
             ready.wait();
             start_gate.wait();
             let start: Instant = *start.get().expect("start set");
-            let base = (producer_id as u64)
-                .checked_mul(items_per_producer)
-                .expect("item count overflow");
-            let end = base
-                .checked_add(items_per_producer)
-                .expect("item count overflow");
-            if let Some(batch_size) = batch_size {
-                let item_count =
-                    usize::try_from(items_per_producer).expect("batched item count must fit usize");
-                let mut first = 0_usize;
-                while first < item_count {
-                    let next = first.saturating_add(batch_size).min(item_count);
-                    queue_thread.send_batch(base, first..next);
-                    first = next;
-                }
-            } else {
-                for value in base..end {
-                    queue_thread.send_value(value);
-                }
-            }
-            let end_ns = start.elapsed().as_nanos() as u64;
-            producer_max.fetch_max(end_ns, AtomicOrdering::Relaxed);
+            send_producer_items(&queue, producer_id, items_per_producer, batch_size);
+            (start.elapsed(), pinned)
         }));
     }
 
-    let mut consumer_handles = Vec::with_capacity(scenario.consumers);
+    let mut consumers = Vec::with_capacity(scenario.consumers);
     for consumer_id in 0..scenario.consumers {
-        let queue_thread = queue_handle.thread_handle();
+        let queue = queue_handle.thread_handle();
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
-        let consumer_max = consumer_max.clone();
-        let consumed_total = consumed_total.clone();
-        let core_id = bench_core_ids()
-            .get(core_offset + scenario.producers + consumer_id)
-            .copied();
-        consumer_handles.push(spawn_bench_thread(move || {
-            if let Some(id) = core_id {
-                core_affinity::set_for_current(id);
-            }
+        let producers_done = producers_done.clone();
+        let core_id = consumer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            consumer_id,
+        );
+        consumers.push(spawn_bench_thread(move || {
+            let pinned = pin_current_bench_thread(core_id);
             ready.wait();
             start_gate.wait();
             let start: Instant = *start.get().expect("start set");
-            loop {
-                let value = queue_thread.recv_value();
-                if value == SENTINEL {
-                    break;
-                }
-                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            let end_ns = start.elapsed().as_nanos() as u64;
-            consumer_max.fetch_max(end_ns, AtomicOrdering::Relaxed);
+            let (last_data, consumed) =
+                receive_consumer_items(&queue, batch_size, &producers_done, start);
+            (last_data, consumed, pinned)
         }));
     }
 
     ready.wait();
     start.set(Instant::now()).ok();
     start_gate.wait();
+    let producer_results = join_bench_threads(producers, "producer")?;
+    if batch_size.is_some() {
+        producers_done.store(true, AtomicOrdering::Release);
+    } else {
+        send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name)?;
+    }
+    let consumer_results = join_bench_threads(consumers, "consumer")?;
+    let consumed = consumer_results.iter().map(|(_, count, _)| *count).sum();
+    if consumed != expected {
+        return Err(format!(
+            "handoff integrity mismatch: expected {expected} items, consumed {consumed}"
+        ));
+    }
+    Ok(TimedRound {
+        elapsed: consumer_results
+            .iter()
+            .map(|(elapsed, _, _)| *elapsed)
+            .max()
+            .unwrap_or_default(),
+        producer_elapsed: producer_results
+            .iter()
+            .map(|(elapsed, _)| *elapsed)
+            .max()
+            .unwrap_or_default(),
+        items: consumed,
+        affinity_ok: producer_results.iter().all(|(_, pinned)| *pinned)
+            && consumer_results.iter().all(|(_, _, pinned)| *pinned),
+    })
+}
 
-    let mut failure_reason = None;
-    if let Err(err) = join_bench_threads(producer_handles, "producer") {
-        failure_reason.get_or_insert(err);
-    }
-    if let Err(err) = send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name) {
-        failure_reason.get_or_insert(err);
-    }
-    if let Err(err) = join_bench_threads(consumer_handles, "consumer") {
-        failure_reason.get_or_insert(err);
-    }
-    if let Some(reason) = failure_reason {
-        let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
-        return failed_runtime_bench_record(
-            queue_name,
-            Mode::Throughput,
-            scenario,
-            items_per_producer,
-            reason,
-            elapsed_ns,
+fn run_enqueue_round<Q: BenchQueueHandleFactory>(
+    queue_handle: &Arc<Q>,
+    scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    batch_size: Option<usize>,
+    core_offset: usize,
+) -> Result<TimedRound, String> {
+    let ready = Arc::new(Barrier::new(scenario.producers + 1));
+    let start_gate = Arc::new(Barrier::new(scenario.producers + 1));
+    let start = Arc::new(OnceLock::new());
+    let mut producers = Vec::with_capacity(scenario.producers);
+    for producer_id in 0..scenario.producers {
+        let queue = queue_handle.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let core_id = producer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            producer_id,
         );
+        producers.push(spawn_bench_thread(move || {
+            let pinned = pin_current_bench_thread(core_id);
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            send_producer_items(&queue, producer_id, items_per_producer, batch_size);
+            (start.elapsed(), pinned)
+        }));
+    }
+    ready.wait();
+    start.set(Instant::now()).ok();
+    start_gate.wait();
+    let results = join_bench_threads(producers, "producer")?;
+    let elapsed = results
+        .iter()
+        .map(|(elapsed, _)| *elapsed)
+        .max()
+        .unwrap_or_default();
+    Ok(TimedRound {
+        elapsed,
+        producer_elapsed: elapsed,
+        items: total_items(items_per_producer, scenario.producers),
+        affinity_ok: results.iter().all(|(_, pinned)| *pinned),
+    })
+}
+
+fn run_dequeue_round<Q: BenchQueueHandleFactory>(
+    queue_handle: &Arc<Q>,
+    scenario: &ScenarioConfig,
+    expected: u64,
+    batch_size: Option<usize>,
+    core_offset: usize,
+) -> Result<TimedRound, String> {
+    let ready = Arc::new(Barrier::new(scenario.consumers + 1));
+    let start_gate = Arc::new(Barrier::new(scenario.consumers + 1));
+    let start = Arc::new(OnceLock::new());
+    let producers_done = Arc::new(AtomicBool::new(true));
+    let mut consumers = Vec::with_capacity(scenario.consumers);
+    for consumer_id in 0..scenario.consumers {
+        let queue = queue_handle.thread_handle();
+        let ready = ready.clone();
+        let start_gate = start_gate.clone();
+        let start = start.clone();
+        let producers_done = producers_done.clone();
+        let core_id = consumer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            consumer_id,
+        );
+        consumers.push(spawn_bench_thread(move || {
+            let pinned = pin_current_bench_thread(core_id);
+            ready.wait();
+            start_gate.wait();
+            let start: Instant = *start.get().expect("start set");
+            let (last_data, consumed) =
+                receive_consumer_items(&queue, batch_size, &producers_done, start);
+            (last_data, consumed, pinned)
+        }));
+    }
+    ready.wait();
+    start.set(Instant::now()).ok();
+    start_gate.wait();
+    let results = join_bench_threads(consumers, "consumer")?;
+    let consumed = results.iter().map(|(_, count, _)| *count).sum();
+    if consumed != expected {
+        return Err(format!(
+            "dequeue integrity mismatch: expected {expected} items, consumed {consumed}"
+        ));
+    }
+    let elapsed = results
+        .iter()
+        .map(|(elapsed, _, _)| *elapsed)
+        .max()
+        .unwrap_or_default();
+    Ok(TimedRound {
+        elapsed,
+        producer_elapsed: Duration::ZERO,
+        items: consumed,
+        affinity_ok: results.iter().all(|(_, _, pinned)| *pinned),
+    })
+}
+
+fn batch_aligned_round_items(items: u64, batch: u64, max_per_producer: u64) -> Option<u64> {
+    let max_batch_aligned = (max_per_producer / batch) * batch;
+    (max_batch_aligned > 0).then(|| {
+        items
+            .max(1)
+            .div_ceil(batch)
+            .saturating_mul(batch)
+            .min(max_batch_aligned)
+    })
+}
+
+fn adaptive_throughput<Q: BenchQueueHandleFactory>(
+    queue_handle: Arc<Q>,
+    queue_name: &str,
+    scenario: &ScenarioConfig,
+    requested_items_per_producer: u64,
+    batch_size: Option<usize>,
+    core_offset: usize,
+) -> Result<BenchRecord, (String, u64)> {
+    let policy = runtime_throughput_policy();
+    let batch = batch_size.map(|value| value as u64).unwrap_or(1);
+    let max_per_producer = (policy.max_round_items / scenario.producers as u64).max(1);
+    if batch_aligned_round_items(1, batch, max_per_producer).is_none() {
+        return Err((
+            format!("batch size {batch} exceeds the per-producer round cap {max_per_producer}"),
+            0,
+        ));
+    }
+    let normalize = |items: u64| {
+        batch_aligned_round_items(items, batch, max_per_producer)
+            .expect("batch was validated against the round cap")
+    };
+
+    let mut pilot_items = normalize(INITIAL_THROUGHPUT_PILOT_ITEMS_PER_PRODUCER);
+    let mut calibration_elapsed = Duration::ZERO;
+    let mut affinity_ok = true;
+    loop {
+        let round = run_handoff_round(
+            &queue_handle,
+            queue_name,
+            scenario,
+            pilot_items,
+            batch_size,
+            core_offset,
+        )
+        .map_err(|reason| (reason, calibration_elapsed.as_nanos() as u64))?;
+        calibration_elapsed += round.elapsed;
+        affinity_ok &= round.affinity_ok;
+        let next = normalize(pilot_items.saturating_mul(2));
+        if round.elapsed >= policy.pilot_duration() || next == pilot_items {
+            break;
+        }
+        pilot_items = next;
     }
 
-    let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
-    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
-    let ops_per_sec = throughput_ops(consumed, elapsed_ns);
+    let mut warmup_elapsed = Duration::ZERO;
+    let mut warmup_rounds = 0_usize;
+    while warmup_elapsed < policy.warmup_duration() {
+        let round = run_handoff_round(
+            &queue_handle,
+            queue_name,
+            scenario,
+            pilot_items,
+            batch_size,
+            core_offset,
+        )
+        .map_err(|reason| (reason, warmup_elapsed.as_nanos() as u64))?;
+        warmup_elapsed += round.elapsed.max(Duration::from_nanos(1));
+        warmup_rounds += 1;
+        affinity_ok &= round.affinity_ok;
+    }
 
-    BenchRecord {
+    let mut handoff_elapsed = Duration::ZERO;
+    let mut handoff_items = 0_u64;
+    let mut handoff_rounds = 0_usize;
+    let mut producer_elapsed_max = Duration::ZERO;
+    while handoff_elapsed < policy.phase_duration() {
+        let round = run_handoff_round(
+            &queue_handle,
+            queue_name,
+            scenario,
+            pilot_items,
+            batch_size,
+            core_offset,
+        )
+        .map_err(|reason| (reason, handoff_elapsed.as_nanos() as u64))?;
+        handoff_elapsed += round.elapsed.max(Duration::from_nanos(1));
+        producer_elapsed_max = producer_elapsed_max.max(round.producer_elapsed);
+        handoff_items = handoff_items
+            .checked_add(round.items)
+            .expect("handoff item count overflow");
+        handoff_rounds += 1;
+        affinity_ok &= round.affinity_ok;
+    }
+
+    let capacity_limit = queue_handle
+        .bounded_capacity()
+        .map(|capacity| capacity.saturating_sub(scenario.consumers) as u64)
+        .unwrap_or(policy.max_round_items);
+    let ceiling_max_per_producer = capacity_limit / scenario.producers as u64;
+    let ceiling_items = if batch == 1 {
+        pilot_items.min(ceiling_max_per_producer).max(1)
+    } else {
+        let candidate = pilot_items.min(ceiling_max_per_producer);
+        if candidate < batch {
+            0
+        } else {
+            (candidate / batch) * batch
+        }
+    };
+    let ceiling_total = total_items(ceiling_items, scenario.producers);
+    if ceiling_items == 0 || ceiling_total > capacity_limit {
+        return Err((
+            format!(
+                "bounded capacity {} cannot hold one ceiling round plus {} consumer sentinels",
+                queue_handle.bounded_capacity().unwrap_or(0),
+                scenario.consumers
+            ),
+            0,
+        ));
+    }
+
+    let mut enqueue_elapsed = Duration::ZERO;
+    let mut dequeue_elapsed = Duration::ZERO;
+    let mut enqueue_items = 0_u64;
+    let mut dequeue_items = 0_u64;
+    let mut ceiling_rounds = 0_usize;
+    while enqueue_elapsed < policy.phase_duration() || dequeue_elapsed < policy.phase_duration() {
+        let enqueue = run_enqueue_round(
+            &queue_handle,
+            scenario,
+            ceiling_items,
+            batch_size,
+            core_offset,
+        )
+        .map_err(|reason| (reason, enqueue_elapsed.as_nanos() as u64))?;
+        affinity_ok &= enqueue.affinity_ok;
+        enqueue_elapsed += enqueue.elapsed.max(Duration::from_nanos(1));
+        enqueue_items = enqueue_items
+            .checked_add(enqueue.items)
+            .expect("enqueue item count overflow");
+
+        if batch_size.is_none() {
+            send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name)
+                .map_err(|reason| (reason, enqueue_elapsed.as_nanos() as u64))?;
+        }
+        let dequeue = run_dequeue_round(
+            &queue_handle,
+            scenario,
+            ceiling_total,
+            batch_size,
+            core_offset,
+        )
+        .map_err(|reason| (reason, dequeue_elapsed.as_nanos() as u64))?;
+        affinity_ok &= dequeue.affinity_ok;
+        dequeue_elapsed += dequeue.elapsed.max(Duration::from_nanos(1));
+        dequeue_items = dequeue_items
+            .checked_add(dequeue.items)
+            .expect("dequeue item count overflow");
+        ceiling_rounds += 1;
+    }
+
+    if !affinity_ok && !runtime_allow_unpinned() {
+        return Err((
+            "one or more benchmark workers could not be pinned to the requested CPU".to_string(),
+            handoff_elapsed.as_nanos() as u64,
+        ));
+    }
+
+    let elapsed_ns = handoff_elapsed.as_nanos().min(u64::MAX as u128) as u64;
+    let enqueue_elapsed_ns = enqueue_elapsed.as_nanos().min(u64::MAX as u128) as u64;
+    let dequeue_elapsed_ns = dequeue_elapsed.as_nanos().min(u64::MAX as u128) as u64;
+    let enqueue_ops_per_sec = throughput_ops(enqueue_items, enqueue_elapsed_ns).unwrap_or(0.0);
+    let dequeue_ops_per_sec = throughput_ops(dequeue_items, dequeue_elapsed_ns).unwrap_or(0.0);
+    let handoff_ops_per_sec = throughput_ops(handoff_items, elapsed_ns);
+    let ceiling_warning = handoff_ops_per_sec.and_then(|handoff| {
+        let ceiling = enqueue_ops_per_sec.min(dequeue_ops_per_sec);
+        (ceiling > 0.0 && handoff > ceiling * 1.05).then(|| {
+            format!(
+                "handoff rate {:.3} exceeds the lower isolated ceiling {:.3} by more than 5%",
+                handoff, ceiling
+            )
+        })
+    });
+
+    Ok(BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::Throughput.name().to_string(),
         batch_size,
-        items_per_producer,
-        total_items,
-        consumed_items: consumed,
+        items_per_producer: handoff_items / scenario.producers as u64,
+        total_items: handoff_items,
+        consumed_items: handoff_items,
         elapsed_ns,
-        ops_per_sec,
-        producer_ops_per_sec: None,
-        consumer_ops_per_sec: None,
+        ops_per_sec: handoff_ops_per_sec,
+        producer_ops_per_sec: Some(enqueue_ops_per_sec),
+        consumer_ops_per_sec: Some(dequeue_ops_per_sec),
         written_bytes: None,
         flush_count: None,
-        push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
-        pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
-        fill_elapsed_ns: None,
-        drain_elapsed_ns: None,
+        push_elapsed_ns: Some(producer_elapsed_max.as_nanos() as u64),
+        pop_elapsed_ns: Some(elapsed_ns),
+        fill_elapsed_ns: Some(enqueue_elapsed_ns),
+        drain_elapsed_ns: Some(dequeue_elapsed_ns),
         avg_data_latency_ns: None,
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
         status: BenchRecordStatus::Completed,
         failure_reason: None,
         timeout_ns: None,
-    }
+        throughput_metrics: Some(ThroughputMetrics {
+            requested_items_per_producer,
+            pilot_items_per_producer: pilot_items,
+            calibration_elapsed_ns: calibration_elapsed.as_nanos() as u64,
+            warmup_elapsed_ns: warmup_elapsed.as_nanos() as u64,
+            warmup_rounds,
+            handoff_items,
+            handoff_elapsed_ns: elapsed_ns,
+            handoff_rounds,
+            enqueue_items,
+            enqueue_elapsed_ns,
+            enqueue_rounds: ceiling_rounds,
+            dequeue_items,
+            dequeue_elapsed_ns,
+            dequeue_rounds: ceiling_rounds,
+            enqueue_ops_per_sec,
+            dequeue_ops_per_sec,
+            affinity_authoritative: affinity_ok,
+            schedule_seed: std::env::var("UBQ_BENCH_SCHEDULE_SEED")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_SCHEDULE_SEED),
+            execution_ordinal: 0,
+            requested_queue_capacity: None,
+            effective_queue_capacity: queue_handle.bounded_capacity(),
+            ceiling_warning,
+        }),
+    })
 }
 
 fn deterministic_busy(thread_id: usize, op_index: u64) {
@@ -4857,7 +6985,12 @@ fn bench_app_log_mpsc_file_with_queue<Q: LogQueueHandleFactory>(
         let start_gate = start_gate.clone();
         let start = start.clone();
         let producer_max = producer_max.clone();
-        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        let core_id = producer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            producer_id,
+        );
         producer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
@@ -4878,9 +7011,7 @@ fn bench_app_log_mpsc_file_with_queue<Q: LogQueueHandleFactory>(
     let start_consumer = start.clone();
     let queue_name_consumer = queue_name.to_string();
     let scenario_consumer = scenario.clone();
-    let core_id = bench_core_ids()
-        .get(core_offset + scenario.producers)
-        .copied();
+    let core_id = consumer_core_id(core_offset, scenario.producers, scenario.consumers, 0);
     let consumer_handle = spawn_bench_thread(move || -> (u64, u64, u64, u64) {
         if let Some(id) = core_id {
             core_affinity::set_for_current(id);
@@ -4964,6 +7095,7 @@ fn bench_app_log_mpsc_file_with_queue<Q: LogQueueHandleFactory>(
         status: BenchRecordStatus::Completed,
         failure_reason: None,
         timeout_ns: None,
+        throughput_metrics: None,
     }
 }
 
@@ -5023,9 +7155,6 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
     let start_gate = Arc::new(Barrier::new(total_threads + 1));
     let start = Arc::new(OnceLock::new());
     let producer_max = Arc::new(AtomicU64::new(0));
-    let consumer_max = Arc::new(AtomicU64::new(0));
-    let consumed_total = Arc::new(AtomicU64::new(0));
-    let latency_total = Arc::new(AtomicU64::new(0));
     let producer_count = scenario.producers;
 
     let mut producer_handles = Vec::with_capacity(scenario.producers);
@@ -5035,7 +7164,12 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
         let start_gate = start_gate.clone();
         let start = start.clone();
         let producer_max = producer_max.clone();
-        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        let core_id = producer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            producer_id,
+        );
         producer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
@@ -5066,19 +7200,21 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
-        let consumer_max = consumer_max.clone();
-        let consumed_total = consumed_total.clone();
-        let latency_total = latency_total.clone();
-        let core_id = bench_core_ids()
-            .get(core_offset + scenario.producers + consumer_id)
-            .copied();
-        consumer_handles.push(spawn_bench_thread(move || {
+        let core_id = consumer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            consumer_id,
+        );
+        consumer_handles.push(spawn_bench_thread(move || -> (u64, u64, u128) {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
             ready.wait();
             start_gate.wait();
             let start: Instant = *start.get().expect("start set");
+            let mut consumed = 0_u64;
+            let mut latency_total = 0_u128;
             loop {
                 let ptr = queue_thread.recv_value();
                 if ptr == SENTINEL {
@@ -5088,13 +7224,12 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
                 let record = unsafe { app_record_from_ptr(ptr) };
                 let digest = app_work(producer_count + consumer_id, record.id ^ record.hash);
                 std::hint::black_box(digest);
-                latency_total.fetch_add(
-                    now_ns.saturating_sub(record.created_ns),
-                    AtomicOrdering::Relaxed,
-                );
-                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
+                latency_total = latency_total
+                    .checked_add(now_ns.saturating_sub(record.created_ns) as u128)
+                    .expect("latency total overflow");
+                consumed = consumed.checked_add(1).expect("consumed count overflow");
             }
-            consumer_max.fetch_max(start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+            (start.elapsed().as_nanos() as u64, consumed, latency_total)
         }));
     }
 
@@ -5109,9 +7244,13 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
     if let Err(err) = send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name) {
         failure_reason.get_or_insert(err);
     }
-    if let Err(err) = join_bench_threads(consumer_handles, "consumer") {
-        failure_reason.get_or_insert(err);
-    }
+    let consumer_results = match join_bench_threads(consumer_handles, "consumer") {
+        Ok(values) => values,
+        Err(err) => {
+            failure_reason.get_or_insert(err);
+            Vec::new()
+        }
+    };
     if let Some(reason) = failure_reason {
         let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
         return failed_runtime_bench_record(
@@ -5125,7 +7264,11 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
-    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
+    let consumed = consumer_results.iter().map(|(_, count, _)| *count).sum();
+    let latency_total: u128 = consumer_results
+        .iter()
+        .map(|(_, _, latency)| *latency)
+        .sum();
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::AppLogFanIn.name().to_string(),
@@ -5140,15 +7283,16 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
         written_bytes: None,
         flush_count: None,
         push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
-        pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
+        pop_elapsed_ns: consumer_results.iter().map(|(end_ns, _, _)| *end_ns).max(),
         fill_elapsed_ns: None,
         drain_elapsed_ns: None,
-        avg_data_latency_ns: average_latency_ns(&latency_total, consumed),
+        avg_data_latency_ns: average_latency_ns(latency_total, consumed),
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
         status: BenchRecordStatus::Completed,
         failure_reason: None,
         timeout_ns: None,
+        throughput_metrics: None,
     }
 }
 
@@ -5185,9 +7329,6 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
     let start_gate = Arc::new(Barrier::new(total_threads + 1));
     let start = Arc::new(OnceLock::new());
     let producer_max = Arc::new(AtomicU64::new(0));
-    let collector_end = Arc::new(AtomicU64::new(0));
-    let consumed_total = Arc::new(AtomicU64::new(0));
-    let latency_total = Arc::new(AtomicU64::new(0));
     let producer_count = scenario.producers;
     let consumer_count = scenario.consumers;
 
@@ -5198,7 +7339,12 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
         let start_gate = start_gate.clone();
         let start = start.clone();
         let producer_max = producer_max.clone();
-        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        let core_id = producer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            producer_id,
+        );
         producer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
@@ -5229,9 +7375,12 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
-        let core_id = bench_core_ids()
-            .get(core_offset + producer_count + worker_id)
-            .copied();
+        let core_id = consumer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            worker_id,
+        );
         worker_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
@@ -5256,31 +7405,29 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
-        let collector_end = collector_end.clone();
-        let consumed_total = consumed_total.clone();
-        let latency_total = latency_total.clone();
         let core_id = bench_core_ids()
             .get(core_offset + scenario.producers + scenario.consumers)
             .copied();
-        spawn_bench_thread(move || {
+        spawn_bench_thread(move || -> (u64, u64, u128) {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
             ready.wait();
             start_gate.wait();
             let start: Instant = *start.get().expect("start set");
+            let mut consumed = 0_u64;
+            let mut latency_total = 0_u128;
             for _ in 0..total_items {
                 let ptr = output_thread.recv_value();
                 let now_ns = start.elapsed().as_nanos() as u64;
                 let record = unsafe { app_record_from_ptr(ptr) };
                 std::hint::black_box(record.hash);
-                latency_total.fetch_add(
-                    now_ns.saturating_sub(record.created_ns),
-                    AtomicOrdering::Relaxed,
-                );
-                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
+                latency_total = latency_total
+                    .checked_add(now_ns.saturating_sub(record.created_ns) as u128)
+                    .expect("latency total overflow");
+                consumed = consumed.checked_add(1).expect("consumed count overflow");
             }
-            collector_end.store(start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+            (start.elapsed().as_nanos() as u64, consumed, latency_total)
         })
     };
 
@@ -5298,9 +7445,13 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
     if let Err(err) = join_bench_threads(worker_handles, "worker") {
         failure_reason.get_or_insert(err);
     }
-    if let Err(err) = join_bench_thread(collector, "collector") {
-        failure_reason.get_or_insert(err);
-    }
+    let collector_result = match join_bench_thread(collector, "collector") {
+        Ok(value) => Some(value),
+        Err(err) => {
+            failure_reason.get_or_insert(err);
+            None
+        }
+    };
     if let Some(reason) = failure_reason {
         let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
         return failed_runtime_bench_record(
@@ -5314,7 +7465,7 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
-    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
+    let (collector_end, consumed, latency_total) = collector_result.expect("collector completed");
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::AppPipeline.name().to_string(),
@@ -5329,15 +7480,16 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
         written_bytes: None,
         flush_count: None,
         push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
-        pop_elapsed_ns: Some(collector_end.load(AtomicOrdering::Relaxed)),
+        pop_elapsed_ns: Some(collector_end),
         fill_elapsed_ns: None,
         drain_elapsed_ns: None,
-        avg_data_latency_ns: average_latency_ns(&latency_total, consumed),
+        avg_data_latency_ns: average_latency_ns(latency_total, consumed),
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
         status: BenchRecordStatus::Completed,
         failure_reason: None,
         timeout_ns: None,
+        throughput_metrics: None,
     }
 }
 
@@ -5370,10 +7522,7 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
     let ready = Arc::new(Barrier::new(total_threads + 1));
     let start_gate = Arc::new(Barrier::new(total_threads + 1));
     let start = Arc::new(OnceLock::new());
-    let client_max = Arc::new(AtomicU64::new(0));
     let worker_max = Arc::new(AtomicU64::new(0));
-    let consumed_total = Arc::new(AtomicU64::new(0));
-    let latency_total = Arc::new(AtomicU64::new(0));
 
     let mut worker_handles = Vec::with_capacity(scenario.consumers);
     for worker_id in 0..scenario.consumers {
@@ -5383,9 +7532,12 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
         let start_gate = start_gate.clone();
         let start = start.clone();
         let worker_max = worker_max.clone();
-        let core_id = bench_core_ids()
-            .get(core_offset + scenario.producers + worker_id)
-            .copied();
+        let core_id = consumer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            worker_id,
+        );
         worker_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
@@ -5413,11 +7565,13 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
-        let client_max = client_max.clone();
-        let consumed_total = consumed_total.clone();
-        let latency_total = latency_total.clone();
-        let core_id = bench_core_ids().get(core_offset + client_id).copied();
-        client_handles.push(spawn_bench_thread(move || {
+        let core_id = producer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            client_id,
+        );
+        client_handles.push(spawn_bench_thread(move || -> (u64, u64, u128) {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
@@ -5427,6 +7581,8 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
             let base = (client_id as u64)
                 .checked_mul(items_per_producer)
                 .expect("item count overflow");
+            let mut consumed = 0_u64;
+            let mut latency_total = 0_u128;
             for offset in 0..items_per_producer {
                 let id = base.checked_add(offset).expect("item count overflow");
                 let created_ns = start.elapsed().as_nanos() as u64;
@@ -5439,13 +7595,12 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
                 let now_ns = start.elapsed().as_nanos() as u64;
                 let record = unsafe { app_record_from_ptr(ptr) };
                 std::hint::black_box(record.hash);
-                latency_total.fetch_add(
-                    now_ns.saturating_sub(record.created_ns),
-                    AtomicOrdering::Relaxed,
-                );
-                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
+                latency_total = latency_total
+                    .checked_add(now_ns.saturating_sub(record.created_ns) as u128)
+                    .expect("latency total overflow");
+                consumed = consumed.checked_add(1).expect("consumed count overflow");
             }
-            client_max.fetch_max(start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+            (start.elapsed().as_nanos() as u64, consumed, latency_total)
         }));
     }
 
@@ -5454,9 +7609,13 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
     start_gate.wait();
 
     let mut failure_reason = None;
-    if let Err(err) = join_bench_threads(client_handles, "client") {
-        failure_reason.get_or_insert(err);
-    }
+    let client_results = match join_bench_threads(client_handles, "client") {
+        Ok(values) => values,
+        Err(err) => {
+            failure_reason.get_or_insert(err);
+            Vec::new()
+        }
+    };
     if let Err(err) = send_sentinels(
         request_queue.thread_handle(),
         scenario.consumers,
@@ -5480,7 +7639,8 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
-    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
+    let consumed = client_results.iter().map(|(_, count, _)| *count).sum();
+    let latency_total: u128 = client_results.iter().map(|(_, _, latency)| *latency).sum();
     BenchRecord {
         queue: queue_name.to_string(),
         mode: Mode::AppTaskRoundtrip.name().to_string(),
@@ -5494,24 +7654,25 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
         consumer_ops_per_sec: None,
         written_bytes: None,
         flush_count: None,
-        push_elapsed_ns: Some(client_max.load(AtomicOrdering::Relaxed)),
+        push_elapsed_ns: client_results.iter().map(|(end_ns, _, _)| *end_ns).max(),
         pop_elapsed_ns: Some(worker_max.load(AtomicOrdering::Relaxed)),
         fill_elapsed_ns: None,
         drain_elapsed_ns: None,
-        avg_data_latency_ns: average_latency_ns(&latency_total, consumed),
+        avg_data_latency_ns: average_latency_ns(latency_total, consumed),
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
         status: BenchRecordStatus::Completed,
         failure_reason: None,
         timeout_ns: None,
+        throughput_metrics: None,
     }
 }
 
-fn average_latency_ns(latency_total: &AtomicU64, consumed: u64) -> Option<f64> {
+fn average_latency_ns(latency_total: u128, consumed: u64) -> Option<f64> {
     if consumed == 0 {
         None
     } else {
-        Some(latency_total.load(AtomicOrdering::Relaxed) as f64 / consumed as f64)
+        Some(latency_total as f64 / consumed as f64)
     }
 }
 
@@ -5543,8 +7704,6 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
     let start_gate = Arc::new(Barrier::new(total_threads + 1));
     let start = Arc::new(OnceLock::new());
     let producer_max = Arc::new(AtomicU64::new(0));
-    let consumer_max = Arc::new(AtomicU64::new(0));
-    let consumed_total = Arc::new(AtomicU64::new(0));
     let producer_count = scenario.producers;
 
     let mut producer_handles = Vec::with_capacity(scenario.producers);
@@ -5554,7 +7713,12 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
         let start_gate = start_gate.clone();
         let start = start.clone();
         let producer_max = producer_max.clone();
-        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        let core_id = producer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            producer_id,
+        );
         producer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
@@ -5582,18 +7746,20 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
-        let consumer_max = consumer_max.clone();
-        let consumed_total = consumed_total.clone();
-        let core_id = bench_core_ids()
-            .get(core_offset + scenario.producers + consumer_id)
-            .copied();
-        consumer_handles.push(spawn_bench_thread(move || {
+        let core_id = consumer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            consumer_id,
+        );
+        consumer_handles.push(spawn_bench_thread(move || -> (u64, u64) {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
             ready.wait();
             start_gate.wait();
             let start: Instant = *start.get().expect("start set");
+            let mut consumed = 0_u64;
             loop {
                 let ptr = queue_thread.recv_value();
                 if ptr == SENTINEL {
@@ -5602,10 +7768,10 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
                 deterministic_busy(producer_count + consumer_id, ptr);
                 let boxed = unsafe { Box::from_raw(ptr as usize as *mut u64) };
                 std::hint::black_box(*boxed);
-                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
+                consumed = consumed.checked_add(1).expect("consumed count overflow");
             }
             let end_ns = start.elapsed().as_nanos() as u64;
-            consumer_max.fetch_max(end_ns, AtomicOrdering::Relaxed);
+            (end_ns, consumed)
         }));
     }
 
@@ -5620,9 +7786,13 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
     if let Err(err) = send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name) {
         failure_reason.get_or_insert(err);
     }
-    if let Err(err) = join_bench_threads(consumer_handles, "consumer") {
-        failure_reason.get_or_insert(err);
-    }
+    let consumer_results = match join_bench_threads(consumer_handles, "consumer") {
+        Ok(values) => values,
+        Err(err) => {
+            failure_reason.get_or_insert(err);
+            Vec::new()
+        }
+    };
     if let Some(reason) = failure_reason {
         let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
         return failed_runtime_bench_record(
@@ -5636,7 +7806,7 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
-    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
+    let consumed = consumer_results.iter().map(|(_, count)| *count).sum();
     let ops_per_sec = throughput_ops(consumed, elapsed_ns);
 
     BenchRecord {
@@ -5653,7 +7823,7 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
         written_bytes: None,
         flush_count: None,
         push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
-        pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
+        pop_elapsed_ns: consumer_results.iter().map(|(end_ns, _)| *end_ns).max(),
         fill_elapsed_ns: None,
         drain_elapsed_ns: None,
         avg_data_latency_ns: None,
@@ -5662,6 +7832,7 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
         status: BenchRecordStatus::Completed,
         failure_reason: None,
         timeout_ns: None,
+        throughput_metrics: None,
     }
 }
 
@@ -5693,9 +7864,6 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
     let start_gate = Arc::new(Barrier::new(total_threads + 1));
     let start = Arc::new(OnceLock::new());
     let producer_max = Arc::new(AtomicU64::new(0));
-    let consumer_max = Arc::new(AtomicU64::new(0));
-    let consumed_total = Arc::new(AtomicU64::new(0));
-    let latency_total = Arc::new(AtomicU64::new(0));
     let producer_count = scenario.producers;
 
     let mut producer_handles = Vec::with_capacity(scenario.producers);
@@ -5705,7 +7873,12 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
         let start_gate = start_gate.clone();
         let start = start.clone();
         let producer_max = producer_max.clone();
-        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        let core_id = producer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            producer_id,
+        );
         producer_handles.push(spawn_bench_thread(move || {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
@@ -5732,19 +7905,21 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
-        let consumer_max = consumer_max.clone();
-        let consumed_total = consumed_total.clone();
-        let latency_total = latency_total.clone();
-        let core_id = bench_core_ids()
-            .get(core_offset + scenario.producers + consumer_id)
-            .copied();
-        consumer_handles.push(spawn_bench_thread(move || {
+        let core_id = consumer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            consumer_id,
+        );
+        consumer_handles.push(spawn_bench_thread(move || -> (u64, u64, u128) {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
             }
             ready.wait();
             start_gate.wait();
             let start: Instant = *start.get().expect("start set");
+            let mut consumed = 0_u64;
+            let mut latency_total = 0_u128;
             loop {
                 let ptr = queue_thread.recv_value();
                 if ptr == SENTINEL {
@@ -5753,11 +7928,13 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
                 let now_ns = start.elapsed().as_nanos() as u64;
                 deterministic_busy(producer_count + consumer_id, ptr);
                 let enqueue_ns = unsafe { *Box::from_raw(ptr as usize as *mut u64) };
-                latency_total.fetch_add(now_ns.saturating_sub(enqueue_ns), AtomicOrdering::Relaxed);
-                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
+                latency_total = latency_total
+                    .checked_add(now_ns.saturating_sub(enqueue_ns) as u128)
+                    .expect("latency total overflow");
+                consumed = consumed.checked_add(1).expect("consumed count overflow");
             }
             let end_ns = start.elapsed().as_nanos() as u64;
-            consumer_max.fetch_max(end_ns, AtomicOrdering::Relaxed);
+            (end_ns, consumed, latency_total)
         }));
     }
 
@@ -5772,9 +7949,13 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
     if let Err(err) = send_sentinels(queue_handle.thread_handle(), scenario.consumers, queue_name) {
         failure_reason.get_or_insert(err);
     }
-    if let Err(err) = join_bench_threads(consumer_handles, "consumer") {
-        failure_reason.get_or_insert(err);
-    }
+    let consumer_results = match join_bench_threads(consumer_handles, "consumer") {
+        Ok(values) => values,
+        Err(err) => {
+            failure_reason.get_or_insert(err);
+            Vec::new()
+        }
+    };
     if let Some(reason) = failure_reason {
         let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
         return failed_runtime_bench_record(
@@ -5788,12 +7969,16 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
     }
 
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
-    let consumed = consumed_total.load(AtomicOrdering::Relaxed);
+    let consumed = consumer_results.iter().map(|(_, count, _)| *count).sum();
+    let latency_total: u128 = consumer_results
+        .iter()
+        .map(|(_, _, latency)| *latency)
+        .sum();
     let ops_per_sec = throughput_ops(consumed, elapsed_ns);
     let avg_data_latency_ns = if consumed == 0 {
         None
     } else {
-        Some(latency_total.load(AtomicOrdering::Relaxed) as f64 / consumed as f64)
+        Some(latency_total as f64 / consumed as f64)
     };
 
     BenchRecord {
@@ -5810,7 +7995,7 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
         written_bytes: None,
         flush_count: None,
         push_elapsed_ns: Some(producer_max.load(AtomicOrdering::Relaxed)),
-        pop_elapsed_ns: Some(consumer_max.load(AtomicOrdering::Relaxed)),
+        pop_elapsed_ns: consumer_results.iter().map(|(end_ns, _, _)| *end_ns).max(),
         fill_elapsed_ns: None,
         drain_elapsed_ns: None,
         avg_data_latency_ns,
@@ -5819,6 +8004,7 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
         status: BenchRecordStatus::Completed,
         failure_reason: None,
         timeout_ns: None,
+        throughput_metrics: None,
     }
 }
 
@@ -5856,7 +8042,12 @@ fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
-        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
+        let core_id = producer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            producer_id,
+        );
         producer_handles.push(spawn_bench_thread(move || -> u64 {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
@@ -5881,9 +8072,12 @@ fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
         let ready = ready.clone();
         let start_gate = start_gate.clone();
         let start = start.clone();
-        let core_id = bench_core_ids()
-            .get(core_offset + scenario.producers + consumer_id)
-            .copied();
+        let core_id = consumer_core_id(
+            core_offset,
+            scenario.producers,
+            scenario.consumers,
+            consumer_id,
+        );
         consumer_handles.push(spawn_bench_thread(move || -> (u64, u64) {
             if let Some(id) = core_id {
                 core_affinity::set_for_current(id);
@@ -5972,69 +8166,7 @@ fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
         status: BenchRecordStatus::Completed,
         failure_reason: None,
         timeout_ns: None,
-    }
-}
-
-fn bench_fill_drain_for<Q: BenchQueue>(
-    queue_name: &str,
-    scenario: &ScenarioConfig,
-    items_per_producer: u64,
-    core_offset: usize,
-) -> BenchRecord {
-    bench_fill_drain_with_queue(
-        Q::new_queue(),
-        queue_name,
-        scenario,
-        items_per_producer,
-        core_offset,
-    )
-}
-
-fn bench_fill_drain_with_queue<Q: BenchQueueHandleFactory>(
-    queue_handle: Arc<Q>,
-    queue_name: &str,
-    scenario: &ScenarioConfig,
-    items_per_producer: u64,
-    core_offset: usize,
-) -> BenchRecord {
-    let total_items = total_items(items_per_producer, scenario.producers);
-    let fill_elapsed = run_producers_only_for(
-        &queue_handle,
-        scenario.producers,
-        items_per_producer,
-        core_offset,
-    );
-    let sentinel_sender = queue_handle.thread_handle();
-    for _ in 0..scenario.consumers {
-        sentinel_sender.send_value(SENTINEL);
-    }
-    let (drain_elapsed, consumed) =
-        run_consumers_only_for(&queue_handle, scenario.consumers, core_offset);
-    let elapsed_ns = (fill_elapsed + drain_elapsed).as_nanos() as u64;
-    let ops_per_sec = throughput_ops(consumed, elapsed_ns);
-    BenchRecord {
-        queue: queue_name.to_string(),
-        mode: Mode::FillDrain.name().to_string(),
-        batch_size: None,
-        items_per_producer,
-        total_items,
-        consumed_items: consumed,
-        elapsed_ns,
-        ops_per_sec,
-        producer_ops_per_sec: None,
-        consumer_ops_per_sec: None,
-        written_bytes: None,
-        flush_count: None,
-        push_elapsed_ns: None,
-        pop_elapsed_ns: None,
-        fill_elapsed_ns: Some(fill_elapsed.as_nanos() as u64),
-        drain_elapsed_ns: Some(drain_elapsed.as_nanos() as u64),
-        avg_data_latency_ns: None,
-        producer_fairness_ratio: None,
-        consumer_fairness_ratio: None,
-        status: BenchRecordStatus::Completed,
-        failure_reason: None,
-        timeout_ns: None,
+        throughput_metrics: None,
     }
 }
 
@@ -6060,7 +8192,7 @@ fn throughput_ops(consumed: u64, elapsed_ns: u64) -> Option<f64> {
 
 fn record_queue_name_for_spec(spec: &JobSpec) -> String {
     match spec.queue {
-        QueueKind::Ubq => QueueKind::Ubq.name().to_string(),
+        QueueKind::Ubq | QueueKind::Dubq => spec.queue.name().to_string(),
         _ => spec.queue_label(),
     }
 }
@@ -6095,18 +8227,7 @@ fn failed_bench_record(
         status,
         failure_reason: Some(reason),
         timeout_ns,
-    }
-}
-
-fn status_and_timeout_for_failure(
-    reason: &str,
-    elapsed_ns: u64,
-) -> (BenchRecordStatus, Option<u64>) {
-    let normalized = reason.to_ascii_lowercase();
-    if normalized.contains("timed out") || normalized.contains("timeout") {
-        (BenchRecordStatus::TimedOut, Some(elapsed_ns))
-    } else {
-        (BenchRecordStatus::Failed, None)
+        throughput_metrics: None,
     }
 }
 
@@ -6118,7 +8239,6 @@ fn failed_runtime_bench_record(
     reason: String,
     elapsed_ns: u64,
 ) -> BenchRecord {
-    let (status, timeout_ns) = status_and_timeout_for_failure(&reason, elapsed_ns);
     BenchRecord {
         queue: queue_name.to_string(),
         mode: mode.name().to_string(),
@@ -6139,9 +8259,10 @@ fn failed_runtime_bench_record(
         avg_data_latency_ns: None,
         producer_fairness_ratio: None,
         consumer_fairness_ratio: None,
-        status,
+        status: BenchRecordStatus::Failed,
         failure_reason: Some(reason),
-        timeout_ns,
+        timeout_ns: None,
+        throughput_metrics: None,
     }
 }
 
@@ -6213,104 +8334,6 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> St
     }
 }
 
-fn run_producers_only_for<Q: BenchQueueHandleFactory>(
-    queue_handle: &Arc<Q>,
-    producers: usize,
-    items_per_producer: u64,
-    core_offset: usize,
-) -> Duration {
-    let ready = Arc::new(Barrier::new(producers + 1));
-    let start_gate = Arc::new(Barrier::new(producers + 1));
-    let start = Arc::new(OnceLock::new());
-    let max_end = Arc::new(AtomicU64::new(0));
-    let mut handles = Vec::with_capacity(producers);
-
-    for producer_id in 0..producers {
-        let queue_thread = queue_handle.thread_handle();
-        let ready = ready.clone();
-        let start_gate = start_gate.clone();
-        let start = start.clone();
-        let max_end = max_end.clone();
-        let core_id = bench_core_ids().get(core_offset + producer_id).copied();
-        handles.push(spawn_bench_thread(move || {
-            if let Some(id) = core_id {
-                core_affinity::set_for_current(id);
-            }
-            ready.wait();
-            start_gate.wait();
-            let start: Instant = *start.get().expect("start set");
-            let base = (producer_id as u64)
-                .checked_mul(items_per_producer)
-                .expect("item count overflow");
-            for offset in 0..items_per_producer {
-                let value = base.checked_add(offset).expect("item count overflow");
-                queue_thread.send_value(value);
-            }
-            let end_ns = start.elapsed().as_nanos() as u64;
-            max_end.fetch_max(end_ns, AtomicOrdering::Relaxed);
-        }));
-    }
-
-    ready.wait();
-    start.set(Instant::now()).ok();
-    start_gate.wait();
-    if let Err(err) = join_bench_threads(handles, "producer") {
-        panic!("{err}");
-    }
-    Duration::from_nanos(max_end.load(AtomicOrdering::Relaxed))
-}
-
-fn run_consumers_only_for<Q: BenchQueueHandleFactory>(
-    queue_handle: &Arc<Q>,
-    consumers: usize,
-    core_offset: usize,
-) -> (Duration, u64) {
-    let ready = Arc::new(Barrier::new(consumers + 1));
-    let start_gate = Arc::new(Barrier::new(consumers + 1));
-    let start = Arc::new(OnceLock::new());
-    let max_end = Arc::new(AtomicU64::new(0));
-    let consumed_total = Arc::new(AtomicU64::new(0));
-    let mut handles = Vec::with_capacity(consumers);
-
-    for consumer_id in 0..consumers {
-        let queue_thread = queue_handle.thread_handle();
-        let ready = ready.clone();
-        let start_gate = start_gate.clone();
-        let start = start.clone();
-        let max_end = max_end.clone();
-        let consumed_total = consumed_total.clone();
-        let core_id = bench_core_ids().get(core_offset + consumer_id).copied();
-        handles.push(spawn_bench_thread(move || {
-            if let Some(id) = core_id {
-                core_affinity::set_for_current(id);
-            }
-            ready.wait();
-            start_gate.wait();
-            let start: Instant = *start.get().expect("start set");
-            loop {
-                let value = queue_thread.recv_value();
-                if value == SENTINEL {
-                    break;
-                }
-                consumed_total.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            let end_ns = start.elapsed().as_nanos() as u64;
-            max_end.fetch_max(end_ns, AtomicOrdering::Relaxed);
-        }));
-    }
-
-    ready.wait();
-    start.set(Instant::now()).ok();
-    start_gate.wait();
-    if let Err(err) = join_bench_threads(handles, "consumer") {
-        panic!("{err}");
-    }
-    (
-        Duration::from_nanos(max_end.load(AtomicOrdering::Relaxed)),
-        consumed_total.load(AtomicOrdering::Relaxed),
-    )
-}
-
 fn total_items(items_per_producer: u64, producers: usize) -> u64 {
     let total = items_per_producer
         .checked_mul(producers as u64)
@@ -6363,28 +8386,170 @@ pub fn detect_available_parallelism() -> Result<usize, String> {
         .ok_or_else(|| "unable to determine available_parallelism".to_string())
 }
 
-/// Run a [`MatrixPlan`] fully in-process using the static UBQ registry compiled
-/// by the build script (requires the `bench_registry` feature).
-///
-/// This replaces the old two-process approach (`build_and_run_matrix_plan`) that
-/// generated a temporary Cargo project and compiled it at runtime.  All UBQ
-/// configurations are monomorphised once at build time, so grid and direct-matrix
-/// plans dispatch through precompiled functions with no subprocess overhead.
-///
-/// Panics inside individual benchmark jobs are caught via
-/// `tokio::task::spawn_blocking` join errors and reported as a [`BatchOutcome`]
-/// with `exit_success = false` and the crashing job identified, matching the
-/// contract expected by the benchmark runners.
+fn job_factory_for_spec(spec: &JobSpec) -> Result<JobFactory, String> {
+    match spec.queue {
+        QueueKind::SegQueue => Ok(make_segqueue_job_factory_variant(
+            spec.scenario.clone(),
+            spec.repeat_index,
+            spec.mode,
+            spec.items_per_producer,
+            spec.batch_size,
+        )),
+        QueueKind::ConcurrentQueue => Ok(make_concurrent_queue_job_factory(
+            spec.scenario.clone(),
+            spec.repeat_index,
+            spec.mode,
+            spec.items_per_producer,
+        )),
+        QueueKind::FastFifo => {
+            let block_size = spec
+                .fastfifo_block_size
+                .ok_or_else(|| "RBBQ job spec is missing block size".to_string())?;
+            let capacity = spec
+                .fastfifo_capacity
+                .ok_or_else(|| "FastFifo job spec is missing capacity".to_string())?;
+            #[cfg(feature = "bench_fastfifo")]
+            {
+                Ok(make_fastfifo_job_factory(
+                    block_size,
+                    capacity,
+                    spec.scenario.clone(),
+                    spec.repeat_index,
+                    spec.mode,
+                    spec.items_per_producer,
+                ))
+            }
+            #[cfg(not(feature = "bench_fastfifo"))]
+            {
+                let _ = (block_size, capacity);
+                Err(
+                    "RBBQ selected but the bench_fastfifo/bench_rbbq feature is not enabled; \
+                     rebuild with --features bench_registry,bench_rbbq"
+                        .to_string(),
+                )
+            }
+        }
+        QueueKind::LfQueue => {
+            let segment_size = spec
+                .lfqueue_segment_size
+                .ok_or_else(|| "lfqueue job spec is missing segment size".to_string())?;
+            #[cfg(feature = "bench_lfqueue")]
+            {
+                Ok(make_lfqueue_job_factory(
+                    segment_size,
+                    spec.scenario.clone(),
+                    spec.repeat_index,
+                    spec.mode,
+                    spec.items_per_producer,
+                ))
+            }
+            #[cfg(not(feature = "bench_lfqueue"))]
+            {
+                let _ = segment_size;
+                Err(
+                    "lfqueue selected but the bench_lfqueue feature is not enabled; \
+                     rebuild with --features bench_registry,bench_lfqueue"
+                        .to_string(),
+                )
+            }
+        }
+        QueueKind::Wcq => {
+            let capacity = spec
+                .wcq_capacity
+                .ok_or_else(|| "wCQ job spec is missing capacity".to_string())?;
+            #[cfg(feature = "bench_wcq")]
+            {
+                make_wcq_job_factory(
+                    capacity,
+                    spec.scenario.clone(),
+                    spec.repeat_index,
+                    spec.mode,
+                    spec.items_per_producer,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "unsupported wCQ capacity {capacity}; supported capacities are \
+                         256,1024,4096,16384,65536,262144,1048576,4194304"
+                    )
+                })
+            }
+            #[cfg(not(feature = "bench_wcq"))]
+            {
+                let _ = capacity;
+                Err("wCQ selected but the bench_wcq feature is not enabled; \
+                     rebuild with --features bench_registry,bench_wcq"
+                    .to_string())
+            }
+        }
+        QueueKind::Ubq => {
+            let label = spec
+                .ubq_label
+                .as_deref()
+                .ok_or_else(|| "UBQ job spec is missing its label".to_string())?;
+            lookup_ubq_job_factory(
+                label,
+                spec.scenario.clone(),
+                spec.repeat_index,
+                spec.mode,
+                spec.items_per_producer,
+                spec.batch_size,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "no compiled UBQ configuration for label '{label}'; \
+                     rebuild with --features bench_registry"
+                )
+            })
+        }
+        QueueKind::Dubq => {
+            let label = spec
+                .dubq_label
+                .as_deref()
+                .ok_or_else(|| "DUBQ job spec is missing its label".to_string())?;
+            make_dubq_job_factory(
+                label,
+                spec.scenario.clone(),
+                spec.repeat_index,
+                spec.mode,
+                spec.items_per_producer,
+                spec.batch_size,
+            )
+        }
+    }
+}
+
+/// Run a [`MatrixPlan`] through the static queue registry. The parent keeps all
+/// scheduling and checkpoint state while a reusable subprocess executes one job
+/// at a time, providing a killable boundary for the hard per-job timeout.
 pub fn run_matrix_plan_in_process(
     plan: &MatrixPlan,
     dry_run: bool,
 ) -> Result<BatchOutcome, String> {
+    plan.throughput_policy.validate()?;
+    let selected_core_ids = selected_plan_core_ids(plan)?;
     let required_specs = required_job_specs(plan);
+    let required_cpu_count = required_specs
+        .iter()
+        .map(JobSpec::thread_budget)
+        .max()
+        .unwrap_or(0);
+    if selected_core_ids.len() < required_cpu_count && !plan.allow_unpinned {
+        return Err(format!(
+            "authoritative run requires {required_cpu_count} selected CPUs, but only {} were selected",
+            selected_core_ids.len()
+        ));
+    }
+    let planned_item_handoffs: u128 = required_specs
+        .iter()
+        .map(|spec| total_items(spec.items_per_producer, spec.scenario.producers) as u128)
+        .sum();
     progress_line(format!(
-        "bench_matrix: {} bundle(s), {} unique job(s) [in-process]",
+        "bench_matrix: {} bundle(s), {} unique job(s), {} planned item handoffs [persistent worker]",
         plan.bundles.len(),
         required_specs.len(),
+        planned_item_handoffs,
     ));
+    print_core_placement(plan);
 
     if dry_run {
         return Ok(BatchOutcome {
@@ -6393,148 +8558,50 @@ pub fn run_matrix_plan_in_process(
         });
     }
 
-    // Build a JobFactory for every required spec using the compile-time registry.
-    let mut factories: Vec<JobFactory> = Vec::with_capacity(required_specs.len());
     for spec in &required_specs {
-        let factory = match spec.queue {
-            QueueKind::SegQueue => make_segqueue_job_factory(
-                spec.scenario.clone(),
-                spec.repeat_index,
-                spec.mode,
-                spec.items_per_producer,
-            ),
-            QueueKind::ConcurrentQueue => make_concurrent_queue_job_factory(
-                spec.scenario.clone(),
-                spec.repeat_index,
-                spec.mode,
-                spec.items_per_producer,
-            ),
-            QueueKind::FastFifo => {
-                let block_size = spec
-                    .fastfifo_block_size
-                    .ok_or_else(|| "RBBQ job spec is missing block size".to_string())?;
-                #[cfg(feature = "bench_fastfifo")]
-                {
-                    make_fastfifo_job_factory(
-                        block_size,
-                        spec.scenario.clone(),
-                        spec.repeat_index,
-                        spec.mode,
-                        spec.items_per_producer,
-                    )
-                }
-                #[cfg(not(feature = "bench_fastfifo"))]
-                {
-                    let _ = block_size;
-                    return Err(
-                        "RBBQ selected but the bench_fastfifo/bench_rbbq feature is not enabled; \
-                         rebuild with --features bench_registry,bench_rbbq"
-                            .to_string(),
-                    );
-                }
-            }
-            QueueKind::LfQueue => {
-                let segment_size = spec
-                    .lfqueue_segment_size
-                    .ok_or_else(|| "lfqueue job spec is missing segment size".to_string())?;
-                #[cfg(feature = "bench_lfqueue")]
-                {
-                    make_lfqueue_job_factory(
-                        segment_size,
-                        spec.scenario.clone(),
-                        spec.repeat_index,
-                        spec.mode,
-                        spec.items_per_producer,
-                    )
-                }
-                #[cfg(not(feature = "bench_lfqueue"))]
-                {
-                    let _ = segment_size;
-                    return Err(
-                        "lfqueue selected but the bench_lfqueue feature is not enabled; \
-                         rebuild with --features bench_registry,bench_lfqueue"
-                            .to_string(),
-                    );
-                }
-            }
-            QueueKind::Wcq => {
-                let capacity = spec
-                    .wcq_capacity
-                    .ok_or_else(|| "wCQ job spec is missing capacity".to_string())?;
-                #[cfg(feature = "bench_wcq")]
-                {
-                    make_wcq_job_factory(
-                        capacity,
-                        spec.scenario.clone(),
-                        spec.repeat_index,
-                        spec.mode,
-                        spec.items_per_producer,
-                    )
-                    .ok_or_else(|| {
-                        format!(
-                            "unsupported wCQ capacity {capacity}; supported capacities are \
-                             256,1024,4096,16384,65536,262144,1048576,4194304"
-                        )
-                    })?
-                }
-                #[cfg(not(feature = "bench_wcq"))]
-                {
-                    let _ = capacity;
-                    return Err("wCQ selected but the bench_wcq feature is not enabled; \
-                         rebuild with --features bench_registry,bench_wcq"
-                        .to_string());
-                }
-            }
-            QueueKind::Ubq => {
-                let label = spec
-                    .ubq_label
-                    .as_deref()
-                    .ok_or_else(|| "UBQ job spec is missing its label".to_string())?;
-                lookup_ubq_job_factory(
-                    label,
-                    spec.scenario.clone(),
-                    spec.repeat_index,
-                    spec.mode,
-                    spec.items_per_producer,
-                    spec.batch_size,
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "no compiled UBQ configuration for label '{label}'; \
-                         rebuild with --features bench_registry"
-                    )
-                })?
-            }
-        };
-        factories.push(factory);
+        job_factory_for_spec(spec)?;
     }
 
+    let fingerprint = experiment_fingerprint(plan)?;
+    let existing_runs = load_existing_runs_for_fingerprint(
+        &plan.runs_dir,
+        &plan.machine_label,
+        Some(&fingerprint),
+    )?;
+    let timing_estimator = TimingEstimator::from_history(&existing_runs);
     let cache = if plan.reuse_existing {
-        load_existing_runs(&plan.runs_dir, &plan.machine_label)?
+        existing_runs
     } else {
         ExistingRunsIndex::default()
     };
 
     // Drop already-cached specs from the pending list.
-    let pending: Vec<JobFactory> = factories
-        .into_iter()
-        .filter(|f| !cache.records.contains_key(&SampleKey::from_job(&f.spec)))
+    let pending: Vec<JobSpec> = required_specs
+        .iter()
+        .filter(|spec| !cache.records.contains_key(&SampleKey::from_job(spec)))
+        .cloned()
         .collect();
 
     progress_line(format!(
-        "scheduler: {} bundle(s), {} required, {} cached, {} pending",
+        "{} bundle(s), {} required, {} cached, {} pending",
         plan.bundles.len(),
         required_specs.len(),
         required_specs.len().saturating_sub(pending.len()),
         pending.len(),
     ));
 
-    let (_, crashed_job) =
-        execute_job_factories(plan, &cache, pending, plan.available_parallelism)?;
+    execute_job_specs_with_timeout(
+        plan,
+        &cache,
+        pending,
+        plan.available_parallelism,
+        bench_job_timeout(plan),
+        timing_estimator,
+    )?;
 
     Ok(BatchOutcome {
-        exit_success: crashed_job.is_none(),
-        crashed_job,
+        exit_success: true,
+        crashed_job: None,
     })
 }
 
@@ -6573,6 +8640,7 @@ mod tests {
             status: BenchRecordStatus::Completed,
             failure_reason: None,
             timeout_ns: None,
+            throughput_metrics: None,
         }
     }
 
@@ -6590,7 +8658,204 @@ mod tests {
     }
 
     #[test]
-    fn grid_plan_adds_every_batch_size_only_to_ubq_throughput() {
+    fn default_scenarios_are_the_complete_feasible_power_of_two_grid() {
+        let scenarios =
+            parse_scenarios_with_parallelism(None, 16).expect("default machine scenario grid");
+        let coordinates = scenarios
+            .iter()
+            .map(|scenario| (scenario.producers, scenario.consumers))
+            .collect::<BTreeSet<_>>();
+        let expected = [1, 2, 4, 8]
+            .into_iter()
+            .flat_map(|producers| {
+                [1, 2, 4, 8]
+                    .into_iter()
+                    .filter(move |consumers| producers + consumers <= 16)
+                    .map(move |consumers| (producers, consumers))
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(coordinates, expected);
+        assert_eq!(scenarios.len(), 16);
+        assert!(
+            scenarios
+                .iter()
+                .all(|scenario| scenario.producers.is_power_of_two()
+                    && scenario.consumers.is_power_of_two()
+                    && scenario.total_threads() <= 16)
+        );
+
+        let large =
+            parse_scenarios_with_parallelism(None, 160).expect("large machine scenario grid");
+        assert_eq!(large.len(), 61);
+        assert!(large.iter().any(|scenario| scenario.name == "128p32c"));
+        assert!(large.iter().any(|scenario| scenario.name == "32p128c"));
+        assert!(!large.iter().any(|scenario| scenario.name == "128p64c"));
+    }
+
+    #[test]
+    fn sparse_and_dense_grids_use_the_same_complete_scenario_set() {
+        let scenarios =
+            parse_scenarios_with_parallelism(None, 16).expect("default machine scenario grid");
+        let build = |grid| {
+            build_grid_matrix_plan(
+                "local",
+                PathBuf::from("runs"),
+                16,
+                &[QueueKind::Ubq, QueueKind::SegQueue],
+                grid,
+                &[],
+                &[],
+                &[],
+                &[],
+                &scenarios,
+                &[Mode::Throughput],
+                Some(&[10]),
+                1,
+                true,
+            )
+            .expect("grid plan")
+        };
+        let sparse = build(UbqGrid::Sparse);
+        let dense = build(UbqGrid::Dense);
+        let scenario_names = |plan: &MatrixPlan| {
+            plan.bundles
+                .iter()
+                .map(|bundle| bundle.scenario.name.clone())
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(scenario_names(&sparse), scenario_names(&dense));
+        assert_eq!(scenario_names(&sparse).len(), 16);
+        assert_eq!(sparse.bundles.len(), 16 * 41);
+        assert_eq!(dense.bundles.len(), 16 * 129);
+
+        for plan in [&sparse, &dense] {
+            let specs = required_job_specs(plan);
+            for queue in [QueueKind::Ubq, QueueKind::SegQueue] {
+                let tested = specs
+                    .iter()
+                    .filter(|spec| spec.queue == queue)
+                    .map(|spec| spec.scenario.name.clone())
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(tested, scenario_names(plan));
+            }
+        }
+    }
+
+    #[test]
+    fn scenario_scaled_item_policy_has_stable_band_boundaries() {
+        let cases = [
+            (1, 1_000_000),
+            (8, 1_000_000),
+            (9, 250_000),
+            (16, 250_000),
+            (17, 62_500),
+            (32, 62_500),
+            (33, 15_625),
+            (64, 15_625),
+            (159, 15_625),
+        ];
+        for (producers, expected) in cases {
+            assert_eq!(scenario_scaled_items_per_producer(producers), expected);
+        }
+        assert_eq!(parse_items_per_producer(Some("10")).unwrap(), [10]);
+        assert_eq!(
+            parse_items_per_producer(Some("10,20,10")).unwrap(),
+            [10, 20]
+        );
+    }
+
+    #[test]
+    fn grid_item_policy_applies_identical_work_to_baselines_and_ubq() {
+        let scenarios = [ScenarioConfig::new(8, 1), ScenarioConfig::new(9, 1)];
+        let scaled = build_grid_matrix_plan(
+            "local",
+            PathBuf::from("runs"),
+            10,
+            &[QueueKind::Ubq, QueueKind::SegQueue],
+            UbqGrid::Sparse,
+            &DEFAULT_UBQ_BATCH_SIZES,
+            &[],
+            &[],
+            &[],
+            &scenarios,
+            &[Mode::Throughput],
+            None,
+            1,
+            true,
+        )
+        .expect("scaled grid plan");
+        assert_eq!(scaled.item_policy, ItemPolicy::ScenarioScaledV1);
+        for bundle in &scaled.bundles {
+            assert_eq!(
+                bundle.items_per_producer_values,
+                vec![scenario_scaled_items_per_producer(
+                    bundle.scenario.producers
+                )]
+            );
+            let meta = bundle_output_meta(&scaled, bundle).expect("scaled output metadata");
+            assert_eq!(meta.item_policy, ItemPolicy::ScenarioScaledV1);
+            assert_eq!(
+                meta.planned_items_per_producer,
+                bundle.items_per_producer_values
+            );
+        }
+
+        let explicit = build_grid_matrix_plan(
+            "local",
+            PathBuf::from("runs"),
+            10,
+            &[QueueKind::Ubq, QueueKind::SegQueue],
+            UbqGrid::Sparse,
+            &DEFAULT_UBQ_BATCH_SIZES,
+            &[],
+            &[],
+            &[],
+            &scenarios,
+            &[Mode::Throughput],
+            Some(&[10, 20]),
+            1,
+            true,
+        )
+        .expect("explicit grid plan");
+        assert_eq!(explicit.item_policy, ItemPolicy::Explicit);
+        assert!(
+            explicit
+                .bundles
+                .iter()
+                .all(|bundle| bundle.items_per_producer_values == [10, 20])
+        );
+    }
+
+    #[test]
+    fn interleaved_core_slots_alternate_then_exhaust_the_remaining_role() {
+        let slots = |producers, consumers| {
+            let producer_slots = (0..producers)
+                .map(|id| producer_core_slot(producers, consumers, id))
+                .collect::<Vec<_>>();
+            let consumer_slots = (0..consumers)
+                .map(|id| consumer_core_slot(producers, consumers, id))
+                .collect::<Vec<_>>();
+            (producer_slots, consumer_slots)
+        };
+
+        assert_eq!(slots(4, 4), (vec![0, 2, 4, 6], vec![1, 3, 5, 7]));
+        assert_eq!(slots(4, 1), (vec![0, 2, 3, 4], vec![1]));
+        assert_eq!(slots(1, 4), (vec![0], vec![1, 2, 3, 4]));
+
+        for (producers, consumers) in [(1, 1), (4, 1), (1, 4), (8, 8), (8, 3)] {
+            let (producer_slots, consumer_slots) = slots(producers, consumers);
+            let assigned = producer_slots
+                .into_iter()
+                .chain(consumer_slots)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(assigned, (0..producers + consumers).collect());
+        }
+    }
+
+    #[test]
+    fn grid_plan_adds_every_batch_size_to_ubq_and_segqueue_throughput() {
         let plan = build_grid_matrix_plan(
             "local",
             PathBuf::from("runs"),
@@ -6607,7 +8872,7 @@ mod tests {
             &[],
             &[ScenarioConfig::new(1, 1)],
             &[Mode::Throughput],
-            &[10],
+            Some(&[10]),
             1,
             true,
         )
@@ -6628,7 +8893,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(specs.len(), 482);
+        assert_eq!(specs.len(), 165);
         assert_eq!(
             specs
                 .iter()
@@ -6639,14 +8904,29 @@ mod tests {
         assert_eq!(
             specs
                 .iter()
+                .filter(|spec| spec.queue == QueueKind::SegQueue && spec.batch_size.is_none())
+                .count(),
+            1
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.queue == QueueKind::SegQueue && spec.batch_size.is_some())
+                .map(|spec| spec.batch_size.expect("batch size"))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(DEFAULT_UBQ_BATCH_SIZES)
+        );
+        assert_eq!(
+            specs
+                .iter()
                 .filter(|spec| spec.queue == QueueKind::Ubq && spec.batch_size.is_some())
                 .count(),
-            440
+            120
         );
         assert!(
             specs
                 .iter()
-                .filter(|spec| spec.queue.is_baseline())
+                .filter(|spec| spec.queue.is_baseline() && spec.queue != QueueKind::SegQueue)
                 .all(|spec| spec.batch_size.is_none())
         );
         let baseline_bundle = plan
@@ -6654,18 +8934,52 @@ mod tests {
             .iter()
             .find(|bundle| bundle.ubq_label.is_none())
             .expect("baseline bundle");
-        assert_eq!(expected_keys_for_bundle(&plan, baseline_bundle).len(), 2);
+        assert_eq!(expected_keys_for_bundle(&plan, baseline_bundle).len(), 5);
         let ubq_bundle = plan
             .bundles
             .iter()
             .find(|bundle| bundle.ubq_label.is_some())
             .expect("UBQ bundle");
         let ubq_keys = expected_keys_for_bundle(&plan, ubq_bundle);
-        assert_eq!(ubq_keys.len(), 12);
+        assert_eq!(ubq_keys.len(), 4);
         assert!(
             ubq_keys
                 .iter()
                 .all(|key| key.queue_label.starts_with("ubq_"))
+        );
+    }
+
+    #[test]
+    fn baseline_only_grid_schedules_segqueue_without_ubq_variants() {
+        let plan = build_grid_matrix_plan(
+            "local",
+            PathBuf::from("runs"),
+            2,
+            &[QueueKind::SegQueue],
+            UbqGrid::Sparse,
+            &DEFAULT_UBQ_BATCH_SIZES,
+            &[],
+            &[],
+            &[],
+            &[ScenarioConfig::new(1, 1)],
+            &[Mode::Throughput],
+            Some(&[10]),
+            1,
+            false,
+        )
+        .expect("baseline-only plan");
+        let specs = required_job_specs(&plan);
+
+        assert_eq!(plan.ubq_grid, None);
+        assert_eq!(plan.bundles.len(), 1);
+        assert_eq!(specs.len(), 1 + DEFAULT_UBQ_BATCH_SIZES.len());
+        assert!(specs.iter().all(|spec| spec.queue == QueueKind::SegQueue));
+        assert_eq!(
+            specs
+                .iter()
+                .filter_map(|spec| spec.batch_size)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(DEFAULT_UBQ_BATCH_SIZES)
         );
     }
 
@@ -6683,26 +8997,25 @@ mod tests {
             &[],
             &[ScenarioConfig::new(64, 1)],
             &[Mode::Throughput],
-            &[10],
+            Some(&[10]),
             1,
             true,
         )
         .expect("grid plan");
 
         assert_eq!(plan.bundles.len(), 32);
-        assert_eq!(required_job_specs(&plan).len(), 384);
+        assert_eq!(required_job_specs(&plan).len(), 128);
     }
 
     #[test]
-    fn batched_throughput_job_preserves_values_and_records_its_batch_size() {
-        type Queue = ConfiguredUBQ<u64, backoff::Crossbeam, 1, 31, align::A64>;
+    fn batched_ubq_throughput_preserves_values_and_records_its_batch_size() {
+        type Queue = ConfiguredUBQ<u64, backoff::Crossbeam, 1, 31, crate::align::A64>;
         let record =
-            bench_throughput_batched_for::<Queue>("ubq", &ScenarioConfig::new(1, 1), 257, 16, 0);
+            bench_throughput_batched_for::<Queue>("ubq", &ScenarioConfig::new(2, 2), 257, 16, 0);
 
         assert_eq!(record.status, BenchRecordStatus::Completed);
         assert_eq!(record.batch_size, Some(16));
-        assert_eq!(record.total_items, 257);
-        assert_eq!(record.consumed_items, 257);
+        assert_eq!(record.consumed_items, record.total_items);
     }
 
     #[test]
@@ -6710,6 +9023,321 @@ mod tests {
         assert_eq!(completion_percent(0, 480), 0.0);
         assert_eq!(completion_percent(120, 480), 25.0);
         assert_eq!(completion_percent(480, 480), 100.0);
+    }
+
+    #[test]
+    fn progress_header_repeats_every_fifty_trial_rows() {
+        assert!(progress_header_due(0));
+        assert!(!progress_header_due(1));
+        assert!(!progress_header_due(49));
+        assert!(progress_header_due(50));
+        assert!(progress_header_due(100));
+    }
+
+    #[test]
+    fn progress_timing_uses_a_running_average() {
+        let mut timing = TimingEstimator::default();
+        assert_eq!(timing.estimate_remaining(3), None);
+
+        timing.observe(Duration::from_secs(2));
+        timing.observe(Duration::from_secs(4));
+
+        assert_eq!(timing.estimate_remaining(3), Some(Duration::from_secs(9)));
+        assert_eq!(timing.estimate_remaining(0), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn throughput_timeout_is_derived_only_from_declared_phase_budget() {
+        let mut plan = build_direct_matrix_plan(
+            "local",
+            PathBuf::from(DEFAULT_RUNS_DIR),
+            2,
+            &[QueueKind::SegQueue],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[ScenarioConfig::new(1, 1)],
+            &[Mode::Throughput],
+            &[1],
+            1,
+            false,
+        )
+        .expect("plan");
+        plan.throughput_policy = ThroughputPolicy {
+            warmup_ms: 250,
+            phase_ms: 1_000,
+            pilot_ms: 100,
+            max_round_items: 1024,
+        };
+        assert_eq!(bench_job_timeout(&plan), Duration::from_secs(30));
+        plan.throughput_policy.phase_ms = 10_000;
+        assert_eq!(bench_job_timeout(&plan), Duration::from_millis(151_750));
+    }
+
+    #[test]
+    fn explicit_cpu_lists_accept_ranges_and_reject_duplicates() {
+        assert_eq!(
+            parse_core_ids("0-2,8,10-11").unwrap(),
+            vec![0, 1, 2, 8, 10, 11]
+        );
+        assert!(parse_core_ids("2-1").is_err());
+        assert!(parse_core_ids("0,0").is_err());
+        assert_eq!(
+            parse_schedule_seed("0x55425106").unwrap(),
+            DEFAULT_SCHEDULE_SEED
+        );
+    }
+
+    #[test]
+    fn pilot_scaling_rounds_up_to_batch_and_stops_at_cap() {
+        assert_eq!(batch_aligned_round_items(4_097, 256, 10_000), Some(4_352));
+        assert_eq!(batch_aligned_round_items(20_000, 256, 10_000), Some(9_984));
+        assert_eq!(batch_aligned_round_items(1, 256, 128), None);
+    }
+
+    #[test]
+    fn crossbeam_batch_queue_uses_native_batch_operations() {
+        let queue = BatchQueue::new();
+
+        queue.send_batch(10, 0..4);
+
+        assert_eq!(queue.try_recv_batch(3), 3);
+        assert_eq!(queue.try_recv_value(), Some(13));
+        assert_eq!(queue.try_recv_value(), None);
+
+        let record = bench_throughput_batched_for::<BatchQueue<u64>>(
+            "segqueue",
+            &ScenarioConfig::new(2, 2),
+            257,
+            16,
+            0,
+        );
+        assert_eq!(record.status, BenchRecordStatus::Completed);
+        assert_eq!(record.batch_size, Some(16));
+        assert_eq!(record.consumed_items, record.total_items);
+    }
+
+    struct DelayedSentinelQueue {
+        inner: SegQueue<u64>,
+        sentinel_delay: Duration,
+    }
+
+    impl BenchQueueOps for DelayedSentinelQueue {
+        fn try_send_value(&self, value: u64) -> bool {
+            self.inner.push(value);
+            true
+        }
+
+        fn try_recv_value(&self) -> Option<u64> {
+            let value = self.inner.pop()?;
+            if value == SENTINEL {
+                thread::sleep(self.sentinel_delay);
+            }
+            Some(value)
+        }
+    }
+
+    #[test]
+    fn last_data_timing_excludes_sentinel_and_join_delay() {
+        let queue = Arc::new(DelayedSentinelQueue {
+            inner: SegQueue::new(),
+            sentinel_delay: Duration::from_millis(200),
+        });
+        let round = run_handoff_round(
+            &queue,
+            "delayed-sentinel",
+            &ScenarioConfig::new(1, 1),
+            32,
+            None,
+            0,
+        )
+        .expect("round");
+        assert_eq!(round.items, 32);
+        assert!(round.elapsed < Duration::from_millis(100));
+    }
+
+    struct DropFirstQueue {
+        inner: SegQueue<u64>,
+        dropped: AtomicBool,
+    }
+
+    impl BenchQueueOps for DropFirstQueue {
+        fn try_send_value(&self, value: u64) -> bool {
+            if value != SENTINEL && !self.dropped.swap(true, AtomicOrdering::Relaxed) {
+                return true;
+            }
+            self.inner.push(value);
+            true
+        }
+
+        fn try_recv_value(&self) -> Option<u64> {
+            self.inner.pop()
+        }
+    }
+
+    #[test]
+    fn exact_count_mismatch_fails_without_throughput() {
+        let queue = Arc::new(DropFirstQueue {
+            inner: SegQueue::new(),
+            dropped: AtomicBool::new(false),
+        });
+        let error = run_handoff_round(
+            &queue,
+            "drop-first",
+            &ScenarioConfig::new(1, 1),
+            16,
+            None,
+            0,
+        )
+        .expect_err("integrity failure");
+        assert!(error.contains("integrity mismatch"));
+    }
+
+    struct RetryQueue {
+        attempts: AtomicU64,
+    }
+
+    impl BenchQueueOps for RetryQueue {
+        fn try_send_value(&self, _value: u64) -> bool {
+            self.attempts.fetch_add(1, AtomicOrdering::Relaxed) >= 3
+        }
+
+        fn try_recv_value(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn harness_retry_policy_retries_nonblocking_adapters_uniformly() {
+        let queue = RetryQueue {
+            attempts: AtomicU64::new(0),
+        };
+        queue.send_value(1);
+        assert_eq!(queue.attempts.load(AtomicOrdering::Relaxed), 4);
+    }
+
+    struct BatchTrackingQueue {
+        inner: SegQueue<u64>,
+        scalar_sends: AtomicU64,
+        scalar_receives: AtomicU64,
+        batch_sends: AtomicU64,
+        batch_receives: AtomicU64,
+    }
+
+    impl BenchQueueOps for BatchTrackingQueue {
+        fn try_send_value(&self, value: u64) -> bool {
+            self.scalar_sends.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.push(value);
+            true
+        }
+
+        fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
+            self.batch_sends.fetch_add(1, AtomicOrdering::Relaxed);
+            for offset in offsets {
+                self.inner.push(base + offset as u64);
+            }
+        }
+
+        fn try_recv_value(&self) -> Option<u64> {
+            self.scalar_receives.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.pop()
+        }
+
+        fn try_recv_batch(&self, request_size: usize) -> usize {
+            self.batch_receives.fetch_add(1, AtomicOrdering::Relaxed);
+            let mut received = 0;
+            for _ in 0..request_size {
+                if self.inner.pop().is_none() {
+                    break;
+                }
+                received += 1;
+            }
+            received
+        }
+    }
+
+    #[test]
+    fn batched_throughput_uses_batch_operations_on_both_sides() {
+        let queue = Arc::new(BatchTrackingQueue {
+            inner: SegQueue::new(),
+            scalar_sends: AtomicU64::new(0),
+            scalar_receives: AtomicU64::new(0),
+            batch_sends: AtomicU64::new(0),
+            batch_receives: AtomicU64::new(0),
+        });
+        let record = bench_throughput_with_queue_variant(
+            queue.clone(),
+            "batch-tracking",
+            &ScenarioConfig::new(2, 2),
+            17,
+            Some(8),
+            0,
+        );
+
+        assert_eq!(record.status, BenchRecordStatus::Completed);
+        assert_eq!(record.batch_size, Some(8));
+        assert_eq!(record.consumed_items, record.total_items);
+        assert!(queue.batch_sends.load(AtomicOrdering::Relaxed) > 0);
+        assert!(queue.batch_receives.load(AtomicOrdering::Relaxed) > 0);
+        assert_eq!(queue.scalar_sends.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(queue.scalar_receives.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn adaptive_rounds_exclude_warmup_and_reach_each_timing_target() {
+        let record =
+            bench_throughput_for::<SegQueue<u64>>("segqueue", &ScenarioConfig::new(1, 1), 7, 0);
+        let metrics = record.throughput_metrics.expect("metrics");
+        assert_eq!(metrics.requested_items_per_producer, 7);
+        assert!(metrics.warmup_elapsed_ns >= 1_000_000);
+        assert!(metrics.handoff_elapsed_ns >= 1_000_000);
+        assert!(metrics.enqueue_elapsed_ns >= 1_000_000);
+        assert!(metrics.dequeue_elapsed_ns >= 1_000_000);
+        assert_eq!(
+            record.ops_per_sec,
+            throughput_ops(metrics.handoff_items, metrics.handoff_elapsed_ns)
+        );
+        assert_eq!(
+            metrics.enqueue_ops_per_sec,
+            throughput_ops(metrics.enqueue_items, metrics.enqueue_elapsed_ns).unwrap()
+        );
+        assert_eq!(
+            metrics.dequeue_ops_per_sec,
+            throughput_ops(metrics.dequeue_items, metrics.dequeue_elapsed_ns).unwrap()
+        );
+    }
+
+    #[cfg(feature = "bench_fastfifo")]
+    #[test]
+    fn bounded_fastfifo_ceiling_cycles_with_explicit_capacity() {
+        let factory =
+            make_fastfifo_job_factory(64, 1_024, ScenarioConfig::new(2, 2), 1, Mode::Throughput, 1);
+        let record = (factory.run)(0);
+        let metrics = record.throughput_metrics.expect("metrics");
+        assert_eq!(metrics.requested_queue_capacity, None);
+        assert_eq!(metrics.effective_queue_capacity, Some(1_024));
+        assert_eq!(metrics.enqueue_items, metrics.enqueue_rounds as u64 * 1_022);
+        assert_eq!(metrics.dequeue_items, metrics.enqueue_items);
+    }
+
+    #[test]
+    fn progress_durations_are_compact_and_human_readable() {
+        assert_eq!(format_progress_duration(Duration::ZERO), "0s");
+        assert_eq!(format_progress_duration(Duration::from_micros(42)), "42us");
+        assert_eq!(
+            format_progress_duration(Duration::from_millis(250)),
+            "250ms"
+        );
+        assert_eq!(
+            format_progress_duration(Duration::from_millis(1_250)),
+            "1.25s"
+        );
+        assert_eq!(format_progress_duration(Duration::from_secs(125)), "2m05s");
+        assert_eq!(
+            format_progress_duration(Duration::from_secs(7_500)),
+            "2h05m"
+        );
     }
 
     #[test]
@@ -6721,8 +9349,10 @@ mod tests {
             items_per_producer: 10,
             queue: QueueKind::Ubq,
             ubq_label: Some("balanced,1,31,crossbeam".to_string()),
+            dubq_label: None,
             batch_size: None,
             fastfifo_block_size: None,
+            fastfifo_capacity: None,
             lfqueue_segment_size: None,
             wcq_capacity: None,
         };
@@ -6742,6 +9372,132 @@ mod tests {
         assert_eq!(parsed.pool, 8);
         assert_eq!(parsed.block, 127);
         assert_eq!(parsed.backoff, "crossbeam");
+    }
+
+    #[test]
+    fn parses_dubq_aliases_and_runtime_labels() {
+        assert_eq!(QueueKind::parse("dubq"), Some(QueueKind::Dubq));
+        assert_eq!(QueueKind::parse("dynamic-ubq"), Some(QueueKind::Dubq));
+        assert_eq!(QueueKind::parse("dynamic"), Some(QueueKind::Dubq));
+
+        let label = parse_dubq_label("8,127,YIELD").expect("DUBQ label");
+        assert_eq!(label.pool, 8);
+        assert_eq!(label.min_block_size, 127);
+        assert_eq!(label.backoff, "yield");
+        assert_eq!(label.text(), "8,127,yield");
+        assert!(parse_dubq_label("8,0,crossbeam").is_err());
+        assert!(parse_dubq_label("8,31,unknown").is_err());
+    }
+
+    #[test]
+    fn direct_plan_requires_and_expands_dubq_labels() {
+        let err = build_direct_matrix_plan_with_dubq(
+            "local",
+            PathBuf::from(DEFAULT_RUNS_DIR),
+            2,
+            &[QueueKind::Dubq],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[ScenarioConfig::new(1, 1)],
+            &[Mode::Throughput],
+            &[10],
+            1,
+            false,
+        )
+        .expect_err("DUBQ requires a runtime label");
+        assert!(err.contains("--dubq-label"));
+
+        let plan = build_direct_matrix_plan_with_dubq(
+            "local",
+            PathBuf::from(DEFAULT_RUNS_DIR),
+            2,
+            &[QueueKind::Dubq],
+            &[],
+            &["3,4,crossbeam".to_string()],
+            &[],
+            &[],
+            &[],
+            &[ScenarioConfig::new(1, 1)],
+            &[Mode::Throughput],
+            &[10],
+            1,
+            false,
+        )
+        .expect("DUBQ plan");
+        assert_eq!(plan.bundles.len(), 1);
+        assert_eq!(plan.bundles[0].dubq_label.as_deref(), Some("3,4,crossbeam"));
+        let specs = required_job_specs(&plan);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs.iter().next().unwrap().queue_label(),
+            "dubq_3,4,crossbeam"
+        );
+    }
+
+    #[test]
+    fn dubq_grid_keeps_min_blocks_below_the_producer_count() {
+        let plan = build_grid_matrix_plan(
+            "local",
+            PathBuf::from("runs"),
+            65,
+            &[QueueKind::Dubq],
+            UbqGrid::Sparse,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[ScenarioConfig::new(64, 1)],
+            &[Mode::Throughput],
+            Some(&[1]),
+            1,
+            false,
+        )
+        .expect("DUBQ grid");
+        assert_eq!(plan.bundles.len(), 40);
+        assert_eq!(required_job_specs(&plan).len(), 40);
+        assert!(plan.bundles.iter().any(|bundle| {
+            bundle
+                .dubq_label
+                .as_deref()
+                .is_some_and(|label| label.starts_with("0,31,"))
+        }));
+    }
+
+    #[test]
+    fn mixed_grid_uses_disjoint_static_dynamic_and_baseline_bundles() {
+        let plan = build_grid_matrix_plan(
+            "local",
+            PathBuf::from("runs"),
+            2,
+            &[QueueKind::Ubq, QueueKind::Dubq, QueueKind::SegQueue],
+            UbqGrid::Sparse,
+            &DEFAULT_UBQ_BATCH_SIZES,
+            &[],
+            &[],
+            &[],
+            &[ScenarioConfig::new(1, 1)],
+            &[Mode::Throughput],
+            Some(&[10]),
+            1,
+            false,
+        )
+        .expect("mixed grid");
+        assert_eq!(plan.bundles.len(), 81);
+        assert!(plan.bundles.iter().all(|bundle| {
+            usize::from(bundle.ubq_label.is_some()) + usize::from(bundle.dubq_label.is_some()) <= 1
+        }));
+        let specs = required_job_specs(&plan);
+        assert_eq!(specs.len(), 324);
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.queue == QueueKind::Dubq)
+                .count(),
+            160
+        );
     }
 
     #[test]
@@ -6945,6 +9701,86 @@ mod tests {
     }
 
     #[test]
+    fn dubq_adapter_completes_every_benchmark_mode() {
+        let scenario = ScenarioConfig::new(2, 1);
+        for mode in [
+            Mode::Throughput,
+            Mode::ComplexThroughput,
+            Mode::DataLatency,
+            Mode::Fairness,
+            Mode::AppLogFanIn,
+            Mode::AppPipeline,
+            Mode::AppTaskRoundtrip,
+            Mode::AppLogMpscFile,
+        ] {
+            let factory =
+                make_dubq_job_factory("2,4,crossbeam", scenario.clone(), 1, mode, 8, None)
+                    .expect("DUBQ factory");
+            let record = (factory.run)(0);
+            assert_eq!(
+                record.status,
+                BenchRecordStatus::Completed,
+                "mode={}",
+                mode.name()
+            );
+            assert_eq!(record.queue, "dubq");
+            assert_eq!(record.consumed_items, record.total_items);
+        }
+
+        let batched = make_dubq_job_factory(
+            "1,4,yield",
+            ScenarioConfig::new(2, 2),
+            1,
+            Mode::Throughput,
+            17,
+            Some(8),
+        )
+        .expect("batched DUBQ factory");
+        let record = (batched.run)(0);
+        assert_eq!(record.status, BenchRecordStatus::Completed);
+        assert_eq!(record.batch_size, Some(8));
+        assert_eq!(record.consumed_items, record.total_items);
+    }
+
+    #[test]
+    fn locally_aggregated_microbenchmarks_preserve_exact_counts() {
+        let scenario = ScenarioConfig::new(2, 2);
+        for mode in [Mode::Throughput, Mode::ComplexThroughput, Mode::DataLatency] {
+            let record = match mode {
+                Mode::Throughput => {
+                    bench_throughput_for::<SegQueue<u64>>("segqueue", &scenario, 32, 0)
+                }
+                Mode::ComplexThroughput => {
+                    bench_complex_throughput_for::<SegQueue<u64>>("segqueue", &scenario, 32, 0)
+                }
+                Mode::DataLatency => {
+                    bench_data_latency_for::<SegQueue<u64>>("segqueue", &scenario, 32, 0)
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(record.status, BenchRecordStatus::Completed);
+            if mode == Mode::Throughput {
+                let metrics = record
+                    .throughput_metrics
+                    .as_ref()
+                    .expect("adaptive metrics");
+                assert_eq!(metrics.requested_items_per_producer, 32);
+                assert_eq!(metrics.handoff_items, record.consumed_items);
+                assert!(record.consumed_items >= 64);
+            } else {
+                assert_eq!(record.consumed_items, 64, "mode={}", mode.name());
+            }
+            assert_eq!(record.consumed_items, record.total_items);
+            assert!(record.ops_per_sec.is_some());
+            if mode == Mode::DataLatency {
+                assert!(record.avg_data_latency_ns.is_some());
+            }
+        }
+        assert_eq!(average_latency_ns(300, 3), Some(100.0));
+        assert_eq!(average_latency_ns(0, 0), None);
+    }
+
+    #[test]
     fn direct_plan_expands_fastfifo_block_variants() {
         let plan = build_direct_matrix_plan(
             "local",
@@ -6967,8 +9803,14 @@ mod tests {
         let labels = keys
             .into_iter()
             .map(|key| key.queue_label)
-            .collect::<Vec<_>>();
-        assert_eq!(labels, vec!["fastfifo_64", "fastfifo_256"]);
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            labels,
+            BTreeSet::from([
+                "fastfifo_b64_c1048576".to_string(),
+                "fastfifo_b256_c1048576".to_string(),
+            ])
+        );
     }
 
     #[test]
@@ -6983,7 +9825,7 @@ mod tests {
             &[32, 256],
             &[4096, 65536],
             &[ScenarioConfig::new(1, 1)],
-            &[Mode::FillDrain],
+            &[Mode::Throughput],
             &[1],
             1,
             false,
@@ -6994,10 +9836,7 @@ mod tests {
             .into_iter()
             .map(|key| key.queue_label)
             .collect::<Vec<_>>();
-        assert_eq!(
-            labels,
-            vec!["lfqueue_32", "lfqueue_256", "wcq_4096", "wcq_65536"]
-        );
+        assert_eq!(labels, vec!["lfqueue_32", "lfqueue_256"]);
     }
 
     #[test]
@@ -7031,28 +9870,6 @@ mod tests {
                     .any(|key| key.mode == mode && key.queue_label == "lfqueue_32")
             );
         }
-    }
-
-    #[test]
-    fn direct_plan_omits_wcq_fill_drain_when_capacity_cannot_hold_prefill() {
-        let plan = build_direct_matrix_plan(
-            "local",
-            PathBuf::from(DEFAULT_RUNS_DIR),
-            16,
-            &[QueueKind::Wcq],
-            &[],
-            &[],
-            &[],
-            &[4096],
-            &[ScenarioConfig::new(8, 8)],
-            &[Mode::FillDrain],
-            &[1000],
-            1,
-            false,
-        )
-        .expect("plan");
-        let keys = expected_keys_for_bundle(&plan, &plan.bundles[0]);
-        assert!(keys.is_empty());
     }
 
     #[test]
@@ -7103,6 +9920,79 @@ mod tests {
     }
 
     #[test]
+    fn experiment_fingerprint_reuses_overlapping_scenario_subsets() {
+        let root =
+            std::env::temp_dir().join(format!("ubq_scenario_subset_test_{}", now_unix_nanos()));
+        let runs_dir = root.join("runs");
+        let build = |scenarios: &[ScenarioConfig]| {
+            build_direct_matrix_plan(
+                "local",
+                runs_dir.clone(),
+                128,
+                &[QueueKind::SegQueue],
+                &[],
+                &[],
+                &[],
+                &[],
+                scenarios,
+                &[Mode::Throughput],
+                &[1_000_000],
+                3,
+                true,
+            )
+            .expect("direct plan")
+        };
+        let full = build(&[
+            ScenarioConfig::new(16, 16),
+            ScenarioConfig::new(32, 32),
+            ScenarioConfig::new(64, 64),
+        ]);
+        let mut subset = build(&[ScenarioConfig::new(64, 64)]);
+        let compatible_fingerprint = experiment_fingerprint(&subset).expect("subset fingerprint");
+
+        assert_eq!(
+            experiment_fingerprint(&full).expect("full fingerprint"),
+            compatible_fingerprint,
+            "scenario coverage must not invalidate matching cached samples"
+        );
+
+        let key = SampleKey {
+            scenario: "64p64c".to_string(),
+            repeat_index: 1,
+            mode: Mode::Throughput,
+            items_per_producer: 1_000_000,
+            queue_label: "segqueue".to_string(),
+            batch_size: None,
+        };
+        let mut record = test_record("segqueue", Mode::Throughput, 1_000_000);
+        record.total_items = 64_000_000;
+        record.consumed_items = 64_000_000;
+        let mut writer =
+            IncrementalOutputWriter::new(&full, &ExistingRunsIndex::default()).expect("writer");
+        writer
+            .handle_completed_record(key.clone(), record)
+            .expect("persist full-plan sample");
+        writer.finish(false).expect("finish writer");
+
+        let cached =
+            load_existing_runs_for_fingerprint(&runs_dir, "local", Some(&compatible_fingerprint))
+                .expect("load subset cache");
+        assert!(
+            cached.records.contains_key(&key),
+            "the subset plan must load its sample from the wider plan"
+        );
+
+        subset.throughput_policy.phase_ms += 1;
+        assert_ne!(
+            experiment_fingerprint(&full).expect("full fingerprint"),
+            experiment_fingerprint(&subset).expect("changed-policy fingerprint"),
+            "measurement protocol changes must still invalidate cached samples"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn serialization_omits_none_fields() {
         let output = OutputFile {
             schema_version: RUN_SCHEMA_VERSION,
@@ -7114,10 +10004,22 @@ mod tests {
                 consumers: 1,
                 repeat_index: 1,
                 available_parallelism: 2,
+                core_placement: CorePlacement::Interleaved,
+                selected_core_ids: vec![0, 1],
+                producer_core_ids: vec![0],
+                consumer_core_ids: vec![1],
+                affinity_authoritative: true,
+                schedule_seed: DEFAULT_SCHEDULE_SEED,
+                throughput_policy: ThroughputPolicy::default(),
+                experiment_fingerprint: "test".to_string(),
+                item_policy: ItemPolicy::Explicit,
                 ubq_label: None,
                 ubq_block_size: None,
+                dubq_label: None,
+                dubq_min_block_size: None,
                 ubq_grid: None,
                 expected_ubq_configurations: None,
+                expected_dubq_configurations: None,
                 ubq_batch_sizes: Vec::new(),
                 planned_repeats: None,
                 planned_items_per_producer: Vec::new(),
@@ -7145,6 +10047,7 @@ mod tests {
                 status: BenchRecordStatus::Completed,
                 failure_reason: None,
                 timeout_ns: None,
+                throughput_metrics: None,
             }],
         };
         let json = serde_json::to_string(&output).expect("json");
@@ -7152,6 +10055,7 @@ mod tests {
         assert!(!json.contains("ubq_label"));
         assert!(!json.contains("fill_elapsed_ns"));
         assert!(!json.contains("status"));
+        assert!(json.contains("\"core_placement\":\"interleaved\""));
     }
 
     #[test]
@@ -7163,11 +10067,19 @@ mod tests {
 
         let plan = MatrixPlan {
             plan_schema_version: PLAN_SCHEMA_VERSION,
+            core_placement: CorePlacement::Interleaved,
+            item_policy: ItemPolicy::Explicit,
             machine_label: "local".to_string(),
             runs_dir: runs_dir.clone(),
             available_parallelism: 2,
+            core_ids: Vec::new(),
+            allow_unpinned: true,
+            schedule_seed: DEFAULT_SCHEDULE_SEED,
+            throughput_policy: ThroughputPolicy::default(),
+            job_timeout_secs: None,
             baseline_queues: vec![QueueKind::SegQueue],
             fastfifo_block_sizes: Vec::new(),
+            fastfifo_capacities: default_fastfifo_capacities(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
             ubq_grid: None,
@@ -7176,7 +10088,8 @@ mod tests {
             bundles: vec![PlanBundle {
                 scenario: ScenarioConfig::new(1, 1),
                 repeat_index: 1,
-                ubq_label: Some("balanced,1,31,crossbeam".to_string()),
+                ubq_label: None,
+                dubq_label: None,
                 modes: vec![Mode::Throughput],
                 items_per_producer_values: vec![1],
             }],
@@ -7209,6 +10122,28 @@ mod tests {
         );
         assert_eq!(loaded.records.len(), 1);
 
+        let mut files = Vec::new();
+        collect_run_jsons_recursive(&runs_dir, &mut files).expect("scan runs");
+        assert_eq!(files.len(), 1);
+        let snapshot = fs::read_to_string(&files[0]).expect("read snapshot");
+        assert!(
+            !snapshot.contains('\n'),
+            "persisted snapshots should be compact"
+        );
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&snapshot).expect("parse snapshot");
+        legacy["schema_version"] = serde_json::Value::from(RUN_SCHEMA_VERSION - 1);
+        fs::write(
+            &files[0],
+            serde_json::to_string_pretty(&legacy).expect("serialize legacy snapshot"),
+        )
+        .expect("write legacy snapshot");
+        let legacy_loaded = load_existing_runs(&runs_dir, "local").expect("load legacy");
+        assert!(
+            legacy_loaded.records.is_empty(),
+            "schema-v4 samples must not satisfy the schema-v5 cache"
+        );
+
         writer.finish(false).expect("finish writer");
         let _ = fs::remove_dir_all(&root);
     }
@@ -7223,11 +10158,19 @@ mod tests {
         let scenario = ScenarioConfig::new(1, 1);
         let plan = MatrixPlan {
             plan_schema_version: PLAN_SCHEMA_VERSION,
+            core_placement: CorePlacement::Interleaved,
+            item_policy: ItemPolicy::Explicit,
             machine_label: "local".to_string(),
             runs_dir: runs_dir.clone(),
             available_parallelism: 2,
+            core_ids: Vec::new(),
+            allow_unpinned: true,
+            schedule_seed: DEFAULT_SCHEDULE_SEED,
+            throughput_policy: ThroughputPolicy::default(),
+            job_timeout_secs: None,
             baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
             fastfifo_block_sizes: Vec::new(),
+            fastfifo_capacities: default_fastfifo_capacities(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
             ubq_grid: None,
@@ -7237,6 +10180,7 @@ mod tests {
                 scenario: scenario.clone(),
                 repeat_index: 1,
                 ubq_label: None,
+                dubq_label: None,
                 modes: vec![Mode::Throughput],
                 items_per_producer_values: vec![1],
             }],
@@ -7270,7 +10214,8 @@ mod tests {
         );
 
         let (executed, crashed) =
-            execute_job_factories(&plan, &cache, Vec::new(), 2).expect("execute");
+            execute_job_factories(&plan, &cache, Vec::new(), 2, TimingEstimator::default())
+                .expect("execute");
         assert!(executed.is_empty());
         assert!(crashed.is_none());
 
@@ -7285,8 +10230,9 @@ mod tests {
     }
 
     #[test]
-    fn execute_job_factories_can_run_multiple_ubq_jobs_concurrently() {
-        let root = std::env::temp_dir().join(format!("ubq_parallel_ubq_test_{}", now_unix_nanos()));
+    fn execute_job_factories_run_sequentially_on_the_same_core_range() {
+        let root =
+            std::env::temp_dir().join(format!("ubq_sequential_job_test_{}", now_unix_nanos()));
         let runs_dir = root.join("runs");
         fs::create_dir_all(&runs_dir).expect("mkdir");
 
@@ -7294,11 +10240,19 @@ mod tests {
         let ubq_label = "balanced,1,31,crossbeam".to_string();
         let plan = MatrixPlan {
             plan_schema_version: PLAN_SCHEMA_VERSION,
+            core_placement: CorePlacement::Interleaved,
+            item_policy: ItemPolicy::Explicit,
             machine_label: "local".to_string(),
             runs_dir: runs_dir.clone(),
             available_parallelism: 4,
+            core_ids: Vec::new(),
+            allow_unpinned: true,
+            schedule_seed: DEFAULT_SCHEDULE_SEED,
+            throughput_policy: ThroughputPolicy::default(),
+            job_timeout_secs: None,
             baseline_queues: Vec::new(),
             fastfifo_block_sizes: Vec::new(),
+            fastfifo_capacities: default_fastfifo_capacities(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
             ubq_grid: None,
@@ -7309,6 +10263,7 @@ mod tests {
                     scenario: scenario.clone(),
                     repeat_index: 1,
                     ubq_label: Some(ubq_label.clone()),
+                    dubq_label: None,
                     modes: vec![Mode::Throughput],
                     items_per_producer_values: vec![1],
                 },
@@ -7316,6 +10271,7 @@ mod tests {
                     scenario: scenario.clone(),
                     repeat_index: 2,
                     ubq_label: Some(ubq_label.clone()),
+                    dubq_label: None,
                     modes: vec![Mode::Throughput],
                     items_per_producer_values: vec![1],
                 },
@@ -7326,10 +10282,12 @@ mod tests {
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let start_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let core_offsets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let make_job = |repeat_index| {
             let active = std::sync::Arc::clone(&active);
             let max_active = std::sync::Arc::clone(&max_active);
             let start_count = std::sync::Arc::clone(&start_count);
+            let core_offsets = std::sync::Arc::clone(&core_offsets);
             JobFactory {
                 spec: JobSpec {
                     scenario: scenario.clone(),
@@ -7338,25 +10296,19 @@ mod tests {
                     items_per_producer: 1,
                     queue: QueueKind::Ubq,
                     ubq_label: Some(ubq_label.clone()),
+                    dubq_label: None,
                     batch_size: None,
                     fastfifo_block_size: None,
+                    fastfifo_capacity: None,
                     lfqueue_segment_size: None,
                     wcq_capacity: None,
                 },
-                run: std::sync::Arc::new(move |_| {
+                run: std::sync::Arc::new(move |core_offset| {
+                    core_offsets.lock().unwrap().push(core_offset);
                     start_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let now_active = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     max_active.fetch_max(now_active, std::sync::atomic::Ordering::SeqCst);
-
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_millis(200);
-                    while start_count.load(std::sync::atomic::Ordering::SeqCst) < 2
-                        && std::time::Instant::now() < deadline
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
                     std::thread::sleep(std::time::Duration::from_millis(20));
-
                     active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     test_record("ubq", Mode::Throughput, 1)
                 }),
@@ -7369,115 +10321,79 @@ mod tests {
             &ExistingRunsIndex::default(),
             pending,
             plan.available_parallelism,
+            TimingEstimator::default(),
         )
         .expect("execute");
 
         assert!(crashed.is_none());
         assert_eq!(executed.len(), 2);
         assert_eq!(start_count.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(
-            max_active.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-            "expected overlapping UBQ execution when thread budget allows it"
-        );
+        assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(*core_offsets.lock().unwrap(), vec![0, 0]);
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn execute_job_factories_records_timeout_and_continues() {
-        let root =
-            std::env::temp_dir().join(format!("ubq_timeout_record_test_{}", now_unix_nanos()));
-        let runs_dir = root.join("runs");
-        fs::create_dir_all(&runs_dir).expect("mkdir");
-
-        let scenario = ScenarioConfig::new(1, 1);
-        let plan = MatrixPlan {
-            plan_schema_version: PLAN_SCHEMA_VERSION,
-            machine_label: "local".to_string(),
-            runs_dir: runs_dir.clone(),
-            available_parallelism: 4,
-            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            fastfifo_block_sizes: Vec::new(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: Vec::new(),
-            ubq_grid: None,
-            ubq_batch_sizes: Vec::new(),
-            planned_repeats: 1,
-            bundles: vec![PlanBundle {
-                scenario: scenario.clone(),
-                repeat_index: 1,
-                ubq_label: None,
-                modes: vec![Mode::Throughput],
-                items_per_producer_values: vec![1],
-            }],
-            reuse_existing: false,
-        };
-
-        let slow_spec = JobSpec {
-            scenario: scenario.clone(),
-            repeat_index: 1,
-            mode: Mode::Throughput,
-            items_per_producer: 1,
-            queue: QueueKind::SegQueue,
-            ubq_label: None,
-            batch_size: None,
-            fastfifo_block_size: None,
-            lfqueue_segment_size: None,
-            wcq_capacity: None,
-        };
-        let fast_spec = JobSpec {
-            queue: QueueKind::ConcurrentQueue,
-            ..slow_spec.clone()
-        };
-        let pending = vec![
-            JobFactory {
-                spec: slow_spec.clone(),
-                run: Arc::new(move |_| {
-                    std::thread::sleep(Duration::from_millis(80));
-                    test_record("segqueue", Mode::Throughput, 1)
-                }),
+    fn worker_protocol_round_trips_and_rejects_version_mismatches() {
+        let request = WorkerRequest {
+            protocol_version: BENCH_WORKER_PROTOCOL_VERSION,
+            request_id: 7,
+            command: WorkerCommand::Run {
+                spec: JobSpec {
+                    scenario: ScenarioConfig::new(1, 1),
+                    repeat_index: 1,
+                    mode: Mode::Throughput,
+                    items_per_producer: 10,
+                    queue: QueueKind::SegQueue,
+                    ubq_label: None,
+                    dubq_label: None,
+                    batch_size: None,
+                    fastfifo_block_size: None,
+                    fastfifo_capacity: None,
+                    lfqueue_segment_size: None,
+                    wcq_capacity: None,
+                },
             },
-            JobFactory {
-                spec: fast_spec.clone(),
-                run: Arc::new(move |_| test_record("concurrent-queue", Mode::Throughput, 1)),
+        };
+        let json = serde_json::to_string(&request).expect("serialize request");
+        let decoded: WorkerRequest = serde_json::from_str(&json).expect("decode request");
+        assert_eq!(decoded.protocol_version, BENCH_WORKER_PROTOCOL_VERSION);
+        assert_eq!(decoded.request_id, 7);
+
+        let mismatch = WorkerResponse {
+            protocol_version: BENCH_WORKER_PROTOCOL_VERSION,
+            request_id: 7,
+            result: WorkerResult::ProtocolError {
+                reason: format!(
+                    "worker protocol version mismatch: parent={}, worker={}",
+                    BENCH_WORKER_PROTOCOL_VERSION + 1,
+                    BENCH_WORKER_PROTOCOL_VERSION
+                ),
             },
-        ];
+        };
+        let mismatch_json = serde_json::to_string(&mismatch).expect("serialize mismatch");
+        assert!(mismatch_json.contains("protocol_error"));
+        assert!(mismatch_json.contains("version mismatch"));
 
-        let (executed, crashed) = execute_job_factories_with_timeout(
-            &plan,
-            &ExistingRunsIndex::default(),
-            pending,
-            plan.available_parallelism,
-            Duration::from_millis(10),
-        )
-        .expect("execute");
-
-        assert!(crashed.is_none());
-        let slow_key = SampleKey::from_job(&slow_spec);
-        let fast_key = SampleKey::from_job(&fast_spec);
-        let slow_record = executed.get(&slow_key).expect("timeout record");
-        assert_eq!(slow_record.status, BenchRecordStatus::TimedOut);
         assert!(
-            slow_record
-                .failure_reason
-                .as_deref()
-                .unwrap()
-                .contains("timeout")
+            decode_worker_response("not-json", 7)
+                .unwrap_err()
+                .contains("malformed")
         );
-        assert!(slow_record.ops_per_sec.is_none());
-        assert_eq!(
-            executed.get(&fast_key).expect("fast record").status,
-            BenchRecordStatus::Completed
-        );
-
-        let loaded = load_existing_runs(&runs_dir, "local").expect("load");
+        let wrong_version = WorkerResponse {
+            protocol_version: BENCH_WORKER_PROTOCOL_VERSION + 1,
+            request_id: 7,
+            result: WorkerResult::ShuttingDown,
+        };
         assert!(
-            !loaded.records.contains_key(&slow_key),
-            "timed-out jobs must remain eligible for retry after resume"
+            decode_worker_response(
+                &serde_json::to_string(&wrong_version).expect("serialize wrong version"),
+                7,
+            )
+            .unwrap_err()
+            .contains("version mismatch")
         );
-        assert!(loaded.records.contains_key(&fast_key));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -7539,6 +10455,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
             index.records.insert(
@@ -7573,6 +10490,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
             index.records.insert(
@@ -7607,6 +10525,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
         }
@@ -7675,6 +10594,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
             index.records.insert(
@@ -7709,6 +10629,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
             index.records.insert(
@@ -7743,6 +10664,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
         }
@@ -7766,250 +10688,6 @@ mod tests {
             plan.bundles
                 .iter()
                 .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,yield"))
-        );
-    }
-
-    #[test]
-    fn frontier_expands_when_wcq_is_unsupported_for_one_mode() {
-        let scenario = ScenarioConfig::new(1, 1);
-        let mut index = ExistingRunsIndex::default();
-        for mode in [Mode::Throughput, Mode::FillDrain] {
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index: 1,
-                    mode,
-                    items_per_producer: 1,
-                    queue_label: "segqueue".to_string(),
-                    batch_size: None,
-                },
-                test_record("segqueue", mode, 1),
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index: 1,
-                    mode,
-                    items_per_producer: 1,
-                    queue_label: "ubq_balanced,8,127,crossbeam".to_string(),
-                    batch_size: None,
-                },
-                test_record("ubq", mode, 1),
-            );
-        }
-        index.records.insert(
-            SampleKey {
-                scenario: scenario.name.clone(),
-                repeat_index: 1,
-                mode: Mode::FillDrain,
-                items_per_producer: 1,
-                queue_label: "wcq_4096".to_string(),
-                batch_size: None,
-            },
-            test_record("wcq", Mode::FillDrain, 1),
-        );
-
-        let config = FrontierConfig {
-            machine_label: "local".to_string(),
-            runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
-            scenarios: vec![scenario],
-            baseline_queues: vec![QueueKind::SegQueue, QueueKind::Wcq],
-            fastfifo_block_sizes: Vec::new(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: vec![4096],
-            seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
-            modes: vec![Mode::Throughput, Mode::FillDrain],
-            items_per_producer_values: vec![1],
-            repeats: 1,
-            available_parallelism: 8,
-        };
-        let plan = compute_frontier_round_plan(&config, &index, &BTreeSet::new()).expect("plan");
-        assert!(
-            plan.bundles
-                .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,yield"))
-        );
-        assert!(
-            plan.bundles
-                .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,0,127,crossbeam"))
-        );
-    }
-
-    #[test]
-    fn frontier_does_not_expand_nonbest_baseline_beater() {
-        let scenario = ScenarioConfig::new(1, 1);
-        let weaker_label = "balanced,8,127,crossbeam";
-        let best_label = "balanced,16,127,crossbeam";
-        let best_only_neighbor = "balanced,32,127,crossbeam";
-        let weaker_only_neighbor = "balanced,4,127,crossbeam";
-        let mut index = ExistingRunsIndex::default();
-
-        for repeat_index in 1..=2 {
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "segqueue".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "segqueue".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 10,
-                    ops_per_sec: Some(10.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "concurrent-queue".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "concurrent-queue".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 11,
-                    ops_per_sec: Some(9.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: format!("ubq_{weaker_label}"),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "ubq".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 20,
-                    ops_per_sec: Some(20.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: format!("ubq_{best_label}"),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "ubq".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 15,
-                    ops_per_sec: Some(25.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                },
-            );
-        }
-
-        let config = FrontierConfig {
-            machine_label: "local".to_string(),
-            runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
-            scenarios: vec![scenario.clone()],
-            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            fastfifo_block_sizes: Vec::new(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: Vec::new(),
-            seed_labels: vec![weaker_label.to_string()],
-            modes: vec![Mode::Throughput],
-            items_per_producer_values: vec![1],
-            repeats: 2,
-            available_parallelism: 8,
-        };
-        let plan = compute_frontier_round_plan(&config, &index, &BTreeSet::new()).expect("plan");
-
-        assert!(
-            plan.bundles
-                .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some(best_only_neighbor))
-        );
-        assert!(
-            !plan
-                .bundles
-                .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some(weaker_only_neighbor))
         );
     }
 
@@ -8076,6 +10754,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
             index.records.insert(
@@ -8110,6 +10789,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
             index.records.insert(
@@ -8144,6 +10824,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
         }
@@ -8217,6 +10898,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
             index.records.insert(
@@ -8251,6 +10933,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
             index.records.insert(
@@ -8285,6 +10968,7 @@ mod tests {
                     status: BenchRecordStatus::Completed,
                     failure_reason: None,
                     timeout_ns: None,
+                    throughput_metrics: None,
                 },
             );
         }
@@ -8308,39 +10992,5 @@ mod tests {
             bundle.scenario.name == constrained_scenario.name
                 && bundle.ubq_label.as_deref() == Some(winning_label)
         }));
-    }
-
-    #[test]
-    fn scheduler_allows_jobs_until_thread_budget_is_exhausted() {
-        let baseline = JobSpec {
-            scenario: ScenarioConfig::new(1, 1),
-            repeat_index: 1,
-            mode: Mode::Throughput,
-            items_per_producer: 1,
-            queue: QueueKind::SegQueue,
-            ubq_label: None,
-            batch_size: None,
-            fastfifo_block_size: None,
-            lfqueue_segment_size: None,
-            wcq_capacity: None,
-        };
-        let ubq = JobSpec {
-            scenario: ScenarioConfig::new(1, 1),
-            repeat_index: 1,
-            mode: Mode::Throughput,
-            items_per_producer: 1,
-            queue: QueueKind::Ubq,
-            ubq_label: Some("balanced,1,31,crossbeam".to_string()),
-            batch_size: None,
-            fastfifo_block_size: None,
-            lfqueue_segment_size: None,
-            wcq_capacity: None,
-        };
-
-        assert!(can_start_job(&baseline, 0, 8));
-        assert!(can_start_job(&ubq, 0, 8));
-        assert!(can_start_job(&baseline, 2, 8));
-        assert!(can_start_job(&ubq, 2, 8));
-        assert!(!can_start_job(&ubq, 7, 8));
     }
 }

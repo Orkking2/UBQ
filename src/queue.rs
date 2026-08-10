@@ -1,5 +1,5 @@
 use crate::{
-    align::{A1024, A4096},
+    align::A1024,
     backoff::{BackoffPolicy, Crossbeam},
     block::{Block, DEFAULT_BLOCK_SIZE, SKIP, WRITE},
 };
@@ -9,11 +9,10 @@ use core::{
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::DerefMut,
-    ptr::{NonNull, null_mut, with_exposed_provenance_mut},
+    ptr::{null_mut, with_exposed_provenance_mut},
     sync::atomic::{
         AtomicPtr, AtomicUsize,
         Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
-        fence,
     },
 };
 use crossbeam_utils::CachePadded;
@@ -70,6 +69,12 @@ struct Head<T, const BLOCK_SIZE: usize, A> {
     block: *mut Block<T, BLOCK_SIZE, A>,
 }
 
+impl<T, const BLOCK_SIZE: usize, A> PartialEq for Head<T, BLOCK_SIZE, A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && self.block == other.block
+    }
+}
+
 #[inline]
 fn drop_spare_block<T, const BLOCK_SIZE: usize, A>(block: *mut Block<T, BLOCK_SIZE, A>) {
     let _ = unsafe { Box::from_raw(block.cast::<ManuallyDrop<Block<T, BLOCK_SIZE, A>>>()) };
@@ -90,11 +95,11 @@ impl<T, const BLOCK: usize, A> Clone for Head<T, BLOCK, A> {
 
 impl<T, const BLOCK_SIZE: usize, A> Head<T, BLOCK_SIZE, A> {
     #[inline]
-    fn mask() -> usize {
+    const fn mask() -> usize {
         Block::<T, BLOCK_SIZE, A>::block_mask()
     }
 
-    fn new(u: usize) -> Self {
+    const fn new(u: usize) -> Self {
         let mask = Self::mask();
 
         Self {
@@ -103,7 +108,14 @@ impl<T, const BLOCK_SIZE: usize, A> Head<T, BLOCK_SIZE, A> {
         }
     }
 
-    fn is_zero(&self) -> bool {
+    const fn zero() -> Self {
+        Self {
+            index: 0,
+            block: null_mut(),
+        }
+    }
+
+    const fn is_zero(&self) -> bool {
         self.index == 0 && self.block.is_null()
     }
 
@@ -114,7 +126,7 @@ impl<T, const BLOCK_SIZE: usize, A> Head<T, BLOCK_SIZE, A> {
 
 // SAFETY: Slot ownership is assigned with atomic counters, and producer/consumer
 // commits are synchronized with Release/Acquire ordering before cross-thread reads.
-unsafe impl<T: Sync, B, A: Sync, const POOL: usize, const BLOCK_SIZE: usize> Sync
+unsafe impl<T: Send, B, A: Send, const POOL: usize, const BLOCK_SIZE: usize> Sync
     for ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>
 {
 }
@@ -320,7 +332,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
                             .get_unchecked(i)
                             .next
                             .as_ptr()
-                            .write(ref_to_mut_ptr(&blocks.get_unchecked(i + 1)))
+                            .write(ref_to_mut_ptr(blocks.get_unchecked(i + 1)))
                     }
                 }
             }
@@ -346,15 +358,16 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
                 .pack(),
                 Release,
             )
+        } else {
+            blocks
+                .into_iter()
+                .map(Box::into_raw)
+                .for_each(|block| self.give_to_pool(block));
         }
 
         // At this point we are guaranteed to have `len` slots available, whether that be in the current block
         // or if that overflows into the subsequent blocks we have just allocated. These are all ours.
-        for i in 0..len {
-            let item = items.next().unwrap_or_else(|| {
-                panic!("ExactSizeIterator gave len == {len}, but only produced {i} items")
-            });
-
+        for _ in 0..len {
             let slot = unsafe { (*phead.block).slots.get_unchecked(phead.index) };
 
             phead.index += 1;
@@ -362,12 +375,19 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
             if phead.index == BLOCK_SIZE {
                 phead = Head {
                     index: 0,
-                    block: unsafe { (*phead.block).next.as_ptr().read() }, // next is guaranteed to not change until the block is freed
+                    block: unsafe { (*phead.block).next.as_ptr().read() },
                 }
             }
 
-            unsafe { slot.value.get().write(MaybeUninit::new(item)) };
-            slot.state.store(WRITE, Release);
+            let state = if let Some(item) = items.next() {
+                unsafe { slot.value.get().write(MaybeUninit::new(item)) };
+
+                WRITE
+            } else {
+                SKIP
+            };
+
+            slot.state.store(state, Release);
         }
     }
 
@@ -423,10 +443,10 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
                     && phead.index + 1 == BLOCK_SIZE
                     && self.pool.iter().all(|b| b.load(Relaxed).is_null())
                 {
-                    next_block = Some(Block::<T, BLOCK_SIZE, A>::new_zeroed());
+                    next_block = Some(Block::new_zeroed());
                 }
 
-                phead = Head::new(self.phead.fetch_add(1, SeqCst));
+                phead = Head::new(self.phead.fetch_add(1, Acquire));
 
                 if phead.index < BLOCK_SIZE {
                     break;
@@ -462,6 +482,182 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
         }
     }
 
+    /// Reserves and returns up to `request_size` items from the front of the queue.
+    ///
+    /// The returned iterator owns one consecutive range, so concurrent consumers
+    /// cannot take items from within that range. Reservation is eager but slot
+    /// reads are lazy: this call advances the consumer head before the iterator
+    /// yields its first item.
+    ///
+    /// The iterator may yield fewer than `request_size` items when fewer queue
+    /// positions are available or when an inaccurate batched producer published
+    /// skips. Dropping the iterator consumes and drops the unvisited part of its
+    /// reservation so that blocks can still be recycled.
+    #[doc(alias = "dequeue_batch")]
+    #[doc(alias = "receive_batch")]
+    pub fn pop_batch(&self, request_size: usize) -> TransBlockIter<'_, T, B, POOL, BLOCK_SIZE, A> {
+        let () = Self::LAYOUT_CHECKS;
+
+        if request_size == 0 || self.chead.load(Relaxed) == 0 {
+            return TransBlockIter::empty(self);
+        }
+
+        let backoff = B::new();
+        let mut chead = self.acquire_chead();
+
+        // First claim the part of the request that lies in the current block.
+        // A marker at BLOCK_SIZE gives this consumer exclusive ownership of the
+        // boundary transition, making it safe to inspect successor pointers.
+        let marker = loop {
+            let start_index = chead.index >> 1;
+
+            if start_index == BLOCK_SIZE {
+                backoff.snooze();
+                chead = self.acquire_chead();
+                continue;
+            }
+
+            let in_block = request_size.min(BLOCK_SIZE - start_index);
+            let mut new_index = ((start_index + in_block) << 1) | (chead.index & 1);
+
+            if chead.index & 1 == 0 {
+                let phead = Head::new(self.phead.load(Relaxed));
+
+                if phead.block == chead.block {
+                    if start_index >= phead.index {
+                        return TransBlockIter::empty(self);
+                    }
+
+                    new_index = new_index.min(phead.index << 1);
+                } else {
+                    // Remember that the producer was observed beyond this
+                    // block. Future consumers can then avoid reloading phead.
+                    new_index |= 1;
+                }
+            }
+
+            let new_chead = Head {
+                block: chead.block,
+                index: new_index,
+            };
+
+            match self
+                .chead
+                .compare_exchange_weak(chead.pack(), new_chead.pack(), SeqCst, Acquire)
+            {
+                Ok(_) => break new_chead,
+                Err(real) => {
+                    chead = Head::new(real);
+                    backoff.spin();
+                }
+            }
+        };
+
+        let start = Head {
+            block: chead.block,
+            index: chead.index >> 1,
+        };
+        let marker_index = marker.index >> 1;
+
+        // Validate the reservation against a producer-head load ordered after
+        // the consumer CAS. In the unlikely event that the earlier relaxed
+        // observation was stale, publish SKIPs for any positions the consumer
+        // has already claimed but no producer has reserved.
+        loop {
+            let phead = Head::new(self.phead.load(SeqCst));
+
+            if phead.block != start.block || phead.index >= marker_index {
+                break;
+            }
+
+            self.faux_push();
+        }
+
+        if marker_index < BLOCK_SIZE {
+            let end = Head {
+                block: start.block,
+                index: marker_index,
+            };
+
+            return TransBlockIter::new(self, start, end, marker_index - start.index);
+        }
+
+        // We own the boundary marker. Wait until the producer head is
+        // normalized, then walk at most the requested number of slots and cap
+        // the reservation at that producer frontier.
+        let phead = loop {
+            let phead = self.acquire_phead();
+
+            if phead.index < BLOCK_SIZE && phead.block != start.block {
+                break phead;
+            }
+
+            if phead.index < BLOCK_SIZE {
+                // A stale "has next" observation allowed the consumer to reach
+                // an unreserved suffix. Turn one position into a SKIP and retry.
+                self.faux_push();
+            } else {
+                backoff.snooze();
+            }
+        };
+
+        let first_block_slots = BLOCK_SIZE - start.index;
+        let mut remaining = request_size - first_block_slots;
+        let mut reserved = first_block_slots;
+        let mut cursor = Head {
+            block: loop {
+                let next = unsafe { (*start.block).next.load(Acquire) };
+
+                if !next.is_null() {
+                    break next;
+                }
+
+                backoff.snooze();
+            },
+            index: 0,
+        };
+
+        let (end, has_next) = loop {
+            if cursor.block == phead.block {
+                let take = remaining.min(phead.index);
+                cursor.index = take;
+                reserved += take;
+
+                break (cursor, false);
+            }
+
+            if remaining < BLOCK_SIZE {
+                cursor.index = remaining;
+                reserved += remaining;
+
+                break (cursor, true);
+            }
+
+            remaining -= BLOCK_SIZE;
+            reserved += BLOCK_SIZE;
+            cursor.block = loop {
+                let next = unsafe { (*cursor.block).next.load(Acquire) };
+
+                if !next.is_null() {
+                    break next;
+                }
+
+                backoff.snooze();
+            };
+        };
+
+        self.chead.store(
+            Head {
+                block: end.block,
+                index: (end.index << 1) | usize::from(has_next),
+            }
+            .pack(),
+            Release,
+        );
+
+        TransBlockIter::new(self, start, end, reserved)
+    }
+
     /// Removes and returns the front element, or [`None`] if the queue is empty.
     #[doc(alias = "dequeue")]
     #[doc(alias = "recv")]
@@ -486,8 +682,7 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
             let mut new_index = chead.index + 2;
 
             if chead.index & 1 == 0 {
-                fence(SeqCst);
-                let phead = Head::<T, BLOCK_SIZE, A>::new(self.phead.load(Relaxed));
+                let phead = Head::new(self.phead.load(Relaxed));
 
                 if phead.block == chead.block {
                     if chead.index >> 1 >= phead.index {
@@ -509,9 +704,9 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
             {
                 Ok(_) => {
                     // This load *must* be ordered subsequent (in time) to the CAS of chead
-                    let phead = Head::<T, BLOCK_SIZE, A>::new(self.phead.load(SeqCst));
+                    let phead = Head::new(self.phead.load(SeqCst));
 
-                    if phead.block == chead.block && phead.index <= chead.index {
+                    if phead.block == chead.block && phead.index <= chead.index >> 1 {
                         self.faux_push();
                     }
 
@@ -544,18 +739,14 @@ impl<T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
             );
         }
 
-        let slot = unsafe { (*chead.block).slots.get_unchecked(chead.index) };
-
-        while slot.state.load(Acquire) & WRITE == 0 {
-            backoff.snooze();
-        }
+        let slot =
+            unsafe { (*chead.block).slots.get_unchecked(chead.index) }.busy_wait_state(&backoff);
 
         let out = (slot.state.load(Acquire) != SKIP)
             .then(|| unsafe { slot.value.get().read().assume_init() });
 
-        if unsafe { (*chead.block).consumed.fetch_add(1, Relaxed) } + 1 == BLOCK_SIZE {
-            unsafe { Block::reset(chead.block) };
-            self.give_to_pool(chead.block);
+        if unsafe { (*chead.block).consumed.fetch_add(1, AcqRel) } + 1 == BLOCK_SIZE {
+            self.give_to_pool(Block::reset(chead.block));
         }
 
         out.or_else(|| self.pop())
@@ -585,5 +776,111 @@ impl<T, B, const POOL: usize, const BLOCK: usize, A> Drop for ConfiguredUBQ<T, B
             .map(AtomicPtr::get_mut)
             .filter(|p| !p.is_null())
             .for_each(|p| drop_spare_block(*p));
+    }
+}
+
+/// Guaranteed exclusive access to the slot represented by [left..right]; right is past
+/// the terminal slot, giving left == right => EMPTY. Otherwise, as pops happen,
+/// left will traverse the singly linked list of blocks in search of right, returning
+/// blocks to the queue's pool as they are consumed.
+pub struct TransBlockIter<'a, T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A> {
+    queue: &'a ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>,
+    max_size: usize,
+    right: usize,
+    left: usize,
+}
+
+impl<'a, T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
+    TransBlockIter<'a, T, B, POOL, BLOCK_SIZE, A>
+{
+    fn empty(queue: &'a ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>) -> Self {
+        let zero = Head::<T, BLOCK_SIZE, A>::zero().pack();
+
+        Self {
+            queue,
+            max_size: 0,
+            right: zero,
+            left: zero,
+        }
+    }
+
+    fn new(
+        queue: &'a ConfiguredUBQ<T, B, POOL, BLOCK_SIZE, A>,
+        left: Head<T, BLOCK_SIZE, A>,
+        right: Head<T, BLOCK_SIZE, A>,
+        max_size: usize,
+    ) -> Self {
+        Self {
+            queue,
+            max_size,
+            right: right.pack(),
+            left: left.pack(),
+        }
+    }
+}
+
+impl<'a, T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A> Drop
+    for TransBlockIter<'a, T, B, POOL, BLOCK_SIZE, A>
+{
+    fn drop(&mut self) {
+        while self.max_size != 0 {
+            let _ = self.next();
+        }
+    }
+}
+
+impl<'a, T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A> Iterator
+    for TransBlockIter<'a, T, B, POOL, BLOCK_SIZE, A>
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let backoff = B::new();
+
+        while self.left != self.right {
+            let mut left = Head::<T, BLOCK_SIZE, A>::new(self.left);
+            let block = left.block;
+            let slot = unsafe { (*block).slots.get_unchecked(left.index) };
+
+            left.index += 1;
+            self.max_size -= 1;
+
+            // Cache the successor before this slot can make us the last
+            // consumer and allow the current block to be reset and recycled.
+            if left.index == BLOCK_SIZE {
+                left = Head {
+                    block: loop {
+                        let next = unsafe { (*block).next.load(Acquire) };
+
+                        if !next.is_null() {
+                            break next;
+                        }
+
+                        backoff.snooze();
+                    },
+                    index: 0,
+                };
+            }
+
+            self.left = left.pack();
+
+            let slot = slot.busy_wait_state(&backoff);
+            let out = (slot.state.load(Acquire) != SKIP)
+                .then(|| unsafe { slot.value.get().read().assume_init() });
+
+            if unsafe { (*block).consumed.fetch_add(1, AcqRel) } + 1 == BLOCK_SIZE {
+                self.queue.give_to_pool(Block::reset(block));
+            }
+
+            if out.is_some() {
+                return out;
+            }
+        }
+
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.max_size))
     }
 }
