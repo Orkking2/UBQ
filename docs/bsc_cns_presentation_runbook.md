@@ -12,7 +12,7 @@ cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue --bin ben
   --machine-label local-preview \
   --runs-dir bench_results/presentation_runs \
   --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue \
-  --ubq-label balanced,8,127,crossbeam \
+  --ubq-label balanced,1,127,crossbeam \
   --fastfifo-block-sizes 64,256,1024,4096 \
   --lfqueue-segment-sizes 1024 \
   --scenarios 1p4c,4p4c,16p16c,64p64c \
@@ -35,7 +35,7 @@ multi-threaded scenarios to run.
 | 16p16c | 4,298,067 | crossbeam SegQueue | 6,819,665 | 0.63x |
 | 64p64c | 15,700,386 | crossbeam SegQueue | 25,958,356 | 0.60x |
 
-Interpretation: the fixed preview label `balanced,8,127,crossbeam` is enough to
+Interpretation: the fixed preview label `balanced,1,127,crossbeam` is enough to
 show a fan-out win, but it is not the tuned high-contention label. Use the BSC
 sparse-grid run below for real claims.
 

@@ -5,9 +5,9 @@ use std::{
     },
     thread,
 };
-use ubq::{ConfiguredUBQ, align, backoff};
+use ubq::{UBQ, backoff};
 
-type TinyQueue<T> = ConfiguredUBQ<T, backoff::Crossbeam, 2, 7, align::A64>;
+type TinyQueue<T> = UBQ<T, 7, backoff::Crossbeam>;
 
 #[test]
 fn empty_single_and_varied_batch_lengths_preserve_fifo_order() {

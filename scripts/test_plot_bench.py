@@ -35,6 +35,8 @@ from scripts.plot_bench import (
     parse_batched_dubq_label,
     parse_batched_segqueue_label,
     parse_dubq_variant,
+    pool_size_effect_observations,
+    pool_size_effect_rows,
     preferred_core_placements,
     publication_display_label,
     publication_machine_entries,
@@ -53,6 +55,7 @@ from scripts.plot_bench import (
     throughput_speedup_rows,
     write_immediate_variant_csv,
     write_machine_line_csv,
+    write_pool_size_effect_csv,
 )
 
 
@@ -188,6 +191,19 @@ class DisplayLabelTest(unittest.TestCase):
 
 
 class ImmediateWinnerVariantReportTest(unittest.TestCase):
+    def test_current_fixed_pool_grid_varies_only_block_and_backoff(self):
+        entries = {
+            "ubq_balanced,1,127,crossbeam": stats(100),
+            "ubq_balanced,1,63,crossbeam": stats(90),
+            "ubq_balanced,1,255,crossbeam": stats(90),
+            "ubq_balanced,1,127,yield": stats(90),
+        }
+
+        report = immediate_winner_variant_report(entries, "1p1c")
+
+        self.assertEqual([], report["missing_required_labels"])
+        self.assertEqual([], report["zero_pool_labels"])
+
     def test_four_part_immediate_neighbors_are_present(self):
         entries = {
             "segqueue": stats(1),
@@ -907,6 +923,75 @@ class ThroughputSpeedupGridTest(unittest.TestCase):
         self.assertEqual(100 / 60, by_comparison["scalar_segqueue"]["speedup"])
         self.assertEqual(3.0, by_comparison["batched_segqueue"]["speedup"])
         self.assertEqual(batched, by_comparison["batched_segqueue"]["ubq_queue"])
+
+
+class PoolSizeEffectTest(unittest.TestCase):
+    def test_pool_effects_are_matched_on_every_other_ubq_knob(self):
+        batched_pool0_8 = format_batched_ubq_label("balanced,0,127,crossbeam", 8)
+        batched_pool1_8 = format_batched_ubq_label("balanced,1,127,crossbeam", 8)
+        batched_pool0_32 = format_batched_ubq_label("balanced,0,127,crossbeam", 32)
+        batched_pool1_32 = format_batched_ubq_label("balanced,1,127,crossbeam", 32)
+        entries = {
+            "1p1c": {
+                "ubq_balanced,0,127,crossbeam": stats(100),
+                "ubq_balanced,1,127,crossbeam": stats(110),
+                "ubq_balanced,8,127,crossbeam": stats(80),
+                "ubq_balanced,0,511,yield": stats(200),
+                "ubq_balanced,1,511,yield": stats(180),
+                # No matching pool=0: this observation must not be compared.
+                "ubq_balanced,8,511,crossbeam": stats(500),
+                batched_pool0_8: stats(50),
+                batched_pool1_8: stats(100),
+                batched_pool0_32: stats(100),
+                batched_pool1_32: stats(50),
+            }
+        }
+
+        observations = pool_size_effect_observations(entries)
+        rows = pool_size_effect_rows(entries)
+        by_key = {(row["method"], row["pool_size"]): row for row in rows}
+
+        self.assertEqual(9, len(observations))
+        self.assertEqual(2, by_key[("scalar", 1)]["matched_configurations"])
+        self.assertAlmostEqual(1.0, by_key[("scalar", 1)]["median_relative_performance_vs_pool0"])
+        self.assertEqual(0.5, by_key[("scalar", 1)]["beneficial_fraction"])
+        self.assertEqual(1, by_key[("scalar", 8)]["matched_configurations"])
+        self.assertAlmostEqual(0.8, by_key[("scalar", 8)]["median_relative_performance_vs_pool0"])
+        self.assertEqual("8,32", by_key[("batched", 1)]["batch_sizes"])
+        self.assertAlmostEqual(1.25, by_key[("batched", 1)]["median_relative_performance_vs_pool0"])
+
+    def test_lower_is_better_metrics_are_oriented_as_performance(self):
+        entries = {
+            "1p1c": {
+                "ubq_balanced,0,127,crossbeam": stats(100),
+                "ubq_balanced,1,127,crossbeam": stats(50),
+            }
+        }
+
+        rows = pool_size_effect_rows(entries, "throughput_push_elapsed")
+        pooled = next(row for row in rows if row["pool_size"] == 1)
+
+        self.assertEqual(2.0, pooled["median_relative_performance_vs_pool0"])
+
+    def test_summary_csv_records_match_counts_and_claim_status(self):
+        rows = pool_size_effect_rows(
+            {
+                "1p1c": {
+                    "ubq_balanced,0,127,crossbeam": stats(100),
+                    "ubq_balanced,1,127,crossbeam": stats(120),
+                }
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pool.csv"
+            write_pool_size_effect_csv(path, rows)
+            with path.open(encoding="utf-8") as f:
+                written = list(csv.DictReader(f))
+
+        pooled = next(row for row in written if row["pool_size"] == "1")
+        self.assertEqual("1", pooled["matched_configurations"])
+        self.assertEqual("1.200000", pooled["median_relative_performance_vs_pool0"])
+        self.assertEqual("eligible", pooled["claim_status"])
 
 
 class MetricExtractionTest(unittest.TestCase):

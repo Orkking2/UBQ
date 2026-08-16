@@ -96,10 +96,6 @@ impl<T> PHead<T> {
         index: 0,
     };
 
-    pub(crate) fn from_block(block: &Block<T>) -> Self {
-        Self::from_ptr(NonNull::from_ref(block))
-    }
-
     /// Constructs a normalized head at index zero for one block. Successor
     /// capacity is intentionally zero and must be added separately when this
     /// block is the head of a newly allocated `BlockChain`.
@@ -167,9 +163,9 @@ impl<T> PHead<T> {
     /// Callers must ensure the current block cannot be reclaimed before this
     /// method has loaded its `next` pointer.
     pub(crate) fn next(self) -> Self {
-        let block = unsafe { self.ptr.as_ref_unchecked() };
+        let block = unsafe { &*self.ptr };
         let ptr = block.next().load(Ordering::Acquire);
-        let block_length = u16::try_from(unsafe { ptr.as_ref_unchecked() }.len())
+        let block_length = u16::try_from(unsafe { &*ptr }.len())
             .expect("block length must fit in the packed u16 field");
 
         Self {
@@ -321,9 +317,9 @@ impl<T> CHead<T> {
 
     #[inline]
     pub(crate) fn next(self) -> Self {
-        let block = unsafe { self.ptr.as_ref_unchecked() };
+        let block = unsafe { &*self.ptr };
         let ptr = block.next().load(Ordering::Acquire);
-        let block_length = u16::try_from(unsafe { ptr.as_ref_unchecked() }.len())
+        let block_length = u16::try_from(unsafe { &*ptr }.len())
             .expect("block length must fit in the packed u16 field");
 
         Self {
@@ -335,7 +331,7 @@ impl<T> CHead<T> {
     }
 
     pub(crate) fn await_next_head<B: BackoffPolicy>(self, backoff: &B) -> Self {
-        let block = unsafe { self.ptr.as_ref_unchecked() };
+        let block = unsafe { &*self.ptr };
         let (next, block_length) = block.await_next(backoff);
 
         Self {
@@ -375,12 +371,13 @@ mod tests {
     #[test]
     fn producer_token_advances_with_the_pointer() {
         let first = Block::<()>::new_boxed(7, None);
+        let first_ptr = NonNull::from_ref(first.as_ref());
         let second = Block::<()>::new_boxed(11, None);
         let second_ptr = NonNull::from_ref(second.as_ref());
         let head = PHead {
             token: u16::MAX,
             excess: Excess(19),
-            ..PHead::from_block(first.as_ref())
+            ..PHead::from_ptr(first_ptr)
         };
 
         let advanced = head.with_block(second_ptr);

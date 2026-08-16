@@ -1,8 +1,6 @@
 #![allow(missing_docs)]
 
-#[cfg(feature = "bench_registry")]
-use crate::align;
-use crate::{ConfiguredUBQ, backoff, dynamic::DUBQ};
+use crate::{UBQ, backoff, dynamic::DUBQ};
 use concurrent_queue::{ConcurrentQueue, PopError};
 use crossbeam_queue::{BatchQueue, SegQueue};
 use crossbeam_utils::Backoff;
@@ -130,10 +128,14 @@ fn default_schedule_seed() -> u64 {
 fn default_fastfifo_capacities() -> Vec<usize> {
     vec![DEFAULT_FASTFIFO_CAPACITY]
 }
-const UBQ_POOL_VALUES: [u8; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
+// Kept in the label for compatibility with existing benchmark result tooling.
+// Static UBQ now owns one internal recycle slot and no longer exposes a pool
+// const generic.
+const UBQ_POOL_VALUES: [u8; 1] = [1];
+const DUBQ_POOL_VALUES: [u8; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
 const UBQ_BLOCK_VALUES: [u16; 8] = [31, 63, 127, 255, 511, 1023, 2047, 4095];
 const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
-const UBQ_SPARSE_POOL_VALUES: [u8; 4] = [0, 1, 8, 64];
+const DUBQ_SPARSE_POOL_VALUES: [u8; 4] = [0, 1, 8, 64];
 const UBQ_SPARSE_BLOCK_VALUES: [u16; 5] = [31, 127, 511, 2047, 4095];
 pub const DEFAULT_UBQ_BATCH_SIZES: [usize; 3] = [8, 32, 256];
 const DEFAULT_LFQUEUE_SEGMENT_SIZES: [usize; 3] = [32, 256, 1024];
@@ -427,11 +429,9 @@ impl<B: backoff::BackoffPolicy + 'static> LogQueueOps for DubqBenchQueue<LogReco
     }
 }
 
-impl<B, const POOL: usize, const BLOCK: usize, A> BenchQueueOps
-    for ConfiguredUBQ<u64, B, POOL, BLOCK, A>
+impl<B, const BLOCK: usize> BenchQueueOps for UBQ<u64, BLOCK, B>
 where
     B: backoff::BackoffPolicy + 'static,
-    A: Send + Sync + 'static,
 {
     fn try_send_value(&self, value: u64) -> bool {
         self.push(value);
@@ -451,22 +451,18 @@ where
     }
 }
 
-impl<B, const POOL: usize, const BLOCK: usize, A> BenchQueue
-    for ConfiguredUBQ<u64, B, POOL, BLOCK, A>
+impl<B, const BLOCK: usize> BenchQueue for UBQ<u64, BLOCK, B>
 where
     B: backoff::BackoffPolicy + 'static,
-    A: Send + Sync + 'static,
 {
     fn new_queue() -> Arc<Self> {
-        Arc::new(Self::new())
+        Self::new_arc()
     }
 }
 
-impl<B, const POOL: usize, const BLOCK: usize, A> LogQueueOps
-    for ConfiguredUBQ<LogRecord, B, POOL, BLOCK, A>
+impl<B, const BLOCK: usize> LogQueueOps for UBQ<LogRecord, BLOCK, B>
 where
     B: backoff::BackoffPolicy + 'static,
-    A: Send + Sync + 'static,
 {
     fn send_log(&self, record: LogRecord) {
         self.push(record);
@@ -483,14 +479,12 @@ where
     }
 }
 
-impl<B, const POOL: usize, const BLOCK: usize, A> LogQueue
-    for ConfiguredUBQ<LogRecord, B, POOL, BLOCK, A>
+impl<B, const BLOCK: usize> LogQueue for UBQ<LogRecord, BLOCK, B>
 where
     B: backoff::BackoffPolicy + 'static,
-    A: Send + Sync + 'static,
 {
     fn new_log_queue() -> Arc<Self> {
-        Arc::new(Self::new())
+        Self::new_arc()
     }
 }
 
@@ -1052,10 +1046,7 @@ impl UbqGrid {
     }
 
     pub fn labels(self) -> Vec<String> {
-        let pools: &[u8] = match self {
-            Self::Sparse => &UBQ_SPARSE_POOL_VALUES,
-            Self::Dense => &UBQ_POOL_VALUES,
-        };
+        let pools = &UBQ_POOL_VALUES;
         let blocks: &[u16] = match self {
             Self::Sparse => &UBQ_SPARSE_BLOCK_VALUES,
             Self::Dense => &UBQ_BLOCK_VALUES,
@@ -1073,8 +1064,8 @@ impl UbqGrid {
 
     pub fn dubq_labels(self) -> Vec<String> {
         let pools: &[u8] = match self {
-            Self::Sparse => &UBQ_SPARSE_POOL_VALUES,
-            Self::Dense => &UBQ_POOL_VALUES,
+            Self::Sparse => &DUBQ_SPARSE_POOL_VALUES,
+            Self::Dense => &DUBQ_POOL_VALUES,
         };
         let blocks: &[u16] = match self {
             Self::Sparse => &UBQ_SPARSE_BLOCK_VALUES,
@@ -2363,20 +2354,6 @@ pub fn normalize_ubq_label(token: &str, require_valid: bool) -> Option<String> {
         .map(|value| value.text())
 }
 
-fn immediate_domain_neighbors_u8(value: u8, domain: &[u8]) -> Vec<u8> {
-    if let Some(idx) = domain.iter().position(|candidate| *candidate == value) {
-        let mut out = Vec::new();
-        if idx > 0 {
-            out.push(domain[idx - 1]);
-        }
-        if idx + 1 < domain.len() {
-            out.push(domain[idx + 1]);
-        }
-        return out;
-    }
-    Vec::new()
-}
-
 fn immediate_domain_neighbors_u16(value: u16, domain: &[u16]) -> Vec<u16> {
     if let Some(idx) = domain.iter().position(|candidate| *candidate == value) {
         let mut out = Vec::new();
@@ -2405,28 +2382,10 @@ fn immediate_domain_neighbors_str<'a>(value: &str, domain: &'a [&str]) -> Vec<&'
     Vec::new()
 }
 
-fn pool_neighbors(value: u8) -> Vec<u8> {
-    let mut out = immediate_domain_neighbors_u8(value, &UBQ_POOL_VALUES);
-    if value != 0 && UBQ_POOL_VALUES.contains(&0) && !out.contains(&0) {
-        out.push(0);
-    }
-    out
-}
-
 fn immediate_neighbors(label: &UbqLabel, idx: usize) -> Vec<UbqLabel> {
     let mut out = Vec::new();
     match idx {
         0 => {
-            for pool in pool_neighbors(label.pool) {
-                out.push(UbqLabel {
-                    preset: label.preset.clone(),
-                    pool,
-                    block: label.block,
-                    backoff: label.backoff.clone(),
-                });
-            }
-        }
-        1 => {
             for block in immediate_domain_neighbors_u16(label.block, &UBQ_BLOCK_VALUES) {
                 out.push(UbqLabel {
                     preset: label.preset.clone(),
@@ -2436,7 +2395,7 @@ fn immediate_neighbors(label: &UbqLabel, idx: usize) -> Vec<UbqLabel> {
                 });
             }
         }
-        2 => {
+        1 => {
             for backoff in immediate_domain_neighbors_str(&label.backoff, &UBQ_BACKOFF_VALUES) {
                 out.push(UbqLabel {
                     preset: label.preset.clone(),
@@ -2455,7 +2414,7 @@ fn required_ubq_labels_for_center(label: &UbqLabel) -> BTreeSet<UbqLabel> {
     let mut required = BTreeSet::new();
     required.insert(label.clone());
 
-    for idx in 0..3 {
+    for idx in 0..2 {
         for candidate in immediate_neighbors(label, idx) {
             if is_valid_ubq_label(&candidate) {
                 required.insert(candidate);
@@ -5329,7 +5288,7 @@ fn generated_cargo_toml(repo_root: &Path) -> String {
 fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
     let mut out = String::new();
     out.push_str("use ubq::bench_harness;\n");
-    out.push_str("use ubq::{ConfiguredUBQ, align, backoff};\n\n");
+    out.push_str("use ubq::{UBQ, backoff};\n\n");
     out.push_str("fn main() {\n");
     out.push_str(
         "    let plan = bench_harness::parse_embedded_plan(PLAN_JSON).expect(\"plan\");\n",
@@ -5668,21 +5627,7 @@ fn ubq_type_expr(label: &UbqLabel, value_type: &str) -> String {
         "yield" => "backoff::Yield",
         _ => panic!("unsupported backoff {}", label.backoff),
     };
-    let align_ty = match label.block {
-        31 => "align::A64",
-        63 => "align::A128",
-        127 => "align::A256",
-        255 => "align::A512",
-        511 => "align::A1024",
-        1023 => "align::A2048",
-        2047 => "align::A4096",
-        4095 => "align::A8192",
-        _ => panic!("unsupported block size {}", label.block),
-    };
-    format!(
-        "ConfiguredUBQ<{value_type}, {backoff_ty}, {}, {}, {align_ty}>",
-        label.pool, label.block
-    )
+    format!("UBQ<{value_type}, {}, {backoff_ty}>", label.block)
 }
 
 pub fn frontier_search(config: &FrontierConfig, dry_run: bool) -> Result<(), String> {
@@ -8649,12 +8594,12 @@ mod tests {
         let sparse = UbqGrid::Sparse.labels();
         let dense = UbqGrid::Dense.labels();
 
-        assert_eq!(sparse.len(), 40);
-        assert_eq!(dense.len(), 128);
-        assert!(sparse.contains(&"balanced,0,31,crossbeam".to_string()));
-        assert!(sparse.contains(&"balanced,64,4095,yield".to_string()));
-        assert!(!sparse.contains(&"balanced,2,63,crossbeam".to_string()));
-        assert!(dense.contains(&"balanced,2,63,crossbeam".to_string()));
+        assert_eq!(sparse.len(), 10);
+        assert_eq!(dense.len(), 16);
+        assert!(sparse.contains(&"balanced,1,31,crossbeam".to_string()));
+        assert!(sparse.contains(&"balanced,1,4095,yield".to_string()));
+        assert!(!sparse.contains(&"balanced,1,63,crossbeam".to_string()));
+        assert!(dense.contains(&"balanced,1,63,crossbeam".to_string()));
     }
 
     #[test]
@@ -8727,8 +8672,8 @@ mod tests {
 
         assert_eq!(scenario_names(&sparse), scenario_names(&dense));
         assert_eq!(scenario_names(&sparse).len(), 16);
-        assert_eq!(sparse.bundles.len(), 16 * 41);
-        assert_eq!(dense.bundles.len(), 16 * 129);
+        assert_eq!(sparse.bundles.len(), 16 * 11);
+        assert_eq!(dense.bundles.len(), 16 * 17);
 
         for plan in [&sparse, &dense] {
             let specs = required_job_specs(plan);
@@ -8884,7 +8829,7 @@ mod tests {
                 .iter()
                 .filter(|bundle| bundle.ubq_label.is_some())
                 .count(),
-            40
+            10
         );
         assert_eq!(
             plan.bundles
@@ -8893,13 +8838,13 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(specs.len(), 165);
+        assert_eq!(specs.len(), 45);
         assert_eq!(
             specs
                 .iter()
                 .filter(|spec| spec.queue == QueueKind::Ubq && spec.batch_size.is_none())
                 .count(),
-            40
+            10
         );
         assert_eq!(
             specs
@@ -8921,7 +8866,7 @@ mod tests {
                 .iter()
                 .filter(|spec| spec.queue == QueueKind::Ubq && spec.batch_size.is_some())
                 .count(),
-            120
+            30
         );
         assert!(
             specs
@@ -9003,13 +8948,13 @@ mod tests {
         )
         .expect("grid plan");
 
-        assert_eq!(plan.bundles.len(), 32);
-        assert_eq!(required_job_specs(&plan).len(), 128);
+        assert_eq!(plan.bundles.len(), 8);
+        assert_eq!(required_job_specs(&plan).len(), 32);
     }
 
     #[test]
     fn batched_ubq_throughput_preserves_values_and_records_its_batch_size() {
-        type Queue = ConfiguredUBQ<u64, backoff::Crossbeam, 1, 31, crate::align::A64>;
+        type Queue = UBQ<u64, 31, backoff::Crossbeam>;
         let record =
             bench_throughput_batched_for::<Queue>("ubq", &ScenarioConfig::new(2, 2), 257, 16, 0);
 
@@ -9366,12 +9311,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_four_part_ubq_labels() {
-        let parsed = parse_ubq_label("balanced,8,127,crossbeam", true).expect("label");
+    fn parses_fixed_pool_ubq_labels() {
+        let parsed = parse_ubq_label("balanced,1,127,crossbeam", true).expect("label");
         assert_eq!(parsed.preset, "balanced");
-        assert_eq!(parsed.pool, 8);
+        assert_eq!(parsed.pool, 1);
         assert_eq!(parsed.block, 127);
         assert_eq!(parsed.backoff, "crossbeam");
+        assert!(parse_ubq_label("balanced,8,127,crossbeam", true).is_err());
     }
 
     #[test]
@@ -9485,12 +9431,12 @@ mod tests {
             false,
         )
         .expect("mixed grid");
-        assert_eq!(plan.bundles.len(), 81);
+        assert_eq!(plan.bundles.len(), 51);
         assert!(plan.bundles.iter().all(|bundle| {
             usize::from(bundle.ubq_label.is_some()) + usize::from(bundle.dubq_label.is_some()) <= 1
         }));
         let specs = required_job_specs(&plan);
-        assert_eq!(specs.len(), 324);
+        assert_eq!(specs.len(), 204);
         assert_eq!(
             specs
                 .iter()
@@ -9503,19 +9449,22 @@ mod tests {
     #[test]
     fn scenario_search_excludes_small_blocks_for_high_producer_count() {
         let scenario = ScenarioConfig::new(64, 1);
-        let labels = immediate_search_labels_for_scenario("balanced,8,127,crossbeam", &scenario)
+        let labels = immediate_search_labels_for_scenario("balanced,1,127,crossbeam", &scenario)
             .expect("scenario labels");
-        assert!(labels.contains("balanced,8,127,crossbeam"));
-        assert!(!labels.contains("balanced,8,63,crossbeam"));
+        assert!(labels.contains("balanced,1,127,crossbeam"));
+        assert!(!labels.contains("balanced,1,63,crossbeam"));
     }
 
     #[test]
-    fn scenario_search_includes_zero_pool_counterpart_for_nonzero_pool() {
+    fn scenario_search_varies_only_block_and_backoff() {
         let scenario = ScenarioConfig::new(1, 1);
-        let labels = immediate_search_labels_for_scenario("balanced,8,127,crossbeam", &scenario)
+        let labels = immediate_search_labels_for_scenario("balanced,1,127,crossbeam", &scenario)
             .expect("scenario labels");
 
-        assert!(labels.contains("balanced,0,127,crossbeam"));
+        assert!(labels.contains("balanced,1,63,crossbeam"));
+        assert!(labels.contains("balanced,1,255,crossbeam"));
+        assert!(labels.contains("balanced,1,127,yield"));
+        assert!(labels.iter().all(|label| label.starts_with("balanced,1,")));
     }
 
     #[test]
@@ -9902,7 +9851,7 @@ mod tests {
             PathBuf::from(DEFAULT_RUNS_DIR),
             128,
             &[QueueKind::Ubq],
-            &["balanced,8,63,crossbeam".to_string()],
+            &["balanced,1,63,crossbeam".to_string()],
             &[],
             &[],
             &[],
@@ -10406,7 +10355,7 @@ mod tests {
             fastfifo_block_sizes: Vec::new(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
+            seed_labels: vec!["balanced,1,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 2,
@@ -10499,7 +10448,7 @@ mod tests {
                     repeat_index,
                     mode: Mode::Throughput,
                     items_per_producer: 1,
-                    queue_label: "ubq_balanced,8,127,crossbeam".to_string(),
+                    queue_label: "ubq_balanced,1,127,crossbeam".to_string(),
                     batch_size: None,
                 },
                 BenchRecord {
@@ -10538,7 +10487,7 @@ mod tests {
             fastfifo_block_sizes: Vec::new(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
+            seed_labels: vec!["balanced,1,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 2,
@@ -10548,12 +10497,7 @@ mod tests {
         assert!(
             plan.bundles
                 .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,yield"))
-        );
-        assert!(
-            plan.bundles
-                .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,0,127,crossbeam"))
+                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,1,127,yield"))
         );
     }
 
@@ -10638,7 +10582,7 @@ mod tests {
                     repeat_index,
                     mode: Mode::Throughput,
                     items_per_producer: 1,
-                    queue_label: "ubq_balanced,8,127,crossbeam".to_string(),
+                    queue_label: "ubq_balanced,1,127,crossbeam".to_string(),
                     batch_size: None,
                 },
                 BenchRecord {
@@ -10677,7 +10621,7 @@ mod tests {
             fastfifo_block_sizes: Vec::new(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
+            seed_labels: vec!["balanced,1,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 2,
@@ -10687,7 +10631,7 @@ mod tests {
         assert!(
             plan.bundles
                 .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,8,127,yield"))
+                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,1,127,yield"))
         );
     }
 
@@ -10701,7 +10645,7 @@ mod tests {
             fastfifo_block_sizes: Vec::new(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,8,63,crossbeam".to_string()],
+            seed_labels: vec!["balanced,1,63,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 1,
@@ -10718,7 +10662,7 @@ mod tests {
     fn frontier_runs_local_winner_across_all_scenarios() {
         let winner_scenario = ScenarioConfig::new(1, 1);
         let other_scenario = ScenarioConfig::new(1, 4);
-        let winning_label = "balanced,8,127,crossbeam";
+        let winning_label = "balanced,1,127,crossbeam";
         let mut index = ExistingRunsIndex::default();
 
         for repeat_index in 1..=2 {
@@ -10862,7 +10806,7 @@ mod tests {
     fn frontier_does_not_propagate_winner_invalid_for_scenario() {
         let winner_scenario = ScenarioConfig::new(1, 1);
         let constrained_scenario = ScenarioConfig::new(64, 1);
-        let winning_label = "balanced,8,31,crossbeam";
+        let winning_label = "balanced,1,31,crossbeam";
         let mut index = ExistingRunsIndex::default();
 
         for repeat_index in 1..=2 {
@@ -10981,7 +10925,7 @@ mod tests {
             fastfifo_block_sizes: Vec::new(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,8,127,crossbeam".to_string()],
+            seed_labels: vec!["balanced,1,127,crossbeam".to_string()],
             modes: vec![Mode::Throughput],
             items_per_producer_values: vec![1],
             repeats: 2,

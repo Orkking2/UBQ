@@ -5,9 +5,9 @@ use std::{
     },
     thread,
 };
-use ubq::{ConfiguredUBQ, align, backoff};
+use ubq::{UBQ, backoff};
 
-type TinyQueue<T> = ConfiguredUBQ<T, backoff::Crossbeam, 2, 7, align::A64>;
+type TinyQueue<T> = UBQ<T, 7, backoff::Crossbeam>;
 
 #[test]
 fn empty_zero_and_oversized_requests_stop_at_the_producer_frontier() {

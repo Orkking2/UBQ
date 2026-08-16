@@ -10,8 +10,8 @@ RBBQ_BLOCK_SIZE="${RBBQ_BLOCK_SIZE:-64}"
 UBQ_VARIANTS="${UBQ_VARIANTS:-default}"
 KEEP_WORKDIR=0
 
-DEFAULT_UBQ_VARIANTS="balanced,8,127,crossbeam"
-SWEEP_UBQ_VARIANTS="balanced,0,127,crossbeam;balanced,4,127,crossbeam;balanced,8,63,crossbeam;balanced,8,127,crossbeam;balanced,8,255,crossbeam;balanced,16,127,crossbeam;balanced,32,127,crossbeam;balanced,8,31,crossbeam;balanced,8,511,crossbeam;balanced,8,127,yield"
+DEFAULT_UBQ_VARIANTS="balanced,1,127,crossbeam"
+SWEEP_UBQ_VARIANTS="balanced,1,63,crossbeam;balanced,1,127,crossbeam;balanced,1,255,crossbeam;balanced,1,31,crossbeam;balanced,1,511,crossbeam;balanced,1,127,yield"
 
 log() {
   printf '[disruptor-jni] %s\n' "$*" >&2
@@ -72,7 +72,7 @@ Options:
 
 UBQ variant labels use commas, so explicit lists must be separated with
 semicolons, for example:
-  --ubq-variants 'balanced,8,63,crossbeam;balanced,8,127,crossbeam'
+  --ubq-variants 'balanced,1,63,crossbeam;balanced,1,127,crossbeam'
 USAGE
 }
 

@@ -1,5 +1,4 @@
 use std::{
-    fmt::Debug,
     hint::black_box,
     println,
     sync::{
@@ -11,7 +10,7 @@ use std::{
     vec::Vec,
 };
 
-use crate::{ConfiguredUBQ, DEFAULT_BLOCK_SIZE, UBQ, align, backoff, ubq};
+use crate::{DEFAULT_BLOCK_SIZE, UBQ, backoff};
 
 #[test]
 fn drop_releases_all_enqueued_values() {
@@ -19,7 +18,7 @@ fn drop_releases_all_enqueued_values() {
     let n = (DEFAULT_BLOCK_SIZE * 3) + 7;
 
     for _ in 0..16 {
-        let q = UBQ::new();
+        let q = UBQ::<Arc<()>>::new();
 
         for _ in 0..n {
             q.push(token.clone());
@@ -37,7 +36,7 @@ fn drop_releases_all_enqueued_values() {
 
 #[test]
 fn fill_drain_ordered() {
-    let q = UBQ::new();
+    let q = UBQ::<i32>::new();
 
     let m = 1_000_000;
     for i in 0..m {
@@ -51,7 +50,7 @@ fn fill_drain_ordered() {
 
 #[test]
 fn refill_drain_recycled_blocks() {
-    let q = UBQ::new();
+    let q = UBQ::<(usize, usize)>::new();
     let per_round = DEFAULT_BLOCK_SIZE * 3 + 17;
 
     for round in 0..64 {
@@ -77,7 +76,7 @@ fn refill_drain_recycled_blocks() {
 // Warm up before running tests.
 // Look for better benchmarkers.
 fn mpmc() {
-    let q = UBQ::new_arc();
+    let q = UBQ::<u8>::new_arc();
     // let q = Arc::new(SegQueue::new());
 
     let flag = Arc::new(AtomicBool::new(true));
@@ -138,8 +137,8 @@ fn mpmc() {
 }
 
 #[test]
-fn configured_queue_supports_non_default_pool_and_preset_block() {
-    let q = ConfiguredUBQ::<u64, backoff::Crossbeam, 8, 127, align::A256>::new();
+fn configured_queue_supports_non_default_block() {
+    let q = UBQ::<u64, 127>::new();
 
     for i in 0..10_000 {
         q.push(i);
@@ -153,12 +152,8 @@ fn configured_queue_supports_non_default_pool_and_preset_block() {
 }
 
 #[test]
-fn configured_queue_supports_arbitrary_block_with_explicit_alignment() {
-    #[repr(align(1024))]
-    #[derive(Clone, Copy, Debug, Default)]
-    struct A1024;
-
-    let q = ConfiguredUBQ::<u64, backoff::Crossbeam, 2, 100, A1024>::new();
+fn configured_queue_supports_arbitrary_block() {
+    let q = UBQ::<u64, 100>::new();
 
     for i in 0..2_000 {
         q.push(i);
@@ -172,37 +167,23 @@ fn configured_queue_supports_arbitrary_block_with_explicit_alignment() {
 }
 
 #[test]
-fn ubq_macro_defaults_to_public_alias() {
-    let q: ConfiguredUBQ<u64> = ubq!(type: u64);
+fn default_queue_uses_public_ubq_type() {
+    let q = UBQ::<u64>::new();
     q.push(9);
     assert_eq!(q.pop(), Some(9));
 }
 
 #[test]
-fn ubq_macro_applies_explicit_overrides() {
-    let q: ConfiguredUBQ<u64, backoff::Yield, 2, 127, align::A256> = ubq!(
-        type: u64,
-        backoff: backoff::Yield,
-        pool: 2,
-        block: 127,
-    );
+fn queue_accepts_explicit_block_and_backoff() {
+    let q = UBQ::<u64, 127, backoff::Yield>::new();
 
     q.push(11);
     assert_eq!(q.pop(), Some(11));
 }
 
 #[test]
-fn ubq_macro_supports_custom_alignment_override() {
-    #[repr(align(1024))]
-    #[derive(Clone, Copy, Debug, Default)]
-    struct A1024;
-
-    let q: ConfiguredUBQ<u64, backoff::Crossbeam, 4, 100, A1024> = ubq!(
-        type: u64,
-        pool: 4,
-        block: 100,
-        align: A1024,
-    );
+fn queue_arc_constructor_uses_explicit_configuration() {
+    let q = UBQ::<u64, 100, backoff::Crossbeam>::new_arc();
 
     q.push(13);
     assert_eq!(q.pop(), Some(13));
@@ -212,7 +193,7 @@ fn ubq_macro_supports_custom_alignment_override() {
 // UBQ: 5.15s
 #[test]
 fn push_test() {
-    let q = UBQ::new_arc();
+    let q = UBQ::<i32>::new_arc();
     // let q = Arc::new(SegQueue::new());
 
     let epoch = Instant::now();

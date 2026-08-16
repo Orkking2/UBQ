@@ -11,23 +11,19 @@ import java.lang.ref.Cleaner;
  * dominated by one JNI transition per event.</p>
  */
 public final class UbqLongQueue implements AutoCloseable {
-    public static final String DEFAULT_NATIVE_VARIANT = "balanced,8,127,crossbeam";
+    public static final String DEFAULT_NATIVE_VARIANT = "balanced,1,127,crossbeam";
 
     /** @deprecated use {@link #DEFAULT_NATIVE_VARIANT}. */
     @Deprecated
     public static final String NATIVE_VARIANT = DEFAULT_NATIVE_VARIANT;
 
     public static final String[] NATIVE_VARIANTS = {
-            "balanced,0,127,crossbeam",
-            "balanced,4,127,crossbeam",
-            "balanced,8,63,crossbeam",
-            "balanced,8,127,crossbeam",
-            "balanced,8,255,crossbeam",
-            "balanced,16,127,crossbeam",
-            "balanced,32,127,crossbeam",
-            "balanced,8,31,crossbeam",
-            "balanced,8,511,crossbeam",
-            "balanced,8,127,yield",
+            "balanced,1,63,crossbeam",
+            "balanced,1,127,crossbeam",
+            "balanced,1,255,crossbeam",
+            "balanced,1,31,crossbeam",
+            "balanced,1,511,crossbeam",
+            "balanced,1,127,yield",
     };
 
     private static final Cleaner CLEANER = Cleaner.create();

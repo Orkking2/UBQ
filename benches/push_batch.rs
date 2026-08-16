@@ -86,7 +86,7 @@ fn run_table(label: &str, items: usize, samples: usize, producers: usize) {
 
 fn measure(items: usize, producers: usize, mode: PushMode) -> Duration {
     if producers == 1 {
-        let queue = UBQ::new();
+        let queue = UBQ::<usize>::new();
         let start = Instant::now();
         push_range(&queue, 0, items, mode);
         let elapsed = start.elapsed();
@@ -94,7 +94,7 @@ fn measure(items: usize, producers: usize, mode: PushMode) -> Duration {
         return elapsed;
     }
 
-    let queue = Arc::new(UBQ::new());
+    let queue = UBQ::<usize>::new_arc();
     let start_barrier = Arc::new(Barrier::new(producers + 1));
     let workers = (0..producers)
         .map(|producer| {

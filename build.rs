@@ -1,22 +1,12 @@
 use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
 
-// (preset, pool_values)
-const PRESET_INFO: &[(&str, &[u8])] = &[
-    // pool=0 gives no-pool behaviour; non-zero values enable block recycling.
-    ("balanced", &[0, 1, 2, 4, 8, 16, 32, 64]),
-];
+// The public label retains a fixed `1` in the former pool position so existing
+// result-processing tools can distinguish static UBQ from runtime-configured
+// DUBQ. UBQ now owns its single-block recycle slot internally.
+const PRESET_INFO: &[(&str, &[u8])] = &[("balanced", &[1])];
 
-const BLOCK_ALIGN: &[(u16, &str)] = &[
-    (31, "align::A64"),
-    (63, "align::A128"),
-    (127, "align::A256"),
-    (255, "align::A512"),
-    (511, "align::A1024"),
-    (1023, "align::A2048"),
-    (2047, "align::A4096"),
-    (4095, "align::A8192"),
-];
+const BLOCK_INFO: &[u16] = &[31, 63, 127, 255, 511, 1023, 2047, 4095];
 
 const BACKOFF_INFO: &[(&str, &str)] = &[
     ("crossbeam", "backoff::Crossbeam"),
@@ -62,14 +52,11 @@ fn main() {
 
     for &(preset, pool_values) in PRESET_INFO {
         for &pool in pool_values {
-            for &(block, align_ty) in BLOCK_ALIGN {
+            for &block in BLOCK_INFO {
                 for &(backoff_name, backoff_ty) in BACKOFF_INFO {
                     let label_str = format!("{},{},{},{}", preset, pool, block, backoff_name);
-                    let value_type_expr =
-                        format!("ConfiguredUBQ<u64, {backoff_ty}, {pool}, {block}, {align_ty}>");
-                    let log_type_expr = format!(
-                        "ConfiguredUBQ<LogRecord, {backoff_ty}, {pool}, {block}, {align_ty}>"
-                    );
+                    let value_type_expr = format!("UBQ<u64, {block}, {backoff_ty}>");
+                    let log_type_expr = format!("UBQ<LogRecord, {block}, {backoff_ty}>");
                     writeln!(
                         code,
                         "        {:?} => Some(make_ubq_job_factory::<{value_type_expr}, {log_type_expr}>(label, scenario, repeat_index, mode, items_per_producer, batch_size)),",

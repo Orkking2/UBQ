@@ -4,7 +4,7 @@ use crate::{
         atomic_int::AtomicInt,
         block::Block,
         heads::{CHead, Excess, MAX_BLOCK_LENGTH, PHead},
-        util::{new_filled_box_slice, usize_as_u16_or_MAX},
+        util::{new_filled_box_slice, usize_as_u16_or_max},
     },
 };
 use alloc::{boxed::Box, sync::Arc};
@@ -370,7 +370,7 @@ impl<T> DUBQ<T> {
 
             remaining -= available;
 
-            let block = unsafe { end.ptr.as_ref_unchecked() };
+            let block = unsafe { &*end.ptr };
             let next = NonNull::new(block.next().load(Ordering::Acquire)).unwrap_or_else(|| {
                 // A null link means the private extension becomes part of the
                 // queue here. Add all of its capacity before entering its first
@@ -434,7 +434,7 @@ impl<T> DUBQ<T> {
     /// this function returns.
     fn reserve_batch<B: BackoffPolicy>(&self, len: usize) -> PHead<T> {
         let backoff = B::new();
-        let len16 = usize_as_u16_or_MAX(len);
+        let len16 = usize_as_u16_or_max(len);
 
         let mut ext = None;
         let mut obs = self.acquire_phead();
@@ -529,12 +529,7 @@ impl<T> DUBQ<T> {
         // writing to this slot afterwards.
 
         for _ in 0..len {
-            let slot = unsafe {
-                cursor
-                    .ptr
-                    .as_ref_unchecked()
-                    .get_slot_unchecked(cursor.index as usize)
-            };
+            let slot = unsafe { (&*cursor.ptr).get_slot_unchecked(cursor.index as usize) };
 
             cursor.index += 1;
             left -= 1;
@@ -780,7 +775,7 @@ impl<T> DUBQ<T> {
         }
 
         let backoff = B::new();
-        let request16 = usize_as_u16_or_MAX(request);
+        let request16 = usize_as_u16_or_max(request);
 
         let (start, marker) = self.claim_pop_batch(request16, &backoff)?;
 
@@ -856,7 +851,7 @@ impl<'a, T, B: BackoffPolicy> Iterator for DUBQIter<'a, T, B> {
 
         while !self.start.full_addr_eq(&self.end) {
             let block_ptr = self.start.ptr;
-            let block = unsafe { block_ptr.as_ref_unchecked() };
+            let block = unsafe { &*block_ptr };
 
             let out = unsafe {
                 block

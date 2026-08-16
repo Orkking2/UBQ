@@ -7,16 +7,12 @@ against `OneToOneThroughputTest`, `ThreeToOneThroughputTest`, and
 
 The adapter exports a small static registry of native UBQ variants:
 
-- `balanced,0,127,crossbeam`
-- `balanced,4,127,crossbeam`
-- `balanced,8,63,crossbeam`
-- `balanced,8,127,crossbeam`
-- `balanced,8,255,crossbeam`
-- `balanced,16,127,crossbeam`
-- `balanced,32,127,crossbeam`
-- `balanced,8,31,crossbeam`
-- `balanced,8,511,crossbeam`
-- `balanced,8,127,yield`
+- `balanced,1,63,crossbeam`
+- `balanced,1,127,crossbeam`
+- `balanced,1,255,crossbeam`
+- `balanced,1,31,crossbeam`
+- `balanced,1,511,crossbeam`
+- `balanced,1,127,yield`
 
 Each measured queue still uses a monomorphic Rust queue type inside the native
 hot loop. The Java wrapper selects one variant when the native handle is
@@ -48,7 +44,7 @@ The Java wrapper lives under `bindings/disruptor-jni/src/main/java`:
 - `ubq.jni.RbbqLongQueue`: primitive wrapper for `rbbq::FastFifo`, available
   when `libubq` is built with `bench_fastfifo`.
 
-`UbqLongQueue` defaults to `balanced,8,127,crossbeam`. Select another supported
+`UbqLongQueue` defaults to `balanced,1,127,crossbeam`. Select another supported
 variant with `-Dubq.jni.ubqVariant=<label>` or by constructing
 `new UbqLongQueue("<label>")`.
 
@@ -80,7 +76,7 @@ logs plus CSV summaries:
 scripts/run_disruptor_jni_bench.sh --queue ubq,rbbq
 ```
 
-The default UBQ run uses `balanced,8,127,crossbeam`. Use
+The default UBQ run uses `balanced,1,127,crossbeam`. Use
 `--ubq-variants sweep` to run every configured UBQ variant:
 
 ```bash
@@ -93,7 +89,7 @@ commas:
 ```bash
 scripts/run_disruptor_jni_bench.sh \
   --queue ubq \
-  --ubq-variants 'balanced,8,63,crossbeam;balanced,8,127,crossbeam'
+  --ubq-variants 'balanced,1,63,crossbeam;balanced,1,127,crossbeam'
 ```
 
 Use `--queue all` to include the official Disruptor sequenced baseline. Results
@@ -145,17 +141,17 @@ git apply /path/to/UBQ/bindings/disruptor-jni/lmax-native-queue-adapter.patch
 ./gradlew perftestClasses
 java \
   -Djava.library.path=/path/to/UBQ/target/release \
-  -Dubq.jni.ubqVariant=balanced,8,127,crossbeam \
+  -Dubq.jni.ubqVariant=balanced,1,127,crossbeam \
   -cp build/classes/java/main:build/classes/java/test:build/classes/java/perftest \
   com.lmax.disruptor.queue.OneToOneQueueThroughputTest
 java \
   -Djava.library.path=/path/to/UBQ/target/release \
-  -Dubq.jni.ubqVariant=balanced,8,127,crossbeam \
+  -Dubq.jni.ubqVariant=balanced,1,127,crossbeam \
   -cp build/classes/java/main:build/classes/java/test:build/classes/java/perftest \
   com.lmax.disruptor.queue.ThreeToOneQueueThroughputTest
 java \
   -Djava.library.path=/path/to/UBQ/target/release \
-  -Dubq.jni.ubqVariant=balanced,8,127,crossbeam \
+  -Dubq.jni.ubqVariant=balanced,1,127,crossbeam \
   -cp build/classes/java/main:build/classes/java/test:build/classes/java/perftest \
   com.lmax.disruptor.queue.OneToThreeQueueThroughputTest
 ```

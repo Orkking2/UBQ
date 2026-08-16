@@ -83,7 +83,7 @@ Example direct run:
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_matrix -- \
   --machine-label local \
   --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
-  --ubq-label balanced,8,127,crossbeam \
+  --ubq-label balanced,1,127,crossbeam \
   --scenarios bbq-atc22-x86-88t \
   --modes throughput,complex_throughput,data_latency,fairness \
   --items-per-producer 1000000 \
@@ -96,7 +96,7 @@ Example oversubscription run on a 12-hyperthread machine:
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_matrix -- \
   --machine-label x86-12t \
   --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue \
-  --ubq-label balanced,8,127,crossbeam \
+  --ubq-label balanced,1,127,crossbeam \
   --scenarios bbq-atc22-oversub-x86-12t \
   --modes throughput,complex_throughput \
   --items-per-producer 1000000 \

@@ -991,12 +991,15 @@ def strict_immediate_winner_ubq_labels(entries, scenario=None):
     winner = max(parsed.keys(), key=lambda label: entries[label]["mean_ops_per_sec"])
     winner_params = parsed[winner]
     required_params = {winner_params}
+    historical_pool_sweep = any(params[1] != 1 for params in parsed.values())
 
     for idx, winner_value in enumerate(winner_params):
         ordered_values = UBQ_IMMEDIATE_DIMS.get(idx)
         if ordered_values is None:
             continue
         if idx == 1:
+            if not historical_pool_sweep:
+                continue
             neighbor_values = pool_neighbors(winner_value, ordered_values)
         else:
             neighbor_values = immediate_domain_neighbors(winner_value, ordered_values)
@@ -2052,6 +2055,160 @@ def throughput_speedup_rows(entries_by_scenario):
     return rows
 
 
+def percentile(values, fraction: float):
+    """Return a linearly interpolated percentile for a non-empty value list."""
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def pool_size_effect_observations(entries_by_scenario, mode: str = "throughput"):
+    """Build matched UBQ observations relative to an otherwise-identical pool=0.
+
+    The comparison key includes scenario, block size, backoff, sync mode, and,
+    for batched UBQ, batch size. This keeps every queue knob except pool size
+    fixed. Relative performance is oriented so values above 1 are always better.
+    """
+    observations = []
+    for scenario in sorted(entries_by_scenario, key=scenario_sort_key):
+        entries = entries_by_scenario[scenario]
+        candidates = []
+        no_pool_by_key = {}
+        threads = parse_scenario_threads(scenario)
+        producers, consumers = threads if threads is not None else (None, None)
+
+        for label, stats in entries.items():
+            batched = parse_batched_ubq_label(label)
+            if batched is not None:
+                batch_size, params = batched
+                method = "batched"
+            else:
+                params = parse_ubq_variant(label)
+                if params is None:
+                    continue
+                batch_size = None
+                method = "scalar"
+
+            if not ubq_params_valid_for_scenario(params, scenario):
+                continue
+            value = mean_value(stats)
+            if not finite_positive(value):
+                continue
+
+            version, pool_size, block_size, backoff = params[:4]
+            sync = params[4] if len(params) >= 5 else "cas"
+            match_key = (method, batch_size, version, block_size, backoff, sync)
+            candidate = {
+                "scenario": scenario,
+                "producers": producers,
+                "consumers": consumers,
+                "method": method,
+                "batch_size": batch_size,
+                "version": version,
+                "pool_size": pool_size,
+                "block_size": block_size,
+                "backoff": backoff_display_name(backoff),
+                "sync": sync,
+                "queue": label,
+                "metric_value": value,
+                "stats": stats,
+                "match_key": match_key,
+            }
+            candidates.append(candidate)
+            if pool_size == 0:
+                no_pool_by_key[match_key] = candidate
+
+        for candidate in candidates:
+            reference = no_pool_by_key.get(candidate["match_key"])
+            if reference is None:
+                continue
+            measured = candidate["metric_value"]
+            no_pool = reference["metric_value"]
+            relative_performance = (
+                no_pool / measured if metric_lower_is_better(mode) else measured / no_pool
+            )
+            stats = candidate["stats"]
+            reference_stats = reference["stats"]
+            authoritative = stats.get("authoritative", True) and reference_stats.get(
+                "authoritative", True
+            )
+            provisional = stats.get("provisional", False) or reference_stats.get(
+                "provisional", False
+            )
+            observations.append(
+                {
+                    key: value
+                    for key, value in candidate.items()
+                    if key not in ("stats", "match_key")
+                }
+                | {
+                    "no_pool_queue": reference["queue"],
+                    "no_pool_metric_value": no_pool,
+                    "relative_performance_vs_pool0": relative_performance,
+                    "authoritative": authoritative,
+                    "provisional": provisional or not authoritative,
+                }
+            )
+
+    return observations
+
+
+def pool_size_effect_rows(entries_by_scenario, mode: str = "throughput"):
+    """Summarize matched pool-size observations by scenario and method."""
+    grouped = {}
+    for observation in pool_size_effect_observations(entries_by_scenario, mode):
+        key = (
+            observation["scenario"],
+            observation["method"],
+            observation["pool_size"],
+        )
+        grouped.setdefault(key, []).append(observation)
+
+    rows = []
+    for (scenario, method, pool_size), observations in grouped.items():
+        ratios = [row["relative_performance_vs_pool0"] for row in observations]
+        batch_sizes = sorted(
+            {row["batch_size"] for row in observations if row["batch_size"] is not None}
+        )
+        eligible = sum(not row["provisional"] for row in observations)
+        rows.append(
+            {
+                "scenario": scenario,
+                "producers": observations[0]["producers"],
+                "consumers": observations[0]["consumers"],
+                "method": method,
+                "batch_sizes": ",".join(str(size) for size in batch_sizes),
+                "pool_size": pool_size,
+                "matched_configurations": len(observations),
+                "eligible_configurations": eligible,
+                "median_relative_performance_vs_pool0": statistics.median(ratios),
+                "p25_relative_performance_vs_pool0": percentile(ratios, 0.25),
+                "p75_relative_performance_vs_pool0": percentile(ratios, 0.75),
+                "min_relative_performance_vs_pool0": min(ratios),
+                "max_relative_performance_vs_pool0": max(ratios),
+                "beneficial_fraction": sum(ratio > 1.0 for ratio in ratios) / len(ratios),
+                "claim_status": "eligible" if eligible == len(observations) else "provisional",
+            }
+        )
+
+    method_order = {"scalar": 0, "batched": 1}
+    return sorted(
+        rows,
+        key=lambda row: (
+            method_order.get(row["method"], 99),
+            scenario_sort_key(row["scenario"]),
+            row["pool_size"],
+        ),
+    )
+
+
 def write_throughput_speedup_csv(out_path: Path, rows):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8", newline="") as f:
@@ -2087,6 +2244,85 @@ def write_throughput_speedup_csv(out_path: Path, rows):
                     f"{row['speedup']:.6f}",
                 ]
             )
+    return out_path
+
+
+def write_pool_size_observations_csv(out_path: Path, observations, mode: str = "throughput"):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "scenario",
+                "producers",
+                "consumers",
+                "method",
+                "batch_size",
+                "pool_size",
+                "block_size",
+                "backoff",
+                "sync",
+                "queue",
+                f"pool_{metric_column(mode)}",
+                "no_pool_queue",
+                f"no_pool_{metric_column(mode)}",
+                "relative_performance_vs_pool0",
+                "authoritative",
+                "claim_status",
+            ]
+        )
+        for row in observations:
+            writer.writerow(
+                [
+                    row["scenario"],
+                    row["producers"] if row["producers"] is not None else "",
+                    row["consumers"] if row["consumers"] is not None else "",
+                    row["method"],
+                    row["batch_size"] if row["batch_size"] is not None else "",
+                    row["pool_size"],
+                    row["block_size"],
+                    row["backoff"],
+                    row["sync"],
+                    row["queue"],
+                    f"{row['metric_value']:.6f}",
+                    row["no_pool_queue"],
+                    f"{row['no_pool_metric_value']:.6f}",
+                    f"{row['relative_performance_vs_pool0']:.6f}",
+                    "yes" if row["authoritative"] else "no",
+                    "provisional" if row["provisional"] else "eligible",
+                ]
+            )
+    return out_path
+
+
+def write_pool_size_effect_csv(out_path: Path, rows):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "scenario",
+        "producers",
+        "consumers",
+        "method",
+        "batch_sizes",
+        "pool_size",
+        "matched_configurations",
+        "eligible_configurations",
+        "median_relative_performance_vs_pool0",
+        "p25_relative_performance_vs_pool0",
+        "p75_relative_performance_vs_pool0",
+        "min_relative_performance_vs_pool0",
+        "max_relative_performance_vs_pool0",
+        "beneficial_fraction",
+        "claim_status",
+    ]
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            output = dict(row)
+            for field in fields:
+                if "relative_performance" in field or field == "beneficial_fraction":
+                    output[field] = f"{row[field]:.6f}"
+            writer.writerow(output)
     return out_path
 
 
@@ -2461,6 +2697,126 @@ def plot_throughput_speedup_grid(
         colorbar.set_ticks(ticks)
         colorbar.set_ticklabels([f"{2 ** tick:g}x" for tick in ticks])
         colorbar.set_label("UBQ speedup")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def plot_pool_size_effect(
+    plt, out_path: Path, machine: str, entries_by_scenario, coverage=None
+):
+    """Plot median matched UBQ performance relative to pool=0."""
+    rows = pool_size_effect_rows(entries_by_scenario, "throughput")
+    methods = [
+        method
+        for method in ("scalar", "batched")
+        if any(row["method"] == method and row["pool_size"] != 0 for row in rows)
+    ]
+    if not methods:
+        return False
+
+    scenarios = sorted(
+        {row["scenario"] for row in rows}, key=scaling_scenario_sort_key
+    )
+    pool_sizes = sorted({row["pool_size"] for row in rows})
+    if not scenarios or len(pool_sizes) < 2:
+        return False
+
+    by_cell = {
+        (row["method"], row["scenario"], row["pool_size"]): row for row in rows
+    }
+    finite_logs = [
+        math.log2(row["median_relative_performance_vs_pool0"])
+        for row in rows
+        if finite_positive(row["median_relative_performance_vs_pool0"])
+    ]
+    if not finite_logs:
+        return False
+
+    from matplotlib.colors import TwoSlopeNorm
+
+    limit = max(0.1, max(abs(value) for value in finite_logs))
+    norm = TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
+    cmap = plt.get_cmap("RdYlGn").copy()
+    cmap.set_bad("#f2f2f2")
+
+    width = max(8.0, len(methods) * (2.8 + 0.72 * len(pool_sizes)))
+    height = max(5.8, 2.8 + 0.52 * len(scenarios))
+    fig, axes = plt.subplots(1, len(methods), figsize=(width, height), squeeze=False)
+    axes = list(axes[0])
+    image = None
+    text_threshold = limit * 0.55
+
+    for ax, method in zip(axes, methods):
+        matrix = []
+        for scenario in scenarios:
+            matrix_row = []
+            for pool_size in pool_sizes:
+                row = by_cell.get((method, scenario, pool_size))
+                ratio = row["median_relative_performance_vs_pool0"] if row else None
+                matrix_row.append(math.log2(ratio) if finite_positive(ratio) else float("nan"))
+            matrix.append(matrix_row)
+
+        image = ax.imshow(matrix, cmap=cmap, norm=norm, origin="upper", aspect="auto")
+        pool_labels = ["0\n(no pool)" if size == 0 else str(size) for size in pool_sizes]
+        ax.set_xticks(range(len(pool_sizes)), pool_labels)
+        ax.set_yticks(range(len(scenarios)), scenarios)
+        ax.set_xlabel("Retained blocks (pool size)")
+        ax.set_ylabel("Scenario")
+        ax.set_title("Scalar UBQ" if method == "scalar" else "Batched UBQ")
+        ax.set_xticks([idx - 0.5 for idx in range(1, len(pool_sizes))], minor=True)
+        ax.set_yticks([idx - 0.5 for idx in range(1, len(scenarios))], minor=True)
+        ax.grid(which="minor", color="white", linestyle="-", linewidth=1.0)
+        ax.tick_params(which="minor", bottom=False, left=False)
+
+        for y_idx, scenario in enumerate(scenarios):
+            for x_idx, pool_size in enumerate(pool_sizes):
+                row = by_cell.get((method, scenario, pool_size))
+                if row is None:
+                    text = "n/a"
+                    color = "#666666"
+                else:
+                    ratio = row["median_relative_performance_vs_pool0"]
+                    log_ratio = math.log2(ratio)
+                    text = f"{format_speedup_label(ratio)}\nn={row['matched_configurations']}"
+                    color = "white" if abs(log_ratio) >= text_threshold else "black"
+                ax.text(
+                    x_idx,
+                    y_idx,
+                    text,
+                    ha="center",
+                    va="center",
+                    fontsize=7.5,
+                    color=color,
+                )
+
+    fig.suptitle(
+        f"{machine_display_label(machine)}: UBQ pool-size effect vs no pool",
+        fontsize=14,
+    )
+    fig.text(
+        0.5,
+        0.015,
+        "Cells are medians of matched ratios with block size, backoff, and batch size fixed; "
+        ">1x favors pooling.",
+        ha="center",
+        fontsize=9,
+    )
+    annotate_figure_grid_coverage(fig, coverage or grid_coverage_report(None, "throughput"))
+    fig.subplots_adjust(top=0.86, bottom=0.13, right=0.87, wspace=0.28)
+    if image is not None:
+        colorbar = fig.colorbar(image, ax=axes, fraction=0.028, pad=0.035)
+        colorbar.set_ticks([-limit, 0.0, limit])
+        colorbar.set_ticklabels(
+            [
+                format_speedup_label(2 ** -limit),
+                "1x",
+                format_speedup_label(2**limit),
+            ]
+        )
+        colorbar.set_label("Relative performance vs pool=0")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
@@ -3012,6 +3368,32 @@ def main():
         entries_by_scenario = grouped[machine].get("throughput")
         if not entries_by_scenario:
             continue
+        pool_observations = pool_size_effect_observations(entries_by_scenario)
+        pool_rows = pool_size_effect_rows(entries_by_scenario)
+        if pool_rows and any(row["pool_size"] != 0 for row in pool_rows):
+            matched_csv_path = (
+                out_root
+                / machine
+                / "csv"
+                / "throughput"
+                / "pool_size_matched_throughput.csv"
+            )
+            write_pool_size_observations_csv(matched_csv_path, pool_observations)
+            print(f"Wrote CSV: {matched_csv_path}")
+            effect_csv_path = (
+                out_root
+                / machine
+                / "csv"
+                / "throughput"
+                / "pool_size_effect_throughput.csv"
+            )
+            write_pool_size_effect_csv(effect_csv_path, pool_rows)
+            print(f"Wrote CSV: {effect_csv_path}")
+
+    for machine in sorted(grouped):
+        entries_by_scenario = grouped[machine].get("throughput")
+        if not entries_by_scenario:
+            continue
         scenarios = sorted(entries_by_scenario, key=scaling_scenario_sort_key)
         for family, selected_scenarios in batch_comparison_scenario_groups(scenarios):
             if len(selected_scenarios) < 2:
@@ -3073,13 +3455,6 @@ def main():
         entries_by_scenario = grouped[machine].get("throughput")
         if not entries_by_scenario:
             continue
-        speedup_rows = throughput_speedup_rows(entries_by_scenario)
-        if not speedup_rows:
-            continue
-        csv_path = out_root / machine / "csv" / "throughput" / "ubq_speedup_grid_throughput.csv"
-        write_throughput_speedup_csv(csv_path, speedup_rows)
-        print(f"Wrote CSV: {csv_path}")
-        png_path = out_root / machine / "throughput" / "ubq_speedup_grid_throughput.png"
         coverage = aggregate_grid_coverage(
             [
                 grid_coverage.get((machine, "throughput", scenario))
@@ -3087,6 +3462,19 @@ def main():
             ],
             "throughput",
         )
+        pool_png_path = out_root / machine / "throughput" / "pool_size_effect_throughput.png"
+        if plot_pool_size_effect(
+            plt, pool_png_path, machine, entries_by_scenario, coverage
+        ):
+            print(f"Wrote PNG: {pool_png_path}")
+
+        speedup_rows = throughput_speedup_rows(entries_by_scenario)
+        if not speedup_rows:
+            continue
+        csv_path = out_root / machine / "csv" / "throughput" / "ubq_speedup_grid_throughput.csv"
+        write_throughput_speedup_csv(csv_path, speedup_rows)
+        print(f"Wrote CSV: {csv_path}")
+        png_path = out_root / machine / "throughput" / "ubq_speedup_grid_throughput.png"
         if plot_throughput_speedup_grid(
             plt, png_path, machine, entries_by_scenario, coverage
         ):

@@ -1,4 +1,4 @@
-use crate::{ConfiguredUBQ, align, backoff};
+use crate::{UBQ, backoff};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[cfg(feature = "bench_fastfifo")]
@@ -13,49 +13,37 @@ type JBoolean = u8;
 const JNI_TRUE: JBoolean = 1;
 const JNI_FALSE: JBoolean = 0;
 
-const UBQ_VARIANT_COUNT: JInt = 10;
-const DEFAULT_UBQ_VARIANT_ID: JInt = 3;
+const UBQ_VARIANT_COUNT: JInt = 6;
+const DEFAULT_UBQ_VARIANT_ID: JInt = 1;
 
 #[cfg(test)]
 const UBQ_VARIANT_LABELS: &[&str] = &[
-    "balanced,0,127,crossbeam",
-    "balanced,4,127,crossbeam",
-    "balanced,8,63,crossbeam",
-    "balanced,8,127,crossbeam",
-    "balanced,8,255,crossbeam",
-    "balanced,16,127,crossbeam",
-    "balanced,32,127,crossbeam",
-    "balanced,8,31,crossbeam",
-    "balanced,8,511,crossbeam",
-    "balanced,8,127,yield",
+    "balanced,1,63,crossbeam",
+    "balanced,1,127,crossbeam",
+    "balanced,1,255,crossbeam",
+    "balanced,1,31,crossbeam",
+    "balanced,1,511,crossbeam",
+    "balanced,1,127,yield",
 ];
 
 enum JniQueue {
-    Balanced0Block127Crossbeam(ConfiguredUBQ<u64, backoff::Crossbeam, 0, 127, align::A256>),
-    Balanced4Block127Crossbeam(ConfiguredUBQ<u64, backoff::Crossbeam, 4, 127, align::A256>),
-    Balanced8Block63Crossbeam(ConfiguredUBQ<u64, backoff::Crossbeam, 8, 63, align::A128>),
-    Balanced8Block127Crossbeam(ConfiguredUBQ<u64, backoff::Crossbeam, 8, 127, align::A256>),
-    Balanced8Block255Crossbeam(ConfiguredUBQ<u64, backoff::Crossbeam, 8, 255, align::A512>),
-    Balanced16Block127Crossbeam(ConfiguredUBQ<u64, backoff::Crossbeam, 16, 127, align::A256>),
-    Balanced32Block127Crossbeam(ConfiguredUBQ<u64, backoff::Crossbeam, 32, 127, align::A256>),
-    Balanced8Block31Crossbeam(ConfiguredUBQ<u64, backoff::Crossbeam, 8, 31, align::A64>),
-    Balanced8Block511Crossbeam(ConfiguredUBQ<u64, backoff::Crossbeam, 8, 511, align::A1024>),
-    Balanced8Block127Yield(ConfiguredUBQ<u64, backoff::Yield, 8, 127, align::A256>),
+    Balanced1Block63Crossbeam(UBQ<u64, 63, backoff::Crossbeam>),
+    Balanced1Block127Crossbeam(UBQ<u64, 127, backoff::Crossbeam>),
+    Balanced1Block255Crossbeam(UBQ<u64, 255, backoff::Crossbeam>),
+    Balanced1Block31Crossbeam(UBQ<u64, 31, backoff::Crossbeam>),
+    Balanced1Block511Crossbeam(UBQ<u64, 511, backoff::Crossbeam>),
+    Balanced1Block127Yield(UBQ<u64, 127, backoff::Yield>),
 }
 
 macro_rules! with_ubq {
     ($queue:expr, $inner:ident, $body:block) => {
         match $queue {
-            JniQueue::Balanced0Block127Crossbeam($inner) => $body,
-            JniQueue::Balanced4Block127Crossbeam($inner) => $body,
-            JniQueue::Balanced8Block63Crossbeam($inner) => $body,
-            JniQueue::Balanced8Block127Crossbeam($inner) => $body,
-            JniQueue::Balanced8Block255Crossbeam($inner) => $body,
-            JniQueue::Balanced16Block127Crossbeam($inner) => $body,
-            JniQueue::Balanced32Block127Crossbeam($inner) => $body,
-            JniQueue::Balanced8Block31Crossbeam($inner) => $body,
-            JniQueue::Balanced8Block511Crossbeam($inner) => $body,
-            JniQueue::Balanced8Block127Yield($inner) => $body,
+            JniQueue::Balanced1Block63Crossbeam($inner) => $body,
+            JniQueue::Balanced1Block127Crossbeam($inner) => $body,
+            JniQueue::Balanced1Block255Crossbeam($inner) => $body,
+            JniQueue::Balanced1Block31Crossbeam($inner) => $body,
+            JniQueue::Balanced1Block511Crossbeam($inner) => $body,
+            JniQueue::Balanced1Block127Yield($inner) => $body,
         }
     };
 }
@@ -68,16 +56,12 @@ struct JniRbbqQueue {
 impl JniQueue {
     fn new(variant_id: JInt) -> Option<Self> {
         match variant_id {
-            0 => Some(Self::Balanced0Block127Crossbeam(ConfiguredUBQ::new())),
-            1 => Some(Self::Balanced4Block127Crossbeam(ConfiguredUBQ::new())),
-            2 => Some(Self::Balanced8Block63Crossbeam(ConfiguredUBQ::new())),
-            3 => Some(Self::Balanced8Block127Crossbeam(ConfiguredUBQ::new())),
-            4 => Some(Self::Balanced8Block255Crossbeam(ConfiguredUBQ::new())),
-            5 => Some(Self::Balanced16Block127Crossbeam(ConfiguredUBQ::new())),
-            6 => Some(Self::Balanced32Block127Crossbeam(ConfiguredUBQ::new())),
-            7 => Some(Self::Balanced8Block31Crossbeam(ConfiguredUBQ::new())),
-            8 => Some(Self::Balanced8Block511Crossbeam(ConfiguredUBQ::new())),
-            9 => Some(Self::Balanced8Block127Yield(ConfiguredUBQ::new())),
+            0 => Some(Self::Balanced1Block63Crossbeam(UBQ::new())),
+            1 => Some(Self::Balanced1Block127Crossbeam(UBQ::new())),
+            2 => Some(Self::Balanced1Block255Crossbeam(UBQ::new())),
+            3 => Some(Self::Balanced1Block31Crossbeam(UBQ::new())),
+            4 => Some(Self::Balanced1Block511Crossbeam(UBQ::new())),
+            5 => Some(Self::Balanced1Block127Yield(UBQ::new())),
             _ => None,
         }
     }
@@ -436,14 +420,7 @@ extern "system" fn Java_ubq_jni_UbqLongQueue_nativePopBatch(
         };
 
         with_ubq!(queue, inner, {
-            let mut popped = 0;
-            for _ in 0..limit {
-                if inner.pop().is_none() {
-                    break;
-                }
-                popped += 1;
-            }
-            popped
+            inner.pop_batch(limit as usize).count() as JInt
         })
     })
 }
@@ -706,7 +683,7 @@ mod tests {
     fn jni_exports_all_configured_ubq_variants() {
         assert_eq!(
             UBQ_VARIANT_LABELS[DEFAULT_UBQ_VARIANT_ID as usize],
-            "balanced,8,127,crossbeam"
+            "balanced,1,127,crossbeam"
         );
 
         for variant_id in 0..UBQ_VARIANT_LABELS.len() as JInt {

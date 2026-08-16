@@ -16,7 +16,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use ubq::{ConfiguredUBQ, align, backoff};
+use ubq::{UBQ, backoff};
 
 const DEFAULT_QUEUES: &str = "io-uring,bbq,ubq";
 const DEFAULT_SQ_SIZES: &str = "32,1024";
@@ -27,7 +27,6 @@ const DEFAULT_REPEATS: usize = 10;
 const DEFAULT_BBQ_BLOCK_SIZE: usize = 64;
 const DEFAULT_CQ_MULTIPLIER: usize = 2;
 
-const UBQ_POOL_VALUES: [usize; 8] = [0, 1, 2, 4, 8, 16, 32, 64];
 const UBQ_BLOCK_VALUES: [u16; 8] = [31, 63, 127, 255, 511, 1023, 2047, 4095];
 const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
 
@@ -129,7 +128,6 @@ impl BatchMode {
 #[derive(Clone, Debug)]
 struct UbqLabel {
     normalized: String,
-    pool: usize,
     block: u16,
     backoff: String,
 }
@@ -342,18 +340,16 @@ struct BoundedUbq<Q> {
     len: CachePadded<AtomicUsize>,
 }
 
-impl<B, const POOL: usize, const BLOCK: usize, A> BenchQueue
-    for BoundedUbq<ConfiguredUBQ<u64, B, POOL, BLOCK, A>>
+impl<B, const BLOCK: usize> BenchQueue for BoundedUbq<UBQ<u64, BLOCK, B>>
 where
     B: backoff::BackoffPolicy + 'static,
-    A: Send + Sync + 'static,
 {
     fn new(capacity: usize, _bbq_block_size: usize) -> Result<Self, String> {
         if capacity == 0 {
             return Err("UBQ bounded wrapper capacity must be > 0".to_string());
         }
         Ok(Self {
-            inner: ConfiguredUBQ::new(),
+            inner: UBQ::new(),
             capacity,
             len: CachePadded::new(AtomicUsize::new(0)),
         })
@@ -540,7 +536,7 @@ fn parse_ubq_label(raw: &str) -> Result<UbqLabel, String> {
         .map_err(|_| format!("invalid UBQ label '{raw}'"))?;
     let backoff = parts[3].to_string();
     if parts[0] != "balanced"
-        || !UBQ_POOL_VALUES.contains(&pool)
+        || pool != 1
         || !UBQ_BLOCK_VALUES.contains(&block)
         || !UBQ_BACKOFF_VALUES.contains(&backoff.as_str())
     {
@@ -548,7 +544,6 @@ fn parse_ubq_label(raw: &str) -> Result<UbqLabel, String> {
     }
     Ok(UbqLabel {
         normalized: format!("balanced,{pool},{block},{backoff}"),
-        pool,
         block,
         backoff,
     })
@@ -837,63 +832,17 @@ fn run_backend<Q: BenchQueue>(queue_label: &str, ctx: &RunContext) -> Result<Vec
     Ok(samples)
 }
 
-macro_rules! dispatch_ubq_pool {
-    ($pool:expr, $block:literal, $align_ty:ty, $backoff_ty:ty, $queue_label:expr, $ctx:expr) => {
-        match $pool {
-            0 => run_backend::<BoundedUbq<ConfiguredUBQ<u64, $backoff_ty, 0, $block, $align_ty>>>(
-                $queue_label,
-                $ctx,
-            ),
-            1 => run_backend::<BoundedUbq<ConfiguredUBQ<u64, $backoff_ty, 1, $block, $align_ty>>>(
-                $queue_label,
-                $ctx,
-            ),
-            2 => run_backend::<BoundedUbq<ConfiguredUBQ<u64, $backoff_ty, 2, $block, $align_ty>>>(
-                $queue_label,
-                $ctx,
-            ),
-            4 => run_backend::<BoundedUbq<ConfiguredUBQ<u64, $backoff_ty, 4, $block, $align_ty>>>(
-                $queue_label,
-                $ctx,
-            ),
-            8 => run_backend::<BoundedUbq<ConfiguredUBQ<u64, $backoff_ty, 8, $block, $align_ty>>>(
-                $queue_label,
-                $ctx,
-            ),
-            16 => {
-                run_backend::<BoundedUbq<ConfiguredUBQ<u64, $backoff_ty, 16, $block, $align_ty>>>(
-                    $queue_label,
-                    $ctx,
-                )
-            }
-            32 => {
-                run_backend::<BoundedUbq<ConfiguredUBQ<u64, $backoff_ty, 32, $block, $align_ty>>>(
-                    $queue_label,
-                    $ctx,
-                )
-            }
-            64 => {
-                run_backend::<BoundedUbq<ConfiguredUBQ<u64, $backoff_ty, 64, $block, $align_ty>>>(
-                    $queue_label,
-                    $ctx,
-                )
-            }
-            _ => Err(format!("unsupported UBQ pool size {}", $pool)),
-        }
-    };
-}
-
 macro_rules! dispatch_ubq_block {
-    ($block:expr, $pool:expr, $backoff_ty:ty, $queue_label:expr, $ctx:expr) => {
+    ($block:expr, $backoff_ty:ty, $queue_label:expr, $ctx:expr) => {
         match $block {
-            31 => dispatch_ubq_pool!($pool, 31, align::A64, $backoff_ty, $queue_label, $ctx),
-            63 => dispatch_ubq_pool!($pool, 63, align::A128, $backoff_ty, $queue_label, $ctx),
-            127 => dispatch_ubq_pool!($pool, 127, align::A256, $backoff_ty, $queue_label, $ctx),
-            255 => dispatch_ubq_pool!($pool, 255, align::A512, $backoff_ty, $queue_label, $ctx),
-            511 => dispatch_ubq_pool!($pool, 511, align::A1024, $backoff_ty, $queue_label, $ctx),
-            1023 => dispatch_ubq_pool!($pool, 1023, align::A2048, $backoff_ty, $queue_label, $ctx),
-            2047 => dispatch_ubq_pool!($pool, 2047, align::A4096, $backoff_ty, $queue_label, $ctx),
-            4095 => dispatch_ubq_pool!($pool, 4095, align::A8192, $backoff_ty, $queue_label, $ctx),
+            31 => run_backend::<BoundedUbq<UBQ<u64, 31, $backoff_ty>>>($queue_label, $ctx),
+            63 => run_backend::<BoundedUbq<UBQ<u64, 63, $backoff_ty>>>($queue_label, $ctx),
+            127 => run_backend::<BoundedUbq<UBQ<u64, 127, $backoff_ty>>>($queue_label, $ctx),
+            255 => run_backend::<BoundedUbq<UBQ<u64, 255, $backoff_ty>>>($queue_label, $ctx),
+            511 => run_backend::<BoundedUbq<UBQ<u64, 511, $backoff_ty>>>($queue_label, $ctx),
+            1023 => run_backend::<BoundedUbq<UBQ<u64, 1023, $backoff_ty>>>($queue_label, $ctx),
+            2047 => run_backend::<BoundedUbq<UBQ<u64, 2047, $backoff_ty>>>($queue_label, $ctx),
+            4095 => run_backend::<BoundedUbq<UBQ<u64, 4095, $backoff_ty>>>($queue_label, $ctx),
             _ => Err(format!("unsupported UBQ block size {}", $block)),
         }
     };
@@ -903,14 +852,8 @@ fn run_ubq(label: &str, ctx: &RunContext) -> Result<Vec<Sample>, String> {
     let label = parse_ubq_label(label)?;
     let queue_label = format!("ubq_{}", label.normalized);
     match label.backoff.as_str() {
-        "crossbeam" => dispatch_ubq_block!(
-            label.block,
-            label.pool,
-            backoff::Crossbeam,
-            &queue_label,
-            ctx
-        ),
-        "yield" => dispatch_ubq_block!(label.block, label.pool, backoff::Yield, &queue_label, ctx),
+        "crossbeam" => dispatch_ubq_block!(label.block, backoff::Crossbeam, &queue_label, ctx),
+        "yield" => dispatch_ubq_block!(label.block, backoff::Yield, &queue_label, ctx),
         _ => Err(format!("unsupported UBQ backoff {}", label.backoff)),
     }
 }

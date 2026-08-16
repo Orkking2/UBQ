@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ubq::{ConfiguredUBQ, align, backoff};
+use ubq::{UBQ, backoff};
 
 const CHILD_ENV: &str = "UBQ_ABA_CHILD";
 const DEFAULT_TRIALS: usize = 50;
@@ -109,7 +109,7 @@ fn recycled_block_aba_child_process() {
 }
 
 fn run_public_api_worst_case(items: usize, consumers: usize, in_flight: usize) {
-    type Q = ConfiguredUBQ<u64, backoff::Yield, 1, 1, align::A64>;
+    type Q = UBQ<u64, 1, backoff::Yield>;
 
     let q = Arc::new(Q::new());
     let seen = Arc::new((0..items).map(|_| AtomicU8::new(0)).collect::<Vec<_>>());

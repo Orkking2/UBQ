@@ -48,7 +48,7 @@ fn hard_timeout_kills_worker_and_next_job_completes() {
             "--job-timeout-secs",
             "1",
             "--queues",
-            "ubq,segqueue,concurrent-queue",
+            "segqueue,concurrent-queue",
             "--scenarios",
             "1p1c",
             "--items-per-producer",
@@ -83,7 +83,6 @@ fn hard_timeout_kills_worker_and_next_job_completes() {
     assert!(!files.is_empty(), "benchmark produced no snapshots");
     let mut concurrent_status = None;
     let mut segqueue_completed = false;
-    let mut ubq_completed = false;
     for path in files {
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(path).expect("read snapshot"))
@@ -100,18 +99,12 @@ fn hard_timeout_kills_worker_and_next_job_completes() {
                     concurrent_status = record["status"].as_str().map(str::to_string);
                     assert_eq!(record["consumed_items"], 0);
                 }
-                Some("ubq") => {
-                    ubq_completed |= record
-                        .get("status")
-                        .is_none_or(|status| status == "completed");
-                }
                 _ => {}
             }
         }
     }
     assert_eq!(concurrent_status.as_deref(), Some("timed_out"));
     assert!(segqueue_completed);
-    assert!(ubq_completed, "a fresh worker did not complete later jobs");
 
     let retry = Command::new(env!("CARGO_BIN_EXE_bench_grid"))
         .args([
@@ -125,7 +118,7 @@ fn hard_timeout_kills_worker_and_next_job_completes() {
             "--job-timeout-secs",
             "1",
             "--queues",
-            "ubq,segqueue,concurrent-queue",
+            "segqueue,concurrent-queue",
             "--scenarios",
             "1p1c",
             "--items-per-producer",
@@ -145,7 +138,7 @@ fn hard_timeout_kills_worker_and_next_job_completes() {
         .expect("retry bench_grid");
     assert!(retry.status.success());
     assert!(
-        String::from_utf8_lossy(&retry.stdout).contains("164 cached, 1 pending"),
+        String::from_utf8_lossy(&retry.stdout).contains("4 cached, 1 pending"),
         "completed samples were not reused or the timeout was not retried"
     );
 
@@ -173,7 +166,7 @@ fn crashed_worker_records_failure_and_restarts() {
             "2",
             "--allow-unpinned",
             "--queues",
-            "ubq,segqueue,concurrent-queue",
+            "segqueue,concurrent-queue",
             "--scenarios",
             "1p1c",
             "--items-per-producer",

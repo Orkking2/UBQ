@@ -50,7 +50,7 @@ struct Args {
     )]
     batch_sizes: Vec<usize>,
 
-    /// Exhaust the 128-configuration grid instead of the default sparse grid.
+    /// Use all 16 static-UBQ block/backoff variants (and all 128 DUBQ variants).
     #[arg(short = 'd', long)]
     dense: bool,
 
@@ -113,9 +113,9 @@ fn main() {
             .as_deref()
             .ok_or_else(|| "--machine-label is required".to_string())?;
         let queues = parse_queue_kinds(&args.queues)?;
-        let includes_ubq_grid = queues
-            .iter()
-            .any(|queue| matches!(queue, QueueKind::Ubq | QueueKind::Dubq));
+        let includes_ubq = queues.contains(&QueueKind::Ubq);
+        let includes_dubq = queues.contains(&QueueKind::Dubq);
+        let includes_ubq_grid = includes_ubq || includes_dubq;
         let requested_core_ids = args.core_ids.as_deref().map(parse_core_ids).transpose()?;
         let available_parallelism = match args.parallelism {
             Some(value) => value,
@@ -210,11 +210,20 @@ fn main() {
                 .join(", ")
         );
         if includes_ubq_grid {
-            println!(
-                "UBQ/DUBQ grid: {} ({} configurations per selected family before constraints)",
-                grid.name(),
-                grid.labels().len()
-            );
+            if includes_ubq {
+                println!(
+                    "static UBQ grid: {} ({} configurations before constraints)",
+                    grid.name(),
+                    grid.labels().len()
+                );
+            }
+            if includes_dubq {
+                println!(
+                    "DUBQ grid: {} ({} configurations before constraints)",
+                    grid.name(),
+                    grid.dubq_labels().len()
+                );
+            }
             println!(
                 "throughput variants per UBQ/DUBQ configuration: {} (scalar-compatible + {} batch sizes)",
                 1 + plan.ubq_batch_sizes.len(),
