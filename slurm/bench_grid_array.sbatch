@@ -30,9 +30,14 @@ if [[ ! "$scenario" =~ ^[0-9]+p[0-9]+c$ ]]; then
     exit 2
 fi
 
-shard_id="$(printf '%03d-%s' "$index" "$scenario")"
-shard_dir="$runs_root/shards/$shard_id"
-mkdir -p "$shard_dir"
+# This array task owns exactly this one scenario end to end: it writes
+# straight into the shared coalesced tree at
+# runs_root/machine_label/scenario/record.json (bench_grid computes that
+# path itself from --runs-dir/--machine-label/--scenarios) rather than a
+# private per-task shard directory. A small sidecar next to it records what
+# this node actually was.
+scenario_dir="$runs_root/$machine_label/$scenario"
+mkdir -p "$scenario_dir"
 
 : "${TMPDIR:?Slurm did not provide TMPDIR}"
 install -m 0755 "$binary" "$TMPDIR/bench_grid"
@@ -44,7 +49,7 @@ install -m 0755 "$binary" "$TMPDIR/bench_grid"
     sha256sum "$TMPDIR/bench_grid"
     lscpu
     env | LC_ALL=C sort | sed -n '/^SLURM_/p'
-} > "$shard_dir/slurm-${SLURM_ARRAY_JOB_ID}_${index}.txt"
+} > "$scenario_dir/slurm-info.txt"
 
 cd "$src_dir"
 
@@ -59,7 +64,7 @@ srun \
   --kill-on-bad-exit=1 \
   "$TMPDIR/bench_grid" \
     --machine-label "$machine_label" \
-    --runs-dir "$shard_dir" \
+    --runs-dir "$runs_root" \
     --parallelism "$SLURM_CPUS_PER_TASK" \
     --scenarios "$scenario" \
     --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \

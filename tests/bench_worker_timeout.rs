@@ -87,7 +87,7 @@ fn hard_timeout_kills_worker_and_next_job_completes() {
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(path).expect("read snapshot"))
                 .expect("parse snapshot");
-        assert_eq!(value["schema_version"], 6);
+        assert_eq!(value["schema_version"], ubq::bench_harness::RUN_SCHEMA_VERSION);
         for record in value["results"].as_array().expect("results") {
             match record["queue"].as_str() {
                 Some("segqueue") => {

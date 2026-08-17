@@ -262,7 +262,7 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
     #[doc(alias = "dequeue_batch")]
     #[doc(alias = "receive_batch")]
     pub fn pop_batch(&self, size: usize) -> UBQIter<'_, T, BLOCK_SIZE, B> {
-        if size == 0 || self.chead.load(Relaxed) == Head::<T, BLOCK_SIZE>::ZERO.to_usize() {
+        if size == 0 || self.chead.load(Acquire) == Head::<T, BLOCK_SIZE>::ZERO.to_usize() {
             return UBQIter::empty(self);
         }
 

@@ -102,10 +102,10 @@ The Rust benchmark harness and binaries are isolated behind the `bench_tools`
 feature. Benchmark-specific features such as `bench_registry`, `bench_rbbq`,
 `bench_lfqueue`, and `bench_wcq` enable it automatically.
 
-The schema-v6 comparative harness has two front ends:
+The schema-v7 comparative harness has two front ends:
 
 - `bench_matrix`: direct matrix execution. It dispatches through the
-  precompiled benchmark registry and writes schema-v6 JSON files under
+  precompiled benchmark registry and writes schema-v7 JSON files under
   `bench_results/runs`.
 - `bench_grid`: reproducible UBQ/DUBQ grid execution. Its default sparse grid is
   `block=[31,127,511,2047,4095]` × both backoffs (10 static-UBQ configurations).
@@ -140,31 +140,79 @@ selects the `explicit` policy and runs every supplied value in every scenario.
 The selected policy and scenario mapping are printed before execution and
 recorded in each output file.
 
-`bench_grid` reuses successful schema-v6 samples with a compatible measurement
-fingerprint by default. Scenario, queue/configuration, mode, batch-size, and
-repeat selection do not change that fingerprint; the exact sample key still
-has to match, so narrower and wider plans reuse their overlap. It writes each
-completed job through an atomic checkpoint, and retries failed or timed-out
-jobs after an interruption. `--rerun` ignores existing samples. Jobs execute
-sequentially on the same core range so separate queue measurements cannot
-contend with one another. Within each job, producer and consumer threads are
-interleaved over the assigned core IDs until one role is exhausted; the actual
-role-to-core map is printed before execution and recorded as
-`core_placement = "interleaved"`. Authoritative throughput requires every
-worker thread to pin successfully. `--core-ids 0-7,16-23` selects an explicit
-ordered CPU set; `--allow-unpinned` is a diagnostic escape hatch whose records
-are excluded from winner claims. Hard timeouts are derived only from the
-declared measurement budget: at least 30 seconds and otherwise five times the
-warmup plus three measured phases. `--job-timeout-secs` overrides that value.
-Each job runs in a reusable worker process; if it exceeds its hard
-timeout, the parent kills and reaps the entire worker, checkpoints a timed-out
-sample, starts a fresh worker, and continues. Schema-v5 and older results are
-not reused or aggregated with schema-v6 data. Stdout is a fixed-width
-job table with the queue, scenario, mode, batch size, thread use, pending count,
-and percentage of the complete plan; each row advances from `Pending...` to
-`Pending...DONE`.
+Every scenario's results are coalesced into one mutable record at
+`bench_results/runs/<machine-label>/<scenario>/record.json`, reopened and
+updated in place across invocations rather than a fresh file per run. By
+default `bench_grid` greedily reuses any sample already on record there:
+reuse is keyed on the machine-label plus the exact sample identity (scenario,
+queue/configuration, mode, batch size, repeat) and the measurement protocol
+that produced it (available parallelism, core placement/pinning, throughput
+timing budget, item-count policy). Changing scenario, queue, or repeat
+coverage between runs never invalidates unrelated cached samples, and
+narrower or wider plans reuse their overlap; changing the measurement
+protocol only recomputes the samples that protocol actually affects, leaving
+the rest of the record untouched. Source/build state (git commit, `rustc`
+version, hostname) is recorded per scenario for provenance but never gates
+reuse, so editing source between runs does not invalidate prior data — a
+crash or interruption costs at most the in-flight sample. `--rerun` ignores
+existing samples for this machine-label and recomputes everything.
+Deliberately reuse a machine-label to extend or resume a batch, or bump it
+(e.g. `grace-1` -> `grace-2`) to force a fully fresh sweep isolated from a
+prior one. Jobs execute sequentially on the same core range so separate queue
+measurements cannot contend with one another. Within each job, producer and
+consumer threads are interleaved over the assigned core IDs until one role is
+exhausted; the actual role-to-core map is printed before execution and
+recorded as `core_placement = "interleaved"`. Authoritative throughput
+requires every worker thread to pin successfully. `--core-ids 0-7,16-23`
+selects an explicit ordered CPU set; `--allow-unpinned` is a diagnostic
+escape hatch whose records are excluded from winner claims. Hard timeouts are
+derived only from the declared measurement budget: at least 30 seconds and
+otherwise five times the warmup plus three measured phases.
+`--job-timeout-secs` overrides that value. Each job runs in a reusable worker
+process; if it exceeds its hard timeout, the parent kills and reaps the
+entire worker, checkpoints a timed-out sample, starts a fresh worker, and
+continues. Stdout is a fixed-width job table with the queue, scenario, mode,
+batch size, thread use, pending count, and percentage of the complete plan;
+each row advances from `Pending...` to `Pending...DONE`.
 
-`bench_matrix` uses the same overlap rule when `--reuse-existing` is supplied.
+`bench_matrix` uses the same reuse rule when `--reuse-existing` is supplied.
+
+### Slurm
+
+One array task runs one scenario end to end, writing straight into the
+coalesced tree above — there's no separate per-task shard directory to
+reconcile afterward. `slurm/submit_bench_grid.sh {mn5|grace} <machine-label>`
+sizes the array from the manifest itself (`manifests/mn5-112.txt` /
+`manifests/grace-144.txt`) rather than a hand-typed bound, and submits with
+no `%K` concurrency throttle and no node-count cap: every scenario in the
+manifest gets a task regardless of how many run concurrently, and Slurm's own
+partition/QOS/fairshare limits decide actual concurrency.
+`slurm/submit_build.sh {mn5|grace}` builds the `bench_grid` binary first;
+chain the two with `--after`:
+
+```bash
+build_id=$(slurm/submit_build.sh mn5)
+slurm/submit_bench_grid.sh mn5 mn5-1 --after "$build_id"
+```
+
+`<machine-label>` is a required, explicit choice, not a default — per the
+reuse rule above, bump it for a fresh sweep or hold it steady to greedily
+resume/extend a batch. Both scripts default `ACCOUNT=bsc18` and
+`UBQ=/gpfs/projects/$ACCOUNT/$USER/UBQ` (the repo's deployed location on the
+cluster), overridable via env; run `--help` on either for the full option
+list.
+
+### Personal machines
+
+`bench_grid` runs the same way with no Slurm involved: point `--runs-dir` at
+a local directory and it schedules the full feasible grid for the machine's
+detected parallelism in one process. Because reuse is greedy by default, a
+personal machine benefits from the same resilience Slurm gets for free —
+interrupting or crashing the run loses at most the in-flight sample, and
+rerunning the identical command resumes from wherever it left off. Keep a
+stable `--machine-label` (e.g. a hostname) across iterative runs to
+accumulate coverage cheaply; only bump it when you deliberately want a clean
+slate.
 
 `throughput` is an adaptive sustained protocol. A disposable doubling pilot
 selects an empty-to-empty round size (100 ms target, 8,388,608-item cap), then
@@ -469,9 +517,9 @@ Outputs are grouped by `meta.machine_label` and mode, e.g.:
 - `bench_results/plots/grace/throughput/mpsc_line_throughput_batchcomp.png`
 - `bench_results/plots/grace/throughput/spmc_line_throughput_batchcomp.png`
 
-Schema-v6 plotting deduplicates reruns, keeps fingerprints isolated, summarizes
-repeats by median, and emits separate handoff, enqueue-ceiling, and
-dequeue-ceiling CSVs/plots. Fewer than three repeats are marked provisional.
+Schema-v7 plotting deduplicates reruns, summarizes repeats by median, and
+emits separate handoff, enqueue-ceiling, and dequeue-ceiling CSVs/plots.
+Fewer than three repeats are marked provisional.
 
 Pool-size CSVs and heatmaps are emitted only when plotting historical result
 sets that contain the former static-UBQ pool sweep. New static-UBQ runs contain

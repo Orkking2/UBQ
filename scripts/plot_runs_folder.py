@@ -46,7 +46,7 @@ def main() -> int:
     parser.add_argument(
         "--runs-dir",
         default="bench_results/runs",
-        help="Root directory containing machine/scenario/label run folders (default: bench_results/runs)",
+        help="Root directory containing machine/scenario record.json files (default: bench_results/runs)",
     )
     parser.add_argument(
         "--out-dir",

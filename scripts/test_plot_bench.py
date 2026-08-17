@@ -995,16 +995,26 @@ class PoolSizeEffectTest(unittest.TestCase):
 
 
 class MetricExtractionTest(unittest.TestCase):
-    def test_schema_v5_loads_dubq_scalar_batch_and_coverage(self):
+    def _record(self, **overrides):
+        record = {
+            "repeat_index": 1,
+            "status": "completed",
+            "items_per_producer": 10,
+            "ops_per_sec": 100.0,
+            "protocol": {
+                "core_placement": "interleaved",
+                "affinity_authoritative": True,
+            },
+        }
+        record.update(overrides)
+        return record
+
+    def test_dubq_scalar_and_batched_load_as_distinct_series_with_coverage(self):
         payload = {
-            "schema_version": 5,
+            "schema_version": 7,
             "meta": {
                 "machine_label": "local",
                 "scenario": "1p1c",
-                "repeat_index": 1,
-                "core_placement": "interleaved",
-                "dubq_label": "2,31,crossbeam",
-                "dubq_min_block_size": 31,
                 "ubq_grid": "sparse",
                 "expected_ubq_configurations": 0,
                 "expected_dubq_configurations": 1,
@@ -1013,19 +1023,14 @@ class MetricExtractionTest(unittest.TestCase):
                 "planned_items_per_producer": [10],
             },
             "results": [
-                {
-                    "queue": "dubq",
-                    "mode": "throughput",
-                    "items_per_producer": 10,
-                    "ops_per_sec": 100.0,
-                },
-                {
-                    "queue": "dubq",
-                    "mode": "throughput",
-                    "batch_size": 8,
-                    "items_per_producer": 10,
-                    "ops_per_sec": 140.0,
-                },
+                self._record(queue="dubq", mode="throughput", dubq_label="2,31,crossbeam"),
+                self._record(
+                    queue="dubq",
+                    mode="throughput",
+                    dubq_label="2,31,crossbeam",
+                    batch_size=8,
+                    ops_per_sec=140.0,
+                ),
             ],
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -1045,82 +1050,12 @@ class MetricExtractionTest(unittest.TestCase):
         self.assertEqual(2, len(coverage_rows))
         self.assertTrue(all(row[4][0] == "dubq" for row in coverage_rows))
 
-    def test_schema_v5_loads_interleaved_core_placement(self):
+    def test_ubq_scalar_and_batched_load_as_distinct_series(self):
         payload = {
-            "schema_version": 5,
+            "schema_version": 7,
             "meta": {
                 "machine_label": "local",
                 "scenario": "1p1c",
-                "repeat_index": 1,
-                "core_placement": "interleaved",
-                "item_policy": "scenario_scaled_v1",
-            },
-            "results": [
-                {
-                    "queue": "segqueue",
-                    "mode": "throughput",
-                    "items_per_producer": 10,
-                    "ops_per_sec": 100.0,
-                }
-            ],
-        }
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "run.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
-            rows = list(load_records(path))
-
-        self.assertEqual(1, len(rows))
-        self.assertEqual("interleaved", rows[0][1])
-
-    def test_schema_v5_grid_coverage_accepts_scenario_scaled_counts(self):
-        def payload(scenario, producers, items):
-            return {
-                "schema_version": 5,
-                "meta": {
-                    "machine_label": "local",
-                    "scenario": scenario,
-                    "repeat_index": 1,
-                    "core_placement": "interleaved",
-                    "item_policy": "scenario_scaled_v1",
-                    "ubq_label": "balanced,8,127,crossbeam",
-                    "ubq_grid": "sparse",
-                    "expected_ubq_configurations": 1,
-                    "ubq_batch_sizes": [8, 32, 256],
-                    "planned_repeats": 1,
-                    "planned_items_per_producer": [items],
-                    "producers": producers,
-                    "consumers": producers,
-                },
-                "results": [
-                    {
-                        "queue": "ubq",
-                        "mode": "throughput",
-                        "items_per_producer": items,
-                        "ops_per_sec": 100.0,
-                    }
-                ],
-            }
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            paths = [root / "8p8c.json", root / "64p64c.json"]
-            paths[0].write_text(json.dumps(payload("8p8c", 8, 1_000_000)))
-            paths[1].write_text(json.dumps(payload("64p64c", 64, 15_625)))
-            rows = [row for path in paths for row in load_grid_coverage(path)]
-
-        planned_by_scenario = {row[2]: row[3]["planned_items"] for row in rows}
-        self.assertEqual((1_000_000,), planned_by_scenario["8p8c"])
-        self.assertEqual((15_625,), planned_by_scenario["64p64c"])
-
-    def test_schema_v3_loads_scalar_and_batched_ubq_as_distinct_series(self):
-        payload = {
-            "schema_version": 3,
-            "meta": {
-                "machine_label": "local",
-                "scenario": "1p1c",
-                "repeat_index": 1,
-                "ubq_label": "balanced,8,127,crossbeam",
                 "ubq_grid": "sparse",
                 "expected_ubq_configurations": 40,
                 "ubq_batch_sizes": [2, 4],
@@ -1128,19 +1063,14 @@ class MetricExtractionTest(unittest.TestCase):
                 "planned_items_per_producer": [10],
             },
             "results": [
-                {
-                    "queue": "ubq",
-                    "mode": "throughput",
-                    "items_per_producer": 10,
-                    "ops_per_sec": 100.0,
-                },
-                {
-                    "queue": "ubq",
-                    "mode": "throughput",
-                    "batch_size": 4,
-                    "items_per_producer": 10,
-                    "ops_per_sec": 140.0,
-                },
+                self._record(queue="ubq", mode="throughput", ubq_label="balanced,8,127,crossbeam"),
+                self._record(
+                    queue="ubq",
+                    mode="throughput",
+                    ubq_label="balanced,8,127,crossbeam",
+                    batch_size=4,
+                    ops_per_sec=140.0,
+                ),
             ],
         }
 
@@ -1154,7 +1084,7 @@ class MetricExtractionTest(unittest.TestCase):
             label
             for _machine, _placement, _mode, _scenario, label, _value in rows
         }
-        self.assertEqual({"legacy_grouped"}, {row[1] for row in rows})
+        self.assertEqual({"interleaved"}, {row[1] for row in rows})
         self.assertEqual(
             {
                 "ubq_balanced,8,127,crossbeam",
@@ -1163,6 +1093,60 @@ class MetricExtractionTest(unittest.TestCase):
             labels,
         )
         self.assertEqual(2, len(coverage_rows))
+
+    def test_non_interleaved_protocol_is_excluded(self):
+        payload = {
+            "schema_version": 7,
+            "meta": {"machine_label": "local", "scenario": "1p1c"},
+            "results": [
+                self._record(
+                    queue="segqueue",
+                    mode="throughput",
+                    protocol={"core_placement": "unpinned", "affinity_authoritative": False},
+                )
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            rows = list(load_records(path))
+
+        self.assertEqual(0, len(rows))
+
+    def test_grid_coverage_accepts_scenario_scaled_counts(self):
+        def payload(scenario, items):
+            return {
+                "schema_version": 7,
+                "meta": {
+                    "machine_label": "local",
+                    "scenario": scenario,
+                    "ubq_grid": "sparse",
+                    "expected_ubq_configurations": 1,
+                    "ubq_batch_sizes": [8, 32, 256],
+                    "planned_repeats": 1,
+                    "planned_items_per_producer": [items],
+                },
+                "results": [
+                    self._record(
+                        queue="ubq",
+                        mode="throughput",
+                        ubq_label="balanced,8,127,crossbeam",
+                        items_per_producer=items,
+                    )
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [root / "8p8c.json", root / "64p64c.json"]
+            paths[0].write_text(json.dumps(payload("8p8c", 1_000_000)))
+            paths[1].write_text(json.dumps(payload("64p64c", 15_625)))
+            rows = [row for path in paths for row in load_grid_coverage(path)]
+
+        planned_by_scenario = {row[2]: row[3]["planned_items"] for row in rows}
+        self.assertEqual((1_000_000,), planned_by_scenario["8p8c"])
+        self.assertEqual((15_625,), planned_by_scenario["64p64c"])
 
     def test_grid_coverage_reports_complete_and_incomplete_samples(self):
         coverage = {
@@ -1240,26 +1224,29 @@ class MetricExtractionTest(unittest.TestCase):
         )
 
     def test_load_records_emits_timing_metrics_and_skips_obsolete_groups(self):
+        protocol = {"core_placement": "interleaved", "affinity_authoritative": True}
         payload = {
-            "schema_version": 2,
+            "schema_version": 7,
             "meta": {
                 "machine_label": "local",
                 "scenario": "1p1c",
-                "ubq_label": "balanced,8,127,crossbeam",
             },
             "results": [
                 {
                     "queue": "ubq",
+                    "ubq_label": "balanced,8,127,crossbeam",
                     "mode": "throughput",
                     "ops_per_sec": 100.0,
                     "push_elapsed_ns": 11,
                     "pop_elapsed_ns": 17,
+                    "protocol": protocol,
                 },
                 {
                     "queue": "segqueue",
                     "mode": "throughput",
                     "batch_size": 8,
                     "ops_per_sec": 105.0,
+                    "protocol": protocol,
                 },
                 {
                     "queue": "segqueue",
@@ -1267,12 +1254,14 @@ class MetricExtractionTest(unittest.TestCase):
                     "ops_per_sec": 50.0,
                     "fill_elapsed_ns": 23,
                     "drain_elapsed_ns": 29,
+                    "protocol": protocol,
                 },
                 {
                     "queue": "concurrent-queue",
                     "mode": "app_log_fan_in",
                     "ops_per_sec": 75.0,
                     "avg_data_latency_ns": 31,
+                    "protocol": protocol,
                 },
                 {
                     "queue": "segqueue",
@@ -1280,6 +1269,7 @@ class MetricExtractionTest(unittest.TestCase):
                     "ops_per_sec": 91.0,
                     "producer_ops_per_sec": 123.0,
                     "consumer_ops_per_sec": 89.0,
+                    "protocol": protocol,
                 },
             ],
         }
@@ -1410,7 +1400,7 @@ class ScenarioFamilyTest(unittest.TestCase):
         )
 
 
-class SchemaV6StatisticsTest(unittest.TestCase):
+class SchemaV7StatisticsTest(unittest.TestCase):
     def test_summary_uses_median_and_keeps_repeat_gate(self):
         summary = summarize_ops([1.0, 2.0, 100.0])
         self.assertEqual(2.0, summary["median_ops_per_sec"])
@@ -1432,25 +1422,26 @@ class SchemaV6StatisticsTest(unittest.TestCase):
         self.assertTrue(summarize_ops([1.0, 2.0])["provisional"])
         self.assertTrue(summarize_ops([1.0, 2.0, 3.0], authoritative=False)["provisional"])
 
-    def test_schema_v6_emits_three_isolated_throughput_metrics(self):
+    def test_schema_v7_emits_three_isolated_throughput_metrics(self):
         payload = {
-            "schema_version": 6,
+            "schema_version": 7,
             "meta": {
                 "machine_label": "local",
                 "scenario": "1p1c",
-                "repeat_index": 2,
-                "timestamp_unix_ms": 10,
-                "core_placement": "interleaved",
-                "affinity_authoritative": True,
-                "experiment_fingerprint": "abc",
             },
             "results": [{
+                "repeat_index": 2,
+                "timestamp_unix_ms": 10,
                 "queue": "segqueue",
                 "mode": "throughput",
                 "ops_per_sec": 10.0,
                 "throughput_metrics": {
                     "enqueue_ops_per_sec": 20.0,
                     "dequeue_ops_per_sec": 30.0,
+                },
+                "protocol": {
+                    "core_placement": "interleaved",
+                    "affinity_authoritative": True,
                 },
             }],
         }
@@ -1466,11 +1457,11 @@ class SchemaV6StatisticsTest(unittest.TestCase):
             },
             {sample["mode"]: sample["value"] for sample in samples},
         )
-        self.assertTrue(all(sample["fingerprint"] == "abc" for sample in samples))
+        self.assertTrue(all(sample["repeat_index"] == 2 for sample in samples))
 
     def test_duplicate_reruns_prefer_newest_completed_sample(self):
         base = {
-            "fingerprint": "fp",
+            "machine": "local",
             "scenario": "1p1c",
             "queue": "segqueue",
             "mode": "throughput",
@@ -1479,12 +1470,12 @@ class SchemaV6StatisticsTest(unittest.TestCase):
         deduped = deduplicate_logical_samples([
             {**base, "timestamp": 10, "value": 1.0},
             {**base, "timestamp": 20, "value": 2.0},
-            {**base, "fingerprint": "other", "timestamp": 30, "value": 3.0},
+            {**base, "machine": "other", "timestamp": 30, "value": 3.0},
         ])
         self.assertEqual(2, len(deduped))
         self.assertEqual(
             2.0,
-            next(sample["value"] for sample in deduped if sample["fingerprint"] == "fp"),
+            next(sample["value"] for sample in deduped if sample["machine"] == "local"),
         )
 
 

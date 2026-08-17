@@ -15,7 +15,7 @@ about complete production applications.
   a worker queue and receive completions through a shared response queue. The
   mode reports completed requests per second and average round-trip latency.
 
-These modes use the schema-v6 benchmark JSON format. Throughput is stored in
+These modes use the schema-v7 benchmark JSON format. Throughput is stored in
 `ops_per_sec`, average latency in `avg_data_latency_ns`, and producer/consumer
 elapsed timing in `push_elapsed_ns` and `pop_elapsed_ns`.
 

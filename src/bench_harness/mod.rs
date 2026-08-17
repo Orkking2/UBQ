@@ -11,6 +11,7 @@ use rbbq::FastFifo;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -83,7 +84,7 @@ fn consumer_core_id(
 }
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const RUN_SCHEMA_VERSION: u32 = 6;
+pub const RUN_SCHEMA_VERSION: u32 = 7;
 pub const PLAN_SCHEMA_VERSION: u32 = 6;
 pub const DEFAULT_ITEMS_PER_PRODUCER: u64 = 1_000_000;
 pub const DEFAULT_RUNS_DIR: &str = "bench_results/runs";
@@ -1023,9 +1024,10 @@ pub enum UbqGrid {
     Dense,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CorePlacement {
+    #[default]
     Interleaved,
 }
 
@@ -1286,21 +1288,6 @@ pub struct MatrixPlan {
     pub reuse_existing: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct FrontierConfig {
-    pub machine_label: String,
-    pub runs_dir: PathBuf,
-    pub scenarios: Vec<ScenarioConfig>,
-    pub baseline_queues: Vec<QueueKind>,
-    pub fastfifo_block_sizes: Vec<usize>,
-    pub lfqueue_segment_sizes: Vec<usize>,
-    pub wcq_capacities: Vec<usize>,
-    pub seed_labels: Vec<String>,
-    pub modes: Vec<Mode>,
-    pub items_per_producer_values: Vec<u64>,
-    pub repeats: usize,
-    pub available_parallelism: usize,
-}
 
 /// Outcome returned after a matrix scheduler finishes. Infrastructure errors
 /// such as worker spawn or protocol failures still propagate as `Err`.
@@ -1313,57 +1300,77 @@ pub struct BatchOutcome {
     pub crashed_job: Option<(String, String)>,
 }
 
+/// Per-scenario file-level metadata. One `OutputMeta` describes the whole
+/// coalesced `record.json` for a (machine_label, scenario) pair, not a
+/// single sample — everything that varies per sample lives on `BenchRecord`
+/// instead. `last_updated_unix_ms`, `host_uname`, `git_commit`, `git_dirty`,
+/// `rustc_version`, and `package_version` are purely informational
+/// provenance of the most recent write; nothing here gates reuse.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutputMeta {
-    pub timestamp_unix_ms: u128,
     pub machine_label: String,
     pub scenario: String,
     pub producers: usize,
     pub consumers: usize,
-    pub repeat_index: usize,
-    pub available_parallelism: usize,
-    pub core_placement: CorePlacement,
+    pub last_updated_unix_ms: u128,
     #[serde(default)]
-    pub selected_core_ids: Vec<usize>,
+    pub host_uname: String,
     #[serde(default)]
-    pub producer_core_ids: Vec<usize>,
+    pub git_commit: String,
     #[serde(default)]
-    pub consumer_core_ids: Vec<usize>,
+    pub git_dirty: bool,
     #[serde(default)]
-    pub affinity_authoritative: bool,
-    #[serde(default = "default_schedule_seed")]
-    pub schedule_seed: u64,
+    pub rustc_version: String,
     #[serde(default)]
-    pub throughput_policy: ThroughputPolicy,
-    #[serde(default)]
-    pub experiment_fingerprint: String,
-    #[serde(default)]
-    pub item_policy: ItemPolicy,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ubq_label: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ubq_block_size: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dubq_label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dubq_min_block_size: Option<u16>,
+    pub package_version: String,
+    // Grid-coverage descriptor, merged (union/max) across every plan that has
+    // ever written into this file — drives the "grid exhausted" badge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ubq_grid: Option<UbqGrid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_ubq_configurations: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_dubq_configurations: Option<usize>,
+    #[serde(default)]
+    pub expected_ubq_configurations: usize,
+    #[serde(default)]
+    pub expected_dubq_configurations: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ubq_batch_sizes: Vec<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub planned_repeats: Option<usize>,
+    #[serde(default)]
+    pub planned_repeats: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub planned_items_per_producer: Vec<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// The measurement conditions a sample was collected under. Stamped on every
+/// `BenchRecord` (not just once per file) so reuse can gate per-sample: if a
+/// scenario's `record.json` already has some records measured under one
+/// protocol and a later run under the same machine-label changes e.g.
+/// `--throughput-phase-ms`, only the affected samples recompute.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MeasurementProtocol {
+    pub available_parallelism: usize,
+    pub core_placement: CorePlacement,
+    pub affinity_authoritative: bool,
+    pub selected_core_ids: Vec<usize>,
+    pub item_policy: ItemPolicy,
+    pub throughput_policy: ThroughputPolicy,
+}
+
+impl MeasurementProtocol {
+    fn from_plan(plan: &MatrixPlan) -> Result<Self, String> {
+        Ok(Self {
+            available_parallelism: plan.available_parallelism,
+            core_placement: plan.core_placement,
+            affinity_authoritative: !plan.allow_unpinned,
+            selected_core_ids: selected_plan_core_ids(plan)?,
+            item_policy: plan.item_policy,
+            throughput_policy: plan.throughput_policy,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchRecordStatus {
+    #[default]
     Completed,
     Failed,
     TimedOut,
@@ -1408,9 +1415,15 @@ fn is_completed_status(status: &BenchRecordStatus) -> bool {
     matches!(status, BenchRecordStatus::Completed)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BenchRecord {
+    #[serde(default)]
+    pub repeat_index: usize,
     pub queue: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ubq_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dubq_label: Option<String>,
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<usize>,
@@ -1453,6 +1466,13 @@ pub struct BenchRecord {
     pub timeout_ns: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throughput_metrics: Option<ThroughputMetrics>,
+    #[serde(default)]
+    pub protocol: MeasurementProtocol,
+    // u64, not u128: this record crosses the worker subprocess IPC boundary
+    // inside an internally-tagged `WorkerResult` enum, and serde's tagged-enum
+    // deserialization does not support 128-bit integers.
+    #[serde(default)]
+    pub timestamp_unix_ms: u64,
 }
 
 impl BenchRecord {
@@ -1485,13 +1505,13 @@ impl fmt::Debug for JobFactory {
 #[derive(Default)]
 pub struct ExistingRunsIndex {
     pub records: BTreeMap<SampleKey, BenchRecord>,
-    record_timestamps: BTreeMap<SampleKey, u128>,
-    active_fingerprint: Option<String>,
-    active_fingerprint_timestamp: u128,
 }
 
+/// All state for one coalesced `runs_dir/<machine_label>/<scenario>/record.json`.
+/// A single scenario file aggregates every queue/config/repeat measured for
+/// that scenario, so this groups by scenario rather than by `PlanBundle`.
 #[derive(Clone)]
-struct BundleOutputState {
+struct ScenarioOutputState {
     meta: OutputMeta,
     path: PathBuf,
     ordered_keys: Vec<SampleKey>,
@@ -1499,12 +1519,14 @@ struct BundleOutputState {
     dirty: bool,
 }
 
-impl BundleOutputState {
-    fn new(plan: &MatrixPlan, bundle: &PlanBundle, run_id: &str) -> Result<Self, String> {
+impl ScenarioOutputState {
+    fn new(plan: &MatrixPlan, scenario: &ScenarioConfig) -> Result<Self, String> {
+        let path = output_path_for_scenario(plan, &scenario.name);
+        let previous_meta = read_existing_output_meta(&path);
         Ok(Self {
-            meta: bundle_output_meta(plan, bundle)?,
-            path: output_path_for_bundle(plan, bundle, run_id),
-            ordered_keys: expected_keys_for_bundle(plan, bundle),
+            meta: scenario_output_meta(plan, scenario, previous_meta.as_ref()),
+            path,
+            ordered_keys: expected_keys_for_scenario(plan, &scenario.name),
             records: BTreeMap::new(),
             dirty: false,
         })
@@ -1526,7 +1548,7 @@ impl BundleOutputState {
             return Ok(false);
         }
 
-        self.meta.timestamp_unix_ms = now_unix_ms();
+        self.meta.last_updated_unix_ms = now_unix_ms();
         let output = OutputFile {
             schema_version: RUN_SCHEMA_VERSION,
             meta: self.meta.clone(),
@@ -1545,32 +1567,29 @@ impl BundleOutputState {
 }
 
 struct IncrementalOutputWriter {
-    bundles: Vec<BundleOutputState>,
-    bundle_indices_by_key: BTreeMap<SampleKey, Vec<usize>>,
+    scenarios: Vec<ScenarioOutputState>,
+    scenario_index_by_name: BTreeMap<String, usize>,
     write_count: usize,
 }
 
 impl IncrementalOutputWriter {
     fn new(plan: &MatrixPlan, cache: &ExistingRunsIndex) -> Result<Self, String> {
-        let run_id = format!("{}", now_unix_nanos());
-        let mut bundles = Vec::with_capacity(plan.bundles.len());
-        let mut bundle_indices_by_key: BTreeMap<SampleKey, Vec<usize>> = BTreeMap::new();
+        let mut scenarios = Vec::new();
+        let mut scenario_index_by_name: BTreeMap<String, usize> = BTreeMap::new();
 
         for bundle in &plan.bundles {
-            let index = bundles.len();
-            let state = BundleOutputState::new(plan, bundle, &run_id)?;
-            for key in &state.ordered_keys {
-                bundle_indices_by_key
-                    .entry(key.clone())
-                    .or_default()
-                    .push(index);
+            if scenario_index_by_name.contains_key(&bundle.scenario.name) {
+                continue;
             }
-            bundles.push(state);
+            let index = scenarios.len();
+            let state = ScenarioOutputState::new(plan, &bundle.scenario)?;
+            scenario_index_by_name.insert(bundle.scenario.name.clone(), index);
+            scenarios.push(state);
         }
 
         let mut writer = Self {
-            bundles,
-            bundle_indices_by_key,
+            scenarios,
+            scenario_index_by_name,
             write_count: 0,
         };
         for (key, record) in &cache.records {
@@ -1580,14 +1599,12 @@ impl IncrementalOutputWriter {
     }
 
     fn seed_cached_record(&mut self, key: &SampleKey, record: &BenchRecord) {
-        let Some(indices) = self.bundle_indices_by_key.get(key).cloned() else {
+        let Some(&index) = self.scenario_index_by_name.get(&key.scenario) else {
             return;
         };
-        for index in indices {
-            self.bundles[index]
-                .records
-                .insert(key.clone(), record.clone());
-        }
+        self.scenarios[index]
+            .records
+            .insert(key.clone(), record.clone());
     }
 
     fn handle_completed_record(
@@ -1595,9 +1612,9 @@ impl IncrementalOutputWriter {
         key: SampleKey,
         record: BenchRecord,
     ) -> Result<(), String> {
-        let Some(indices) = self.bundle_indices_by_key.get(&key).cloned() else {
+        let Some(&index) = self.scenario_index_by_name.get(&key.scenario) else {
             return Err(format!(
-                "missing output bundle mapping for {} scenario={} repeat={} mode={} items={}",
+                "missing output scenario mapping for {} scenario={} repeat={} mode={} items={}",
                 key.queue_label,
                 key.scenario,
                 key.repeat_index,
@@ -1606,12 +1623,10 @@ impl IncrementalOutputWriter {
             ));
         };
 
-        for index in indices {
-            let bundle = &mut self.bundles[index];
-            bundle.store_record(&key, &record);
-            if bundle.flush()? {
-                self.write_count += 1;
-            }
+        let scenario = &mut self.scenarios[index];
+        scenario.store_record(&key, &record);
+        if scenario.flush()? {
+            self.write_count += 1;
         }
 
         Ok(())
@@ -1619,8 +1634,8 @@ impl IncrementalOutputWriter {
 
     fn finish(mut self, expect_complete: bool) -> Result<usize, String> {
         if expect_complete {
-            for bundle in &self.bundles {
-                if let Some(missing) = bundle.missing_keys().next() {
+            for scenario in &self.scenarios {
+                if let Some(missing) = scenario.missing_keys().next() {
                     return Err(format!(
                         "missing cached record for {} scenario={} repeat={} mode={} items={}",
                         missing.queue_label,
@@ -1633,8 +1648,8 @@ impl IncrementalOutputWriter {
             }
         }
 
-        for bundle in &mut self.bundles {
-            if bundle.flush()? {
+        for scenario in &mut self.scenarios {
+            if scenario.flush()? {
                 self.write_count += 1;
             }
         }
@@ -2188,50 +2203,6 @@ fn wcq_mode_supported(
     // The current wCQ dependency remains excluded from comparative jobs due
     // to its known wrapped-ring emptiness and split-CAS correctness issues.
     false
-}
-
-fn baseline_queue_labels_for_sample(
-    baseline_queues: &[QueueKind],
-    fastfifo_block_sizes: &[usize],
-    lfqueue_segment_sizes: &[usize],
-    wcq_capacities: &[usize],
-    scenario: &ScenarioConfig,
-    mode: Mode,
-    items_per_producer: u64,
-) -> Vec<String> {
-    let mut labels = Vec::new();
-    for queue in baseline_queues {
-        match queue {
-            QueueKind::FastFifo => {
-                labels.extend(
-                    fastfifo_block_sizes.iter().copied().map(|block_size| {
-                        fastfifo_queue_label(block_size, DEFAULT_FASTFIFO_CAPACITY)
-                    }),
-                );
-            }
-            QueueKind::LfQueue => {
-                labels.extend(
-                    lfqueue_segment_sizes
-                        .iter()
-                        .copied()
-                        .map(lfqueue_queue_label),
-                );
-            }
-            QueueKind::Wcq => {
-                labels.extend(
-                    wcq_capacities
-                        .iter()
-                        .copied()
-                        .filter(|capacity| {
-                            wcq_mode_supported(mode, *capacity, scenario, items_per_producer)
-                        })
-                        .map(wcq_queue_label),
-                );
-            }
-            _ => labels.push(queue.name().to_string()),
-        }
-    }
-    labels
 }
 
 pub fn parse_queue_kinds(raw: &str) -> Result<Vec<QueueKind>, String> {
@@ -2837,32 +2808,29 @@ pub fn parse_embedded_plan(raw: &str) -> Result<MatrixPlan, String> {
     Ok(plan)
 }
 
-pub fn load_existing_runs(
-    runs_dir: &Path,
-    machine_label: &str,
-) -> Result<ExistingRunsIndex, String> {
-    load_existing_runs_for_fingerprint(runs_dir, machine_label, None)
-}
+/// Loads every scenario's coalesced `record.json` a plan would touch and
+/// keeps only samples that are reusable for it: schema-compatible,
+/// completed, recorded under this exact `machine_label`, and measured under
+/// the same [`MeasurementProtocol`] this plan would use. There's no
+/// recursive directory scan — each scenario's path is a direct lookup, and
+/// at most one record exists per `SampleKey` since a scenario's samples all
+/// live in one file by construction.
+pub fn load_existing_runs(plan: &MatrixPlan) -> Result<ExistingRunsIndex, String> {
+    let protocol = MeasurementProtocol::from_plan(plan)?;
+    let machine_label = normalize_machine(&plan.machine_label);
+    let mut scenario_names: BTreeSet<&str> = BTreeSet::new();
+    for bundle in &plan.bundles {
+        scenario_names.insert(&bundle.scenario.name);
+    }
 
-fn load_existing_runs_for_fingerprint(
-    runs_dir: &Path,
-    machine_label: &str,
-    expected_fingerprint: Option<&str>,
-) -> Result<ExistingRunsIndex, String> {
-    let mut files = Vec::new();
-    collect_run_jsons_recursive(runs_dir, &mut files)?;
-    files.sort();
-    let machine_label = normalize_machine(machine_label);
     let mut index = ExistingRunsIndex::default();
-
-    for path in files {
-        let raw = match fs::read_to_string(&path) {
-            Ok(value) => value,
-            Err(_) => continue,
+    for scenario_name in scenario_names {
+        let path = output_path_for_scenario(plan, scenario_name);
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
         };
-        let parsed: OutputFile = match serde_json::from_str(&raw) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let Ok(parsed) = serde_json::from_str::<OutputFile>(&raw) else {
+            continue;
         };
         if parsed.schema_version != RUN_SCHEMA_VERSION {
             continue;
@@ -2870,35 +2838,16 @@ fn load_existing_runs_for_fingerprint(
         if normalize_machine(&parsed.meta.machine_label) != machine_label {
             continue;
         }
-        if expected_fingerprint
-            .is_some_and(|expected| parsed.meta.experiment_fingerprint != expected)
-        {
-            continue;
-        }
-        if expected_fingerprint.is_none() {
-            let fingerprint = &parsed.meta.experiment_fingerprint;
-            if index.active_fingerprint.as_ref() != Some(fingerprint) {
-                if parsed.meta.timestamp_unix_ms < index.active_fingerprint_timestamp {
-                    continue;
-                }
-                index.records.clear();
-                index.record_timestamps.clear();
-                index.active_fingerprint = Some(fingerprint.clone());
-            }
-            index.active_fingerprint_timestamp = index
-                .active_fingerprint_timestamp
-                .max(parsed.meta.timestamp_unix_ms);
-        }
         for record in parsed.results {
-            if !record.completed() {
+            if !record.completed() || record.protocol != protocol {
                 continue;
             }
             let queue_label = match record.queue.as_str() {
-                "ubq" => match parsed.meta.ubq_label.as_deref() {
+                "ubq" => match record.ubq_label.as_deref() {
                     Some(label) => format!("ubq_{label}"),
                     None => continue,
                 },
-                "dubq" => match parsed.meta.dubq_label.as_deref() {
+                "dubq" => match record.dubq_label.as_deref() {
                     Some(label) => format!("dubq_{label}"),
                     None => continue,
                 },
@@ -2910,24 +2859,21 @@ fn load_existing_runs_for_fingerprint(
                 .map(|metrics| metrics.requested_items_per_producer)
                 .unwrap_or(record.items_per_producer);
             let key = SampleKey {
-                scenario: parsed.meta.scenario.clone(),
-                repeat_index: parsed.meta.repeat_index,
+                scenario: scenario_name.to_string(),
+                repeat_index: record.repeat_index,
                 mode: Mode::parse(&record.mode).unwrap_or(Mode::Throughput),
                 items_per_producer: requested_items_per_producer,
                 queue_label,
                 batch_size: record.batch_size,
             };
-            let timestamp = parsed.meta.timestamp_unix_ms;
-            if timestamp >= index.record_timestamps.get(&key).copied().unwrap_or(0) {
-                index.record_timestamps.insert(key.clone(), timestamp);
-                index.records.insert(key, record);
-            }
+            index.records.insert(key, record);
         }
     }
 
     Ok(index)
 }
 
+#[cfg(test)]
 fn collect_run_jsons_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
@@ -3853,66 +3799,6 @@ pub fn make_fastfifo_job_factory(
     JobFactory { spec, run }
 }
 
-pub fn run_embedded_scheduler(plan: MatrixPlan, factories: Vec<JobFactory>) -> Result<(), String> {
-    let mut required = required_job_specs(&plan);
-    print_core_placement(&plan);
-    let mut factory_by_key: BTreeMap<SampleKey, JobFactory> = BTreeMap::new();
-    for factory in factories {
-        let key = SampleKey::from_job(&factory.spec);
-        if required.contains(&factory.spec) {
-            factory_by_key.insert(key, factory);
-        }
-    }
-
-    let fingerprint = experiment_fingerprint(&plan)?;
-    let existing_runs = load_existing_runs_for_fingerprint(
-        &plan.runs_dir,
-        &plan.machine_label,
-        Some(&fingerprint),
-    )?;
-    let timing_estimator = TimingEstimator::from_history(&existing_runs);
-    let mut cache = if plan.reuse_existing {
-        existing_runs
-    } else {
-        ExistingRunsIndex::default()
-    };
-
-    let mut pending = Vec::new();
-    for spec in required.iter() {
-        let key = SampleKey::from_job(spec);
-        if cache.records.contains_key(&key) {
-            continue;
-        }
-        let factory = factory_by_key
-            .remove(&key)
-            .ok_or_else(|| format!("missing generated job factory for {}", spec.queue_label()))?;
-        pending.push(factory);
-    }
-
-    progress_line(format!(
-        "{} bundle(s), {} required sample(s), {} cached, {} pending",
-        plan.bundles.len(),
-        required.len(),
-        required.len().saturating_sub(pending.len()),
-        pending.len()
-    ));
-    let (executed, crashed_job) = execute_job_factories(
-        &plan,
-        &cache,
-        pending,
-        plan.available_parallelism,
-        timing_estimator,
-    )?;
-    cache.records.extend(executed);
-    required.clear();
-    if let Some((queue_label, scenario)) = crashed_job {
-        return Err(format!(
-            "scheduler crashed while running ({queue_label}, scenario={scenario})"
-        ));
-    }
-    Ok(())
-}
-
 fn selected_plan_core_ids(plan: &MatrixPlan) -> Result<Vec<usize>, String> {
     let discovered = core_affinity::get_core_ids()
         .unwrap_or_default()
@@ -4467,6 +4353,7 @@ fn execute_job_specs_with_timeout(
     let mut results = BTreeMap::new();
     let mut completed = initially_complete;
     let pending_count = pending.len();
+    let current_protocol = MeasurementProtocol::from_plan(plan)?;
     let execution_result = (|| -> Result<(), String> {
         for (index, spec) in pending.into_iter().enumerate() {
             if progress_header_due(index) {
@@ -4515,6 +4402,11 @@ fn execute_job_specs_with_timeout(
                     _ => None,
                 };
             }
+            record.repeat_index = spec.repeat_index;
+            record.ubq_label = spec.ubq_label.clone();
+            record.dubq_label = spec.dubq_label.clone();
+            record.protocol = current_protocol.clone();
+            record.timestamp_unix_ms = now_unix_ms() as u64;
 
             completed += 1;
             let status = match &record.status {
@@ -4561,113 +4453,6 @@ fn execute_job_specs_with_timeout(
     }
 }
 
-fn execute_job_factories(
-    plan: &MatrixPlan,
-    cache: &ExistingRunsIndex,
-    mut pending: Vec<JobFactory>,
-    available_parallelism: usize,
-    mut timing_estimator: TimingEstimator,
-) -> Result<(BTreeMap<SampleKey, BenchRecord>, Option<(String, String)>), String> {
-    for job in &pending {
-        if job.spec.thread_budget() > available_parallelism {
-            return Err(format!(
-                "job {} requires {} threads but available_parallelism is {}",
-                job.spec.queue_label(),
-                job.spec.thread_budget(),
-                available_parallelism
-            ));
-        }
-    }
-
-    pending.sort_by(|lhs, rhs| lhs.spec.sort_key().cmp(&rhs.spec.sort_key()));
-    let required_specs = required_job_specs(plan);
-    let total_jobs = required_specs.len();
-    let progress_layout = ProgressLayout::new(required_specs.iter());
-    let initially_complete = total_jobs.saturating_sub(pending.len());
-    progress_line(format!(
-        "starting {} pending benchmark job(s); {}/{} ({:.2}%) already complete; available parallelism {}",
-        pending.len(),
-        initially_complete,
-        total_jobs,
-        completion_percent(initially_complete, total_jobs),
-        available_parallelism
-    ));
-    let writer = OutputWriterHandle::start(plan, cache)?;
-    if pending.is_empty() {
-        writer.close(true)?;
-        return Ok((BTreeMap::new(), None));
-    }
-    let session_started_at = Instant::now();
-    let execution_result = (|| -> Result<_, String> {
-        let mut results = BTreeMap::new();
-        let mut completed = initially_complete;
-        let pending_count = pending.len();
-
-        for (index, job) in pending.into_iter().enumerate() {
-            if progress_header_due(index) {
-                progress_layout.print_header();
-            }
-            let key = SampleKey::from_job(&job.spec);
-            let budget = job.spec.thread_budget();
-            let remaining = pending_count - index - 1;
-            progress_layout.print_pending_row(&key, budget, remaining, completed + 1, total_jobs);
-
-            let started_at = Instant::now();
-            let timeout_spec = job.spec.clone();
-            let record =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.run)(0))) {
-                    Ok(record) => record,
-                    Err(payload) => {
-                        let elapsed_ns = started_at.elapsed().as_nanos() as u64;
-                        failed_bench_record(
-                            &timeout_spec,
-                            BenchRecordStatus::Failed,
-                            panic_payload_message(payload),
-                            elapsed_ns,
-                            None,
-                        )
-                    }
-                };
-
-            completed += 1;
-            let status = match &record.status {
-                BenchRecordStatus::Completed => "DONE",
-                BenchRecordStatus::Failed => "FAILED",
-                BenchRecordStatus::TimedOut => "TIMED OUT",
-            };
-            let trial_duration = started_at.elapsed();
-            if record.completed() {
-                timing_estimator.observe(trial_duration);
-            }
-            progress_layout.print_completed_suffix(
-                trial_duration,
-                session_started_at.elapsed(),
-                timing_estimator.estimate_remaining(remaining),
-                status,
-            );
-            if !record.completed() {
-                progress_line(format!(
-                    "reason | {}",
-                    record.failure_reason.as_deref().unwrap_or("unknown")
-                ));
-            }
-            writer.submit(key.clone(), record.clone())?;
-            results.insert(key, record);
-        }
-
-        Ok((results, None))
-    })();
-    let is_fully_complete = matches!(&execution_result, Ok((_, None)));
-    let writer_result = writer.close(is_fully_complete);
-    match (execution_result, writer_result) {
-        (Ok(pair), Ok(_)) => Ok(pair),
-        (Err(exec_err), Ok(_)) => Err(exec_err),
-        (Ok(_), Err(writer_err)) => Err(writer_err),
-        (Err(exec_err), Err(writer_err)) => {
-            Err(format!("{exec_err}; output writer error: {writer_err}"))
-        }
-    }
-}
 
 fn result_key_sort(lhs: &SampleKey, rhs: &SampleKey) -> Ordering {
     let queue_order = |label: &str| match label {
@@ -4901,6 +4686,24 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
     keys
 }
 
+/// Union of `expected_keys_for_bundle` across every bundle for a scenario,
+/// deduplicated. Every bundle used to duplicate its baseline-queue keys so
+/// each per-label output file was self-contained; that duplication is no
+/// longer needed once every bundle for a scenario shares one output file.
+fn expected_keys_for_scenario(plan: &MatrixPlan, scenario_name: &str) -> Vec<SampleKey> {
+    let mut keys: BTreeSet<SampleKey> = BTreeSet::new();
+    for bundle in plan
+        .bundles
+        .iter()
+        .filter(|bundle| bundle.scenario.name == scenario_name)
+    {
+        keys.extend(expected_keys_for_bundle(plan, bundle));
+    }
+    let mut keys: Vec<SampleKey> = keys.into_iter().collect();
+    keys.sort_by(result_key_sort);
+    keys
+}
+
 fn command_output(program: &str, args: &[&str]) -> String {
     Command::new(program)
         .args(args)
@@ -4911,161 +4714,115 @@ fn command_output(program: &str, args: &[&str]) -> String {
         .unwrap_or_else(|| "unavailable".to_string())
 }
 
-fn experiment_fingerprint(plan: &MatrixPlan) -> Result<String, String> {
-    static SOURCE_IDENTITY: OnceLock<String> = OnceLock::new();
-    static MACHINE_IDENTITY: OnceLock<String> = OnceLock::new();
-    let selected_core_ids = selected_plan_core_ids(plan)?;
-    let source_identity = SOURCE_IDENTITY.get_or_init(|| {
-        let cargo_lock = fs::read("Cargo.lock").unwrap_or_default();
-        let git_head = command_output("git", &["rev-parse", "HEAD"]);
-        let git_status = command_output(
-            "git",
-            &[
-                "status", "--porcelain=v1", "--untracked-files=all", "--", "Cargo.toml",
-                "Cargo.lock", "build.rs", "src", "benches", "scripts",
-            ],
-        );
-        let git_diff = command_output(
-            "git",
-            &[
-                "diff", "--binary", "HEAD", "--", "Cargo.toml", "Cargo.lock", "build.rs",
-                "src", "benches", "scripts",
-            ],
-        );
-        let rustc = command_output("rustc", &["--version", "--verbose"]);
-        format!(
-            "git_head={git_head};git_status={git_status};git_diff={git_diff};rustc={rustc};cargo_lock={cargo_lock:?}"
-        )
-    });
-    let machine_identity = MACHINE_IDENTITY.get_or_init(|| {
-        format!(
-            "uname={};cpu={};model={};lscpu={}",
-            command_output("uname", &["-a"]),
-            command_output("sysctl", &["-n", "machdep.cpu.brand_string"]),
-            command_output("sysctl", &["-n", "hw.model"]),
-            command_output("lscpu", &[]),
-        )
-    });
-    // This fingerprint describes the environment and measurement protocol, not
-    // the requested coverage. SampleKey already identifies the scenario,
-    // repeat, mode, workload size, queue configuration, and batch size. Keeping
-    // selection-only fields out lets a narrower or wider plan reuse its exact
-    // overlap without accepting measurements made under different conditions.
-    let identity = format!(
-        "compatibility=v1;schema={RUN_SCHEMA_VERSION};plan={PLAN_SCHEMA_VERSION};package={}@{};target={};debug={};features=registry:{}-fastfifo:{}-lfqueue:{}-wcq:{};machine={};os={};machine_identity={machine_identity};available_parallelism={};cores={:?};placement={:?};allow_unpinned={};schedule_seed={};item_policy={:?};throughput_policy={:?};job_timeout={:?};effective_job_timeout={:?};source={source_identity}",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
-        host_target(),
-        cfg!(debug_assertions),
-        cfg!(feature = "bench_registry"),
-        cfg!(feature = "bench_fastfifo"),
-        cfg!(feature = "bench_lfqueue"),
-        cfg!(feature = "bench_wcq"),
-        normalize_machine(&plan.machine_label),
-        std::env::consts::OS,
-        plan.available_parallelism,
-        selected_core_ids,
-        plan.core_placement,
-        plan.allow_unpinned,
-        plan.schedule_seed,
-        plan.item_policy,
-        plan.throughput_policy,
-        plan.job_timeout_secs,
-        bench_job_timeout(plan),
-    );
-    Ok(format!(
-        "{:016x}",
-        stable_hash64(0x5542_5106, identity.as_bytes())
-    ))
+/// Cheap, purely informational provenance of the machine/build that produced
+/// a scenario's data. Never gates reuse — reuse gates on machine-label plus
+/// `MeasurementProtocol` (see [`MeasurementProtocol::from_plan`]) instead.
+struct SystemProvenance {
+    host_uname: String,
+    git_commit: String,
+    git_dirty: bool,
+    rustc_version: String,
+    package_version: String,
 }
 
-fn bundle_output_meta(plan: &MatrixPlan, bundle: &PlanBundle) -> Result<OutputMeta, String> {
-    let selected_core_ids = selected_plan_core_ids(plan)?;
-    let ubq_label = bundle.ubq_label.clone();
-    let ubq_block_size = match ubq_label.as_deref() {
-        Some(label) => Some(parse_ubq_label(label, true)?.block),
-        None => None,
-    };
-    let dubq_label = bundle.dubq_label.clone();
-    let dubq_min_block_size = match dubq_label.as_deref() {
-        Some(label) => Some(parse_dubq_label(label)?.min_block_size),
-        None => None,
-    };
-    let expected_ubq_configurations = plan.ubq_grid.map(|_| {
-        plan.bundles
-            .iter()
-            .filter(|candidate| candidate.scenario == bundle.scenario)
-            .filter_map(|candidate| candidate.ubq_label.as_deref())
-            .collect::<BTreeSet<_>>()
-            .len()
-    });
-    let expected_dubq_configurations = plan.ubq_grid.map(|_| {
-        plan.bundles
-            .iter()
-            .filter(|candidate| candidate.scenario == bundle.scenario)
-            .filter_map(|candidate| candidate.dubq_label.as_deref())
-            .collect::<BTreeSet<_>>()
-            .len()
-    });
-    let planned_items_per_producer = if plan.ubq_grid.is_some() {
-        plan.bundles
-            .iter()
-            .filter(|candidate| candidate.scenario == bundle.scenario)
-            .flat_map(|candidate| candidate.items_per_producer_values.iter().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    } else {
-        Vec::new()
-    };
-    Ok(OutputMeta {
-        timestamp_unix_ms: now_unix_ms(),
+fn system_provenance() -> &'static SystemProvenance {
+    static PROVENANCE: OnceLock<SystemProvenance> = OnceLock::new();
+    PROVENANCE.get_or_init(|| SystemProvenance {
+        host_uname: command_output("uname", &["-a"]).trim().to_string(),
+        git_commit: command_output("git", &["rev-parse", "--short", "HEAD"])
+            .trim()
+            .to_string(),
+        git_dirty: !command_output("git", &["status", "--porcelain=v1"])
+            .trim()
+            .is_empty(),
+        rustc_version: command_output("rustc", &["--version"]).trim().to_string(),
+        package_version: env!("CARGO_PKG_VERSION").to_string(),
+    })
+}
+
+/// Builds this invocation's metadata for a scenario's coalesced record,
+/// merging (union/max) grid-coverage fields with whatever was already on
+/// disk so a narrower follow-up plan never shrinks the reported "expected"
+/// grid. `previous` is the scenario's `record.json` meta from before this
+/// write, if any.
+fn scenario_output_meta(
+    plan: &MatrixPlan,
+    scenario: &ScenarioConfig,
+    previous: Option<&OutputMeta>,
+) -> OutputMeta {
+    let expected_ubq_configurations = plan
+        .bundles
+        .iter()
+        .filter(|candidate| candidate.scenario.name == scenario.name)
+        .filter_map(|candidate| candidate.ubq_label.as_deref())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let expected_dubq_configurations = plan
+        .bundles
+        .iter()
+        .filter(|candidate| candidate.scenario.name == scenario.name)
+        .filter_map(|candidate| candidate.dubq_label.as_deref())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let planned_items_per_producer = plan
+        .bundles
+        .iter()
+        .filter(|candidate| candidate.scenario.name == scenario.name)
+        .flat_map(|candidate| candidate.items_per_producer_values.iter().copied())
+        .collect::<BTreeSet<_>>();
+
+    let provenance = system_provenance();
+    let mut meta = OutputMeta {
         machine_label: plan.machine_label.clone(),
-        scenario: bundle.scenario.name.clone(),
-        producers: bundle.scenario.producers,
-        consumers: bundle.scenario.consumers,
-        repeat_index: bundle.repeat_index,
-        available_parallelism: plan.available_parallelism,
-        core_placement: plan.core_placement,
-        producer_core_ids: (0..bundle.scenario.producers)
-            .filter_map(|producer_id| {
-                selected_core_ids
-                    .get(producer_core_slot(
-                        bundle.scenario.producers,
-                        bundle.scenario.consumers,
-                        producer_id,
-                    ))
-                    .copied()
-            })
-            .collect(),
-        consumer_core_ids: (0..bundle.scenario.consumers)
-            .filter_map(|consumer_id| {
-                selected_core_ids
-                    .get(consumer_core_slot(
-                        bundle.scenario.producers,
-                        bundle.scenario.consumers,
-                        consumer_id,
-                    ))
-                    .copied()
-            })
-            .collect(),
-        selected_core_ids,
-        affinity_authoritative: !plan.allow_unpinned,
-        schedule_seed: plan.schedule_seed,
-        throughput_policy: plan.throughput_policy,
-        experiment_fingerprint: experiment_fingerprint(plan)?,
-        item_policy: plan.item_policy,
-        ubq_label,
-        ubq_block_size,
-        dubq_label,
-        dubq_min_block_size,
+        scenario: scenario.name.clone(),
+        producers: scenario.producers,
+        consumers: scenario.consumers,
+        last_updated_unix_ms: now_unix_ms(),
+        host_uname: provenance.host_uname.clone(),
+        git_commit: provenance.git_commit.clone(),
+        git_dirty: provenance.git_dirty,
+        rustc_version: provenance.rustc_version.clone(),
+        package_version: provenance.package_version.clone(),
         ubq_grid: plan.ubq_grid,
         expected_ubq_configurations,
         expected_dubq_configurations,
         ubq_batch_sizes: plan.ubq_batch_sizes.clone(),
-        planned_repeats: plan.ubq_grid.map(|_| plan.planned_repeats),
-        planned_items_per_producer,
-    })
+        planned_repeats: plan.planned_repeats,
+        planned_items_per_producer: planned_items_per_producer.into_iter().collect(),
+    };
+
+    if let Some(previous) = previous {
+        meta.ubq_grid = meta.ubq_grid.or(previous.ubq_grid);
+        meta.expected_ubq_configurations = meta
+            .expected_ubq_configurations
+            .max(previous.expected_ubq_configurations);
+        meta.expected_dubq_configurations = meta
+            .expected_dubq_configurations
+            .max(previous.expected_dubq_configurations);
+        meta.planned_repeats = meta.planned_repeats.max(previous.planned_repeats);
+        let batch_sizes: BTreeSet<usize> = meta
+            .ubq_batch_sizes
+            .iter()
+            .copied()
+            .chain(previous.ubq_batch_sizes.iter().copied())
+            .collect();
+        meta.ubq_batch_sizes = batch_sizes.into_iter().collect();
+        let items: BTreeSet<u64> = meta
+            .planned_items_per_producer
+            .iter()
+            .copied()
+            .chain(previous.planned_items_per_producer.iter().copied())
+            .collect();
+        meta.planned_items_per_producer = items.into_iter().collect();
+    }
+
+    meta
+}
+
+fn read_existing_output_meta(path: &Path) -> Option<OutputMeta> {
+    let raw = fs::read_to_string(path).ok()?;
+    let parsed: OutputFile = serde_json::from_str(&raw).ok()?;
+    (parsed.schema_version == RUN_SCHEMA_VERSION).then_some(parsed.meta)
 }
 
 fn atomic_write_string(path: &Path, contents: &str) -> Result<(), String> {
@@ -5106,285 +4863,15 @@ fn atomic_write_string(path: &Path, contents: &str) -> Result<(), String> {
     }
 }
 
-fn output_path_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle, run_id: &str) -> PathBuf {
-    let label = if let Some(value) = bundle.ubq_label.as_deref() {
-        parse_ubq_label(value, true).expect("valid label").safe()
-    } else if let Some(value) = bundle.dubq_label.as_deref() {
-        format!(
-            "dubq_{}",
-            parse_dubq_label(value).expect("valid DUBQ label").safe()
-        )
-    } else {
-        "baseline".to_string()
-    };
+/// The single coalesced record for a (machine_label, scenario) pair. Every
+/// queue/config/repeat measured for that scenario lives in this one file,
+/// reopened and updated in place across invocations rather than a fresh file
+/// per run.
+fn output_path_for_scenario(plan: &MatrixPlan, scenario_name: &str) -> PathBuf {
     plan.runs_dir
         .join(sanitize_name(&plan.machine_label))
-        .join(sanitize_name(&bundle.scenario.name))
-        .join(label)
-        .join(format!("{run_id}_r{}.json", bundle.repeat_index))
-}
-
-/// Parses a legacy scheduler stdout tracking line of the form
-/// `"scheduler: start <label> scenario=<s> repeat=<n> ..."` or
-/// `"scheduler: done <label> scenario=<s> repeat=<n> ..."`.
-/// Returns `("start"|"done", queue_label, scenario, repeat_index)` or `None`.
-fn parse_scheduler_tracking_line(line: &str) -> Option<(&'static str, String, String, usize)> {
-    let (verb, rest) = if let Some(rest) = line.strip_prefix("scheduler: start ") {
-        ("start", rest)
-    } else if let Some(rest) = line.strip_prefix("scheduler: done ") {
-        ("done", rest)
-    } else {
-        return None;
-    };
-    let mut parts = rest.split_ascii_whitespace();
-    let queue_label = parts.next()?.to_string();
-    let mut scenario = String::new();
-    let mut repeat_index: usize = 0;
-    for field in parts {
-        if let Some(v) = field.strip_prefix("scenario=") {
-            scenario = v.to_string();
-        } else if let Some(v) = field.strip_prefix("repeat=") {
-            repeat_index = v.parse().unwrap_or(0);
-        }
-    }
-    if scenario.is_empty() {
-        return None;
-    }
-    Some((verb, queue_label, scenario, repeat_index))
-}
-
-pub fn build_and_run_matrix_plan(
-    plan: &MatrixPlan,
-    dry_run: bool,
-) -> Result<(PathBuf, BatchOutcome), String> {
-    let repo_root =
-        std::env::current_dir().map_err(|err| format!("failed to read current dir: {err}"))?;
-    let run_id = format!("{}", now_unix_nanos());
-    let generated_root = repo_root.join("target").join("bench_harness").join(run_id);
-    let src_dir = generated_root.join("src");
-    fs::create_dir_all(&src_dir).map_err(|err| {
-        format!(
-            "failed to create generated src dir {}: {err}",
-            src_dir.display()
-        )
-    })?;
-
-    let cargo_toml = generated_root.join("Cargo.toml");
-    let main_rs = src_dir.join("main.rs");
-    let plan_json = serde_json::to_string(plan)
-        .map_err(|err| format!("failed to serialize matrix plan: {err}"))?;
-    fs::write(&cargo_toml, generated_cargo_toml(&repo_root))
-        .map_err(|err| format!("failed to write {}: {err}", cargo_toml.display()))?;
-    fs::write(&main_rs, generated_main_source(plan, &plan_json))
-        .map_err(|err| format!("failed to write {}: {err}", main_rs.display()))?;
-
-    let required_jobs = required_job_specs(plan).len();
-    progress_line(format!(
-        "bench_matrix: prepared {} bundle(s), {} unique job(s), generated root {}",
-        plan.bundles.len(),
-        required_jobs,
-        generated_root.display()
-    ));
-    let mut cmd = Command::new("cargo");
-    cmd.arg("run")
-        .arg("--offline")
-        .arg("--release")
-        .arg("--manifest-path")
-        .arg(&cargo_toml);
-    if std::env::var("RUSTFLAGS").map_or(false, |f| f.contains("sanitizer")) {
-        cmd.arg("--target").arg(host_target());
-    }
-    if dry_run {
-        progress_line(format!(
-            "bench_matrix dry-run: cargo run --offline --release --manifest-path {}",
-            cargo_toml.display()
-        ));
-        return Ok((
-            generated_root,
-            BatchOutcome {
-                exit_success: true,
-                crashed_job: None,
-            },
-        ));
-    }
-
-    progress_line(format!(
-        "bench_matrix: building and running generated scheduler {}",
-        cargo_toml.display()
-    ));
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|err| format!("failed to launch generated scheduler: {err}"))?;
-
-    let child_stdout = child.stdout.take().expect("stdout was piped");
-    // Channel for tracking events: (verb, queue_label, scenario, repeat_index).
-    let (tracking_tx, tracking_rx) = mpsc::channel::<(&'static str, String, String, usize)>();
-    let stdout_thread = thread::spawn(move || {
-        let reader = BufReader::new(child_stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            println!("{line}");
-            let _ = io::stdout().flush();
-            if let Some((verb, queue_label, scenario, repeat_index)) =
-                parse_scheduler_tracking_line(&line)
-            {
-                let _ = tracking_tx.send((verb, queue_label, scenario, repeat_index));
-            }
-        }
-    });
-
-    let status = child
-        .wait()
-        .map_err(|err| format!("failed to wait on generated scheduler: {err}"))?;
-    let _ = stdout_thread.join();
-
-    let mut started: BTreeSet<(String, String, usize)> = BTreeSet::new();
-    let mut done: BTreeSet<(String, String, usize)> = BTreeSet::new();
-    for (verb, queue_label, scenario, repeat_index) in tracking_rx.try_iter() {
-        match verb {
-            "start" => {
-                started.insert((queue_label, scenario, repeat_index));
-            }
-            "done" => {
-                done.insert((queue_label, scenario, repeat_index));
-            }
-            _ => {}
-        }
-    }
-
-    if status.success() {
-        return Ok((
-            generated_root,
-            BatchOutcome {
-                exit_success: true,
-                crashed_job: None,
-            },
-        ));
-    }
-
-    // Crashed. Find the UBQ job that started but never completed.
-    let crashed_job = started
-        .difference(&done)
-        .find(|(label, _, _)| label.starts_with("ubq_"))
-        .map(|(label, scenario, _)| (label.clone(), scenario.clone()));
-
-    Ok((
-        generated_root,
-        BatchOutcome {
-            exit_success: false,
-            crashed_job,
-        },
-    ))
-}
-
-fn generated_cargo_toml(repo_root: &Path) -> String {
-    format!(
-        "[package]\nname = \"ubq_generated_scheduler\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nubq = {{ path = {:?}, features = [\"bench_rbbq\", \"bench_lfqueue\", \"bench_wcq\"] }}\n",
-        repo_root.display().to_string()
-    )
-}
-
-fn generated_main_source(plan: &MatrixPlan, plan_json: &str) -> String {
-    let mut out = String::new();
-    out.push_str("use ubq::bench_harness;\n");
-    out.push_str("use ubq::{UBQ, backoff};\n\n");
-    out.push_str("fn main() {\n");
-    out.push_str(
-        "    let plan = bench_harness::parse_embedded_plan(PLAN_JSON).expect(\"plan\");\n",
-    );
-    out.push_str("    let mut jobs = Vec::new();\n");
-
-    for spec in required_job_specs(plan) {
-        let scenario_expr = format!(
-            "bench_harness::ScenarioConfig::new({}, {})",
-            spec.scenario.producers, spec.scenario.consumers
-        );
-        match spec.queue {
-            QueueKind::SegQueue => {
-                out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_segqueue_job_factory_variant({scenario_expr}, {}, bench_harness::Mode::{:?}, {}, {:?}));\n",
-                    spec.repeat_index, spec.mode, spec.items_per_producer, spec.batch_size
-                ));
-            }
-            QueueKind::ConcurrentQueue => {
-                out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_concurrent_queue_job_factory({scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
-                    spec.repeat_index, spec.mode, spec.items_per_producer
-                ));
-            }
-            QueueKind::FastFifo => {
-                let block_size = spec
-                    .fastfifo_block_size
-                    .expect("RBBQ block size must be present");
-                let capacity = spec
-                    .fastfifo_capacity
-                    .expect("FastFifo capacity must be present");
-                out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_fastfifo_job_factory({}, {}, {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
-                    block_size, capacity, spec.repeat_index, spec.mode, spec.items_per_producer
-                ));
-            }
-            QueueKind::LfQueue => {
-                let segment_size = spec
-                    .lfqueue_segment_size
-                    .expect("lfqueue segment size must be present");
-                out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_lfqueue_job_factory({}, {scenario_expr}, {}, bench_harness::Mode::{:?}, {}));\n",
-                    segment_size, spec.repeat_index, spec.mode, spec.items_per_producer
-                ));
-            }
-            QueueKind::Wcq => {
-                let capacity = spec.wcq_capacity.expect("wCQ capacity must be present");
-                out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_wcq_job_factory({}, {scenario_expr}, {}, bench_harness::Mode::{:?}, {}).expect(\"supported wCQ capacity\"));\n",
-                    capacity, spec.repeat_index, spec.mode, spec.items_per_producer
-                ));
-            }
-            QueueKind::Ubq => {
-                let label = parse_ubq_label(
-                    spec.ubq_label
-                        .as_deref()
-                        .expect("ubq labels must be present"),
-                    true,
-                )
-                .expect("valid label");
-                out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_ubq_job_factory::<{}, {}>(\"{}\", {scenario_expr}, {}, bench_harness::Mode::{:?}, {}, {:?}));\n",
-                    ubq_type_expr(&label, "u64"),
-                    ubq_type_expr(&label, "bench_harness::LogRecord"),
-                    label.text(),
-                    spec.repeat_index,
-                    spec.mode,
-                    spec.items_per_producer,
-                    spec.batch_size
-                ));
-            }
-            QueueKind::Dubq => {
-                let label = spec
-                    .dubq_label
-                    .as_deref()
-                    .expect("DUBQ labels must be present");
-                out.push_str(&format!(
-                    "    jobs.push(bench_harness::make_dubq_job_factory(\"{}\", {scenario_expr}, {}, bench_harness::Mode::{:?}, {}, {:?}).expect(\"valid DUBQ label\"));\n",
-                    label,
-                    spec.repeat_index,
-                    spec.mode,
-                    spec.items_per_producer,
-                    spec.batch_size
-                ));
-            }
-        }
-    }
-
-    out.push_str(
-        "    bench_harness::run_embedded_scheduler(plan, jobs).expect(\"run scheduler\");\n",
-    );
-    out.push_str("}\n\n");
-    out.push_str("const PLAN_JSON: &str = r####\"");
-    out.push_str(plan_json);
-    out.push_str("\"####;\n");
-    out
+        .join(sanitize_name(scenario_name))
+        .join("record.json")
 }
 
 fn progress_line(message: impl AsRef<str>) {
@@ -5619,527 +5106,6 @@ impl ProgressLayout {
             status_width = PROGRESS_STATUS_WIDTH,
         ));
     }
-}
-
-fn ubq_type_expr(label: &UbqLabel, value_type: &str) -> String {
-    let backoff_ty = match label.backoff.as_str() {
-        "crossbeam" => "backoff::Crossbeam",
-        "yield" => "backoff::Yield",
-        _ => panic!("unsupported backoff {}", label.backoff),
-    };
-    format!("UBQ<{value_type}, {}, {backoff_ty}>", label.block)
-}
-
-pub fn frontier_search(config: &FrontierConfig, dry_run: bool) -> Result<(), String> {
-    let mut round = 0_usize;
-    let mut failed_attempts: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let mut incompletable: BTreeSet<(String, String)> = BTreeSet::new();
-
-    loop {
-        round += 1;
-        let index = load_existing_runs(&config.runs_dir, &config.machine_label)?;
-        let plan = compute_frontier_round_plan(config, &index, &incompletable)?;
-        if plan.bundles.is_empty() {
-            if incompletable.is_empty() {
-                progress_line(format!(
-                    "bench_frontier frontier-complete after {round} rounds"
-                ));
-            } else {
-                progress_line(format!(
-                    "bench_frontier frontier-complete after {round} rounds \
-                     ({} scenario(s) marked incompletable)",
-                    incompletable.len()
-                ));
-            }
-            return Ok(());
-        }
-        let required_jobs = required_job_specs(&plan).len();
-        progress_line(format!(
-            "bench_frontier round {}: scheduling {} bundle(s), {} unique job(s)",
-            round,
-            plan.bundles.len(),
-            required_jobs
-        ));
-        if dry_run {
-            for bundle in &plan.bundles {
-                progress_line(format!(
-                    "  scenario={} repeat={} label={}",
-                    bundle.scenario.name,
-                    bundle.repeat_index,
-                    bundle.ubq_label.as_deref().unwrap_or("baseline")
-                ));
-            }
-            return Ok(());
-        }
-        let outcome = run_matrix_plan_in_process(&plan, false)?;
-        if !outcome.exit_success {
-            match outcome.crashed_job {
-                Some((queue_label, scenario)) => {
-                    let key = (queue_label.clone(), scenario.clone());
-                    let count = failed_attempts.entry(key.clone()).or_insert(0);
-                    *count += 1;
-                    if *count >= config.repeats {
-                        incompletable.insert(key);
-                        progress_line(format!(
-                            "bench_frontier: marking ({queue_label}, {scenario}) incompletable \
-                             after {count} failed attempt(s)"
-                        ));
-                    } else {
-                        progress_line(format!(
-                            "bench_frontier: ({queue_label}, {scenario}) crashed \
-                             ({count}/{} attempts), will retry",
-                            config.repeats
-                        ));
-                    }
-                }
-                None => {
-                    return Err("generated scheduler crashed but no in-flight UBQ job \
-                         could be identified; check stderr for details"
-                        .to_string());
-                }
-            }
-        }
-    }
-}
-
-pub fn compute_frontier_round_plan(
-    config: &FrontierConfig,
-    index: &ExistingRunsIndex,
-    incompletable: &BTreeSet<(String, String)>,
-) -> Result<MatrixPlan, String> {
-    let mut normalized_seed_labels = Vec::with_capacity(config.seed_labels.len());
-    for seed in &config.seed_labels {
-        normalized_seed_labels.push(parse_ubq_label(seed, true)?);
-    }
-
-    let mut desired: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for scenario in &config.scenarios {
-        let entry = desired.entry(scenario.name.clone()).or_default();
-        for seed in &normalized_seed_labels {
-            if is_valid_ubq_label_for_scenario(seed, scenario) {
-                entry.insert(seed.text());
-            }
-        }
-        if entry.is_empty() {
-            return Err(format!(
-                "scenario {} has no valid seed labels after applying the FAA block-size constraint",
-                scenario.name
-            ));
-        }
-    }
-
-    let present_labels = collect_present_ubq_labels(index);
-    let globally_desired_winners = collect_global_winner_labels(
-        index,
-        &config.scenarios,
-        &present_labels,
-        &config.baseline_queues,
-        &config.fastfifo_block_sizes,
-        &config.lfqueue_segment_sizes,
-        &config.wcq_capacities,
-        &config.modes,
-        &config.items_per_producer_values,
-        config.repeats,
-    );
-    for label in globally_desired_winners {
-        let Ok(parsed) = parse_ubq_label(&label, true) else {
-            continue;
-        };
-        for scenario in &config.scenarios {
-            if is_valid_ubq_label_for_scenario(&parsed, scenario) {
-                desired
-                    .entry(scenario.name.clone())
-                    .or_default()
-                    .insert(label.clone());
-            }
-        }
-    }
-    let local_best_labels = collect_local_best_ubq_labels(
-        index,
-        &config.scenarios,
-        &present_labels,
-        &config.baseline_queues,
-        &config.fastfifo_block_sizes,
-        &config.lfqueue_segment_sizes,
-        &config.wcq_capacities,
-        &config.modes,
-        &config.items_per_producer_values,
-        config.repeats,
-    );
-    for scenario in &config.scenarios {
-        let Some(labels) = desired.get_mut(&scenario.name) else {
-            continue;
-        };
-        let Some(scenario_local_best_labels) = local_best_labels.get(&scenario.name) else {
-            continue;
-        };
-        for label in scenario_local_best_labels {
-            for neighbor in immediate_search_labels_for_scenario(label, scenario)? {
-                labels.insert(neighbor);
-            }
-        }
-    }
-
-    let mut bundles = Vec::new();
-    for scenario in &config.scenarios {
-        let labels = desired.get(&scenario.name).cloned().unwrap_or_default();
-        for label in labels {
-            let queue_label = format!("ubq_{label}");
-            if incompletable.contains(&(queue_label, scenario.name.clone())) {
-                continue;
-            }
-            for repeat_index in 1..=config.repeats {
-                if bundle_complete(
-                    index,
-                    scenario,
-                    repeat_index,
-                    Some(label.as_str()),
-                    &config.baseline_queues,
-                    &config.fastfifo_block_sizes,
-                    &config.lfqueue_segment_sizes,
-                    &config.wcq_capacities,
-                    &config.modes,
-                    &config.items_per_producer_values,
-                ) {
-                    continue;
-                }
-                bundles.push(PlanBundle {
-                    scenario: scenario.clone(),
-                    repeat_index,
-                    ubq_label: Some(label.clone()),
-                    dubq_label: None,
-                    modes: config.modes.clone(),
-                    items_per_producer_values: config.items_per_producer_values.clone(),
-                });
-            }
-        }
-    }
-
-    Ok(MatrixPlan {
-        plan_schema_version: PLAN_SCHEMA_VERSION,
-        core_placement: CorePlacement::Interleaved,
-        item_policy: ItemPolicy::Explicit,
-        machine_label: config.machine_label.clone(),
-        runs_dir: config.runs_dir.clone(),
-        available_parallelism: config.available_parallelism,
-        core_ids: Vec::new(),
-        allow_unpinned: false,
-        schedule_seed: DEFAULT_SCHEDULE_SEED,
-        throughput_policy: ThroughputPolicy::default(),
-        job_timeout_secs: None,
-        baseline_queues: config.baseline_queues.clone(),
-        fastfifo_block_sizes: config.fastfifo_block_sizes.clone(),
-        fastfifo_capacities: default_fastfifo_capacities(),
-        lfqueue_segment_sizes: config.lfqueue_segment_sizes.clone(),
-        wcq_capacities: config.wcq_capacities.clone(),
-        ubq_grid: None,
-        ubq_batch_sizes: Vec::new(),
-        planned_repeats: config.repeats,
-        bundles,
-        reuse_existing: true,
-    })
-}
-
-fn collect_present_ubq_labels(index: &ExistingRunsIndex) -> BTreeSet<String> {
-    index
-        .records
-        .keys()
-        .filter_map(|key| {
-            key.queue_label
-                .strip_prefix("ubq_")
-                .map(ToString::to_string)
-        })
-        .collect()
-}
-
-fn collect_global_winner_labels(
-    index: &ExistingRunsIndex,
-    scenarios: &[ScenarioConfig],
-    present_labels: &BTreeSet<String>,
-    baseline_queues: &[QueueKind],
-    fastfifo_block_sizes: &[usize],
-    lfqueue_segment_sizes: &[usize],
-    wcq_capacities: &[usize],
-    modes: &[Mode],
-    items_per_producer_values: &[u64],
-    repeats: usize,
-) -> BTreeSet<String> {
-    let mut winners = BTreeSet::new();
-    for scenario in scenarios {
-        for mode in modes {
-            for &items_per_producer in items_per_producer_values {
-                let baseline_labels = baseline_queue_labels_for_sample(
-                    baseline_queues,
-                    fastfifo_block_sizes,
-                    lfqueue_segment_sizes,
-                    wcq_capacities,
-                    scenario,
-                    *mode,
-                    items_per_producer,
-                );
-                let best_baseline = baseline_labels
-                    .iter()
-                    .filter_map(|queue_label| {
-                        mean_ops(
-                            index,
-                            &scenario.name,
-                            queue_label,
-                            *mode,
-                            items_per_producer,
-                            repeats,
-                        )
-                    })
-                    .max_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal));
-                let Some(best_baseline) = best_baseline else {
-                    continue;
-                };
-
-                let best_label = present_labels
-                    .iter()
-                    .filter_map(|label| {
-                        let parsed = parse_ubq_label(label, true).ok()?;
-                        is_valid_ubq_label_for_scenario(&parsed, scenario).then_some(label)
-                    })
-                    .filter(|label| {
-                        is_complete_coverage(
-                            index,
-                            scenario,
-                            label,
-                            baseline_queues,
-                            fastfifo_block_sizes,
-                            lfqueue_segment_sizes,
-                            wcq_capacities,
-                            modes,
-                            items_per_producer_values,
-                            repeats,
-                        )
-                    })
-                    .filter_map(|label| {
-                        mean_ops(
-                            index,
-                            &scenario.name,
-                            label,
-                            *mode,
-                            items_per_producer,
-                            repeats,
-                        )
-                        .map(|ops| (label.clone(), ops))
-                    })
-                    .max_by(|lhs, rhs| lhs.1.partial_cmp(&rhs.1).unwrap_or(Ordering::Equal));
-
-                if let Some((label, best_ubq_ops)) = best_label {
-                    if best_ubq_ops > best_baseline {
-                        winners.insert(label);
-                    }
-                }
-            }
-        }
-    }
-    winners
-}
-
-fn collect_local_best_ubq_labels(
-    index: &ExistingRunsIndex,
-    scenarios: &[ScenarioConfig],
-    present_labels: &BTreeSet<String>,
-    baseline_queues: &[QueueKind],
-    fastfifo_block_sizes: &[usize],
-    lfqueue_segment_sizes: &[usize],
-    wcq_capacities: &[usize],
-    modes: &[Mode],
-    items_per_producer_values: &[u64],
-    repeats: usize,
-) -> BTreeMap<String, BTreeSet<String>> {
-    let mut winners = BTreeMap::new();
-    for scenario in scenarios {
-        let mut scenario_winners = BTreeSet::new();
-        for mode in modes {
-            for &items_per_producer in items_per_producer_values {
-                let best_label = present_labels
-                    .iter()
-                    .filter_map(|label| {
-                        let parsed = parse_ubq_label(label, true).ok()?;
-                        is_valid_ubq_label_for_scenario(&parsed, scenario).then_some(label)
-                    })
-                    .filter(|label| {
-                        is_complete_coverage(
-                            index,
-                            scenario,
-                            label,
-                            baseline_queues,
-                            fastfifo_block_sizes,
-                            lfqueue_segment_sizes,
-                            wcq_capacities,
-                            modes,
-                            items_per_producer_values,
-                            repeats,
-                        )
-                    })
-                    .filter_map(|label| {
-                        mean_ops(
-                            index,
-                            &scenario.name,
-                            label,
-                            *mode,
-                            items_per_producer,
-                            repeats,
-                        )
-                        .map(|ops| (label.clone(), ops))
-                    })
-                    .max_by(|lhs, rhs| lhs.1.partial_cmp(&rhs.1).unwrap_or(Ordering::Equal));
-                if let Some((label, _)) = best_label {
-                    scenario_winners.insert(label);
-                }
-            }
-        }
-        if !scenario_winners.is_empty() {
-            winners.insert(scenario.name.clone(), scenario_winners);
-        }
-    }
-    winners
-}
-
-fn bundle_complete(
-    index: &ExistingRunsIndex,
-    scenario: &ScenarioConfig,
-    repeat_index: usize,
-    label: Option<&str>,
-    baseline_queues: &[QueueKind],
-    fastfifo_block_sizes: &[usize],
-    lfqueue_segment_sizes: &[usize],
-    wcq_capacities: &[usize],
-    modes: &[Mode],
-    items_per_producer_values: &[u64],
-) -> bool {
-    for mode in modes {
-        for &items in items_per_producer_values {
-            let baseline_labels = baseline_queue_labels_for_sample(
-                baseline_queues,
-                fastfifo_block_sizes,
-                lfqueue_segment_sizes,
-                wcq_capacities,
-                scenario,
-                *mode,
-                items,
-            );
-            for baseline_label in &baseline_labels {
-                let key = SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: *mode,
-                    items_per_producer: items,
-                    queue_label: baseline_label.clone(),
-                    batch_size: None,
-                };
-                if !index.records.contains_key(&key) {
-                    return false;
-                }
-            }
-            if let Some(label) = label {
-                let key = SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: *mode,
-                    items_per_producer: items,
-                    queue_label: format!("ubq_{label}"),
-                    batch_size: None,
-                };
-                if !index.records.contains_key(&key) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
-fn is_complete_coverage(
-    index: &ExistingRunsIndex,
-    scenario: &ScenarioConfig,
-    label: &str,
-    baseline_queues: &[QueueKind],
-    fastfifo_block_sizes: &[usize],
-    lfqueue_segment_sizes: &[usize],
-    wcq_capacities: &[usize],
-    modes: &[Mode],
-    items_per_producer_values: &[u64],
-    repeats: usize,
-) -> bool {
-    (1..=repeats).all(|repeat_index| {
-        for mode in modes {
-            for &items in items_per_producer_values {
-                let baseline_labels = baseline_queue_labels_for_sample(
-                    baseline_queues,
-                    fastfifo_block_sizes,
-                    lfqueue_segment_sizes,
-                    wcq_capacities,
-                    scenario,
-                    *mode,
-                    items,
-                );
-                for baseline_label in baseline_labels {
-                    let key = SampleKey {
-                        scenario: scenario.name.clone(),
-                        repeat_index,
-                        mode: *mode,
-                        items_per_producer: items,
-                        queue_label: baseline_label,
-                        batch_size: None,
-                    };
-                    if !index.records.contains_key(&key) {
-                        return false;
-                    }
-                }
-                let key = SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: *mode,
-                    items_per_producer: items,
-                    queue_label: format!("ubq_{label}"),
-                    batch_size: None,
-                };
-                if !index.records.contains_key(&key) {
-                    return false;
-                }
-            }
-        }
-        true
-    })
-}
-
-fn mean_ops(
-    index: &ExistingRunsIndex,
-    scenario: &str,
-    queue_label: &str,
-    mode: Mode,
-    items_per_producer: u64,
-    repeats: usize,
-) -> Option<f64> {
-    let mut values = Vec::new();
-    let lookup_label = if queue_label.starts_with("ubq_")
-        || queue_label == "segqueue"
-        || queue_label == "concurrent-queue"
-        || queue_label.starts_with("fastfifo_")
-        || queue_label.starts_with("lfqueue_")
-        || queue_label.starts_with("wcq_")
-    {
-        queue_label.to_string()
-    } else {
-        format!("ubq_{queue_label}")
-    };
-    for repeat_index in 1..=repeats {
-        let key = SampleKey {
-            scenario: scenario.to_string(),
-            repeat_index,
-            mode,
-            items_per_producer,
-            queue_label: lookup_label.clone(),
-            batch_size: None,
-        };
-        let record = index.records.get(&key)?;
-        values.push(record.ops_per_sec?);
-    }
-    Some(values.iter().sum::<f64>() / values.len() as f64)
 }
 
 fn bench_throughput_for<Q: BenchQueue>(
@@ -6726,6 +5692,11 @@ fn adaptive_throughput<Q: BenchQueueHandleFactory>(
     });
 
     Ok(BenchRecord {
+        repeat_index: 0,
+        ubq_label: None,
+        dubq_label: None,
+        protocol: MeasurementProtocol::default(),
+        timestamp_unix_ms: 0,
         queue: queue_name.to_string(),
         mode: Mode::Throughput.name().to_string(),
         batch_size,
@@ -7018,6 +5989,11 @@ fn bench_app_log_mpsc_file_with_queue<Q: LogQueueHandleFactory>(
     let consumer_ops_per_sec = throughput_ops(consumed, consumer_elapsed_ns);
 
     BenchRecord {
+        repeat_index: 0,
+        ubq_label: None,
+        dubq_label: None,
+        protocol: MeasurementProtocol::default(),
+        timestamp_unix_ms: 0,
         queue: queue_name.to_string(),
         mode: Mode::AppLogMpscFile.name().to_string(),
         batch_size: None,
@@ -7215,6 +6191,11 @@ fn bench_app_log_fan_in_with_queue<Q: BenchQueueHandleFactory>(
         .map(|(_, _, latency)| *latency)
         .sum();
     BenchRecord {
+        repeat_index: 0,
+        ubq_label: None,
+        dubq_label: None,
+        protocol: MeasurementProtocol::default(),
+        timestamp_unix_ms: 0,
         queue: queue_name.to_string(),
         mode: Mode::AppLogFanIn.name().to_string(),
         batch_size: None,
@@ -7412,6 +6393,11 @@ fn bench_app_pipeline_with_queues<Q: BenchQueueHandleFactory>(
     let elapsed_ns = start.get().expect("start set").elapsed().as_nanos() as u64;
     let (collector_end, consumed, latency_total) = collector_result.expect("collector completed");
     BenchRecord {
+        repeat_index: 0,
+        ubq_label: None,
+        dubq_label: None,
+        protocol: MeasurementProtocol::default(),
+        timestamp_unix_ms: 0,
         queue: queue_name.to_string(),
         mode: Mode::AppPipeline.name().to_string(),
         batch_size: None,
@@ -7587,6 +6573,11 @@ fn bench_app_task_roundtrip_with_queues<Q: BenchQueueHandleFactory>(
     let consumed = client_results.iter().map(|(_, count, _)| *count).sum();
     let latency_total: u128 = client_results.iter().map(|(_, _, latency)| *latency).sum();
     BenchRecord {
+        repeat_index: 0,
+        ubq_label: None,
+        dubq_label: None,
+        protocol: MeasurementProtocol::default(),
+        timestamp_unix_ms: 0,
         queue: queue_name.to_string(),
         mode: Mode::AppTaskRoundtrip.name().to_string(),
         batch_size: None,
@@ -7755,6 +6746,11 @@ fn bench_complex_throughput_with_queue<Q: BenchQueueHandleFactory>(
     let ops_per_sec = throughput_ops(consumed, elapsed_ns);
 
     BenchRecord {
+        repeat_index: 0,
+        ubq_label: None,
+        dubq_label: None,
+        protocol: MeasurementProtocol::default(),
+        timestamp_unix_ms: 0,
         queue: queue_name.to_string(),
         mode: Mode::ComplexThroughput.name().to_string(),
         batch_size: None,
@@ -7927,6 +6923,11 @@ fn bench_data_latency_with_queue<Q: BenchQueueHandleFactory>(
     };
 
     BenchRecord {
+        repeat_index: 0,
+        ubq_label: None,
+        dubq_label: None,
+        protocol: MeasurementProtocol::default(),
+        timestamp_unix_ms: 0,
         queue: queue_name.to_string(),
         mode: Mode::DataLatency.name().to_string(),
         batch_size: None,
@@ -8089,6 +7090,11 @@ fn bench_fairness_with_queue<Q: BenchQueueHandleFactory>(
         .collect::<Vec<_>>();
 
     BenchRecord {
+        repeat_index: 0,
+        ubq_label: None,
+        dubq_label: None,
+        protocol: MeasurementProtocol::default(),
+        timestamp_unix_ms: 0,
         queue: queue_name.to_string(),
         mode: Mode::Fairness.name().to_string(),
         batch_size: None,
@@ -8150,6 +7156,11 @@ fn failed_bench_record(
     timeout_ns: Option<u64>,
 ) -> BenchRecord {
     BenchRecord {
+        repeat_index: 0,
+        ubq_label: None,
+        dubq_label: None,
+        protocol: MeasurementProtocol::default(),
+        timestamp_unix_ms: 0,
         queue: record_queue_name_for_spec(spec),
         mode: spec.mode.name().to_string(),
         batch_size: spec.batch_size,
@@ -8185,6 +7196,11 @@ fn failed_runtime_bench_record(
     elapsed_ns: u64,
 ) -> BenchRecord {
     BenchRecord {
+        repeat_index: 0,
+        ubq_label: None,
+        dubq_label: None,
+        protocol: MeasurementProtocol::default(),
+        timestamp_unix_ms: 0,
         queue: queue_name.to_string(),
         mode: mode.name().to_string(),
         batch_size: None,
@@ -8294,15 +7310,6 @@ fn now_unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_millis()
-}
-
-fn host_target() -> String {
-    let arch = std::env::consts::ARCH;
-    match std::env::consts::OS {
-        "macos" => format!("{arch}-apple-darwin"),
-        "linux" => format!("{arch}-unknown-linux-gnu"),
-        os => format!("{arch}-unknown-{os}"),
-    }
 }
 
 fn now_unix_nanos() -> u128 {
@@ -8507,12 +7514,7 @@ pub fn run_matrix_plan_in_process(
         job_factory_for_spec(spec)?;
     }
 
-    let fingerprint = experiment_fingerprint(plan)?;
-    let existing_runs = load_existing_runs_for_fingerprint(
-        &plan.runs_dir,
-        &plan.machine_label,
-        Some(&fingerprint),
-    )?;
+    let existing_runs = load_existing_runs(plan)?;
     let timing_estimator = TimingEstimator::from_history(&existing_runs);
     let cache = if plan.reuse_existing {
         existing_runs
@@ -8563,7 +7565,10 @@ mod tests {
 
     fn test_record(queue: &str, mode: Mode, items_per_producer: u64) -> BenchRecord {
         BenchRecord {
+            repeat_index: 1,
             queue: queue.to_string(),
+            ubq_label: None,
+            dubq_label: None,
             mode: mode.name().to_string(),
             batch_size: None,
             items_per_producer,
@@ -8586,6 +7591,8 @@ mod tests {
             failure_reason: None,
             timeout_ns: None,
             throughput_metrics: None,
+            protocol: MeasurementProtocol::default(),
+            timestamp_unix_ms: now_unix_ms() as u64,
         }
     }
 
@@ -8739,8 +7746,7 @@ mod tests {
                     bundle.scenario.producers
                 )]
             );
-            let meta = bundle_output_meta(&scaled, bundle).expect("scaled output metadata");
-            assert_eq!(meta.item_policy, ItemPolicy::ScenarioScaledV1);
+            let meta = scenario_output_meta(&scaled, &bundle.scenario, None);
             assert_eq!(
                 meta.planned_items_per_producer,
                 bundle.items_per_producer_values
@@ -9869,7 +8875,7 @@ mod tests {
     }
 
     #[test]
-    fn experiment_fingerprint_reuses_overlapping_scenario_subsets() {
+    fn reuse_ignores_scenario_coverage_but_honors_measurement_protocol() {
         let root =
             std::env::temp_dir().join(format!("ubq_scenario_subset_test_{}", now_unix_nanos()));
         let runs_dir = root.join("runs");
@@ -9897,13 +8903,6 @@ mod tests {
             ScenarioConfig::new(64, 64),
         ]);
         let mut subset = build(&[ScenarioConfig::new(64, 64)]);
-        let compatible_fingerprint = experiment_fingerprint(&subset).expect("subset fingerprint");
-
-        assert_eq!(
-            experiment_fingerprint(&full).expect("full fingerprint"),
-            compatible_fingerprint,
-            "scenario coverage must not invalidate matching cached samples"
-        );
 
         let key = SampleKey {
             scenario: "64p64c".to_string(),
@@ -9916,6 +8915,7 @@ mod tests {
         let mut record = test_record("segqueue", Mode::Throughput, 1_000_000);
         record.total_items = 64_000_000;
         record.consumed_items = 64_000_000;
+        record.protocol = MeasurementProtocol::from_plan(&full).expect("protocol");
         let mut writer =
             IncrementalOutputWriter::new(&full, &ExistingRunsIndex::default()).expect("writer");
         writer
@@ -9923,19 +8923,18 @@ mod tests {
             .expect("persist full-plan sample");
         writer.finish(false).expect("finish writer");
 
-        let cached =
-            load_existing_runs_for_fingerprint(&runs_dir, "local", Some(&compatible_fingerprint))
-                .expect("load subset cache");
+        let cached = load_existing_runs(&subset).expect("load subset cache");
         assert!(
             cached.records.contains_key(&key),
-            "the subset plan must load its sample from the wider plan"
+            "a narrower plan must reuse a sample the wider plan already collected"
         );
 
         subset.throughput_policy.phase_ms += 1;
-        assert_ne!(
-            experiment_fingerprint(&full).expect("full fingerprint"),
-            experiment_fingerprint(&subset).expect("changed-policy fingerprint"),
-            "measurement protocol changes must still invalidate cached samples"
+        let after_protocol_change =
+            load_existing_runs(&subset).expect("load subset cache after protocol change");
+        assert!(
+            !after_protocol_change.records.contains_key(&key),
+            "a measurement protocol change under the same machine-label must not reuse the old sample"
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -9946,35 +8945,28 @@ mod tests {
         let output = OutputFile {
             schema_version: RUN_SCHEMA_VERSION,
             meta: OutputMeta {
-                timestamp_unix_ms: 1,
                 machine_label: "local".to_string(),
                 scenario: "1p1c".to_string(),
                 producers: 1,
                 consumers: 1,
-                repeat_index: 1,
-                available_parallelism: 2,
-                core_placement: CorePlacement::Interleaved,
-                selected_core_ids: vec![0, 1],
-                producer_core_ids: vec![0],
-                consumer_core_ids: vec![1],
-                affinity_authoritative: true,
-                schedule_seed: DEFAULT_SCHEDULE_SEED,
-                throughput_policy: ThroughputPolicy::default(),
-                experiment_fingerprint: "test".to_string(),
-                item_policy: ItemPolicy::Explicit,
-                ubq_label: None,
-                ubq_block_size: None,
-                dubq_label: None,
-                dubq_min_block_size: None,
+                last_updated_unix_ms: 1,
+                host_uname: String::new(),
+                git_commit: String::new(),
+                git_dirty: false,
+                rustc_version: String::new(),
+                package_version: String::new(),
                 ubq_grid: None,
-                expected_ubq_configurations: None,
-                expected_dubq_configurations: None,
+                expected_ubq_configurations: 0,
+                expected_dubq_configurations: 0,
                 ubq_batch_sizes: Vec::new(),
-                planned_repeats: None,
+                planned_repeats: 0,
                 planned_items_per_producer: Vec::new(),
             },
             results: vec![BenchRecord {
+                repeat_index: 1,
                 queue: "segqueue".to_string(),
+                ubq_label: None,
+                dubq_label: None,
                 mode: "throughput".to_string(),
                 batch_size: None,
                 items_per_producer: 1,
@@ -9997,11 +8989,20 @@ mod tests {
                 failure_reason: None,
                 timeout_ns: None,
                 throughput_metrics: None,
+                protocol: MeasurementProtocol {
+                    available_parallelism: 2,
+                    core_placement: CorePlacement::Interleaved,
+                    affinity_authoritative: true,
+                    selected_core_ids: vec![0, 1],
+                    item_policy: ItemPolicy::Explicit,
+                    throughput_policy: ThroughputPolicy::default(),
+                },
+                timestamp_unix_ms: 1,
             }],
         };
         let json = serde_json::to_string(&output).expect("json");
         assert!(!json.contains("null"));
-        assert!(!json.contains("ubq_label"));
+        assert!(!json.contains("\"ubq_label\""));
         assert!(!json.contains("fill_elapsed_ns"));
         assert!(!json.contains("status"));
         assert!(json.contains("\"core_placement\":\"interleaved\""));
@@ -10054,17 +9055,20 @@ mod tests {
             batch_size: None,
         };
 
+        let mut record = test_record("segqueue", Mode::Throughput, 1);
+        record.protocol = MeasurementProtocol::from_plan(&plan).expect("protocol");
+
         let writer =
             IncrementalOutputWriter::new(&plan, &ExistingRunsIndex::default()).expect("writer");
         let writer = {
             let mut writer = writer;
             writer
-                .handle_completed_record(key.clone(), test_record("segqueue", Mode::Throughput, 1))
+                .handle_completed_record(key.clone(), record)
                 .expect("write partial snapshot");
             writer
         };
 
-        let loaded = load_existing_runs(&runs_dir, "local").expect("load");
+        let loaded = load_existing_runs(&plan).expect("load");
         assert_eq!(
             loaded.records.get(&key).expect("cached record").queue,
             "segqueue"
@@ -10079,207 +9083,22 @@ mod tests {
             !snapshot.contains('\n'),
             "persisted snapshots should be compact"
         );
-        let mut legacy: serde_json::Value =
+        let mut mismatched_schema: serde_json::Value =
             serde_json::from_str(&snapshot).expect("parse snapshot");
-        legacy["schema_version"] = serde_json::Value::from(RUN_SCHEMA_VERSION - 1);
+        mismatched_schema["schema_version"] = serde_json::Value::from(RUN_SCHEMA_VERSION - 1);
         fs::write(
             &files[0],
-            serde_json::to_string_pretty(&legacy).expect("serialize legacy snapshot"),
+            serde_json::to_string_pretty(&mismatched_schema)
+                .expect("serialize mismatched-schema snapshot"),
         )
-        .expect("write legacy snapshot");
-        let legacy_loaded = load_existing_runs(&runs_dir, "local").expect("load legacy");
+        .expect("write mismatched-schema snapshot");
+        let mismatched_loaded = load_existing_runs(&plan).expect("load mismatched schema");
         assert!(
-            legacy_loaded.records.is_empty(),
-            "schema-v4 samples must not satisfy the schema-v5 cache"
+            mismatched_loaded.records.is_empty(),
+            "a schema version mismatch must not satisfy the cache"
         );
 
         writer.finish(false).expect("finish writer");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn execute_job_factories_does_not_duplicate_cached_bundles() {
-        let root =
-            std::env::temp_dir().join(format!("ubq_cached_bundle_test_{}", now_unix_nanos()));
-        let runs_dir = root.join("runs");
-        fs::create_dir_all(&runs_dir).expect("mkdir");
-
-        let scenario = ScenarioConfig::new(1, 1);
-        let plan = MatrixPlan {
-            plan_schema_version: PLAN_SCHEMA_VERSION,
-            core_placement: CorePlacement::Interleaved,
-            item_policy: ItemPolicy::Explicit,
-            machine_label: "local".to_string(),
-            runs_dir: runs_dir.clone(),
-            available_parallelism: 2,
-            core_ids: Vec::new(),
-            allow_unpinned: true,
-            schedule_seed: DEFAULT_SCHEDULE_SEED,
-            throughput_policy: ThroughputPolicy::default(),
-            job_timeout_secs: None,
-            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            fastfifo_block_sizes: Vec::new(),
-            fastfifo_capacities: default_fastfifo_capacities(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: Vec::new(),
-            ubq_grid: None,
-            ubq_batch_sizes: Vec::new(),
-            planned_repeats: 1,
-            bundles: vec![PlanBundle {
-                scenario: scenario.clone(),
-                repeat_index: 1,
-                ubq_label: None,
-                dubq_label: None,
-                modes: vec![Mode::Throughput],
-                items_per_producer_values: vec![1],
-            }],
-            reuse_existing: true,
-        };
-
-        let segqueue_key = SampleKey {
-            scenario: scenario.name.clone(),
-            repeat_index: 1,
-            mode: Mode::Throughput,
-            items_per_producer: 1,
-            queue_label: "segqueue".to_string(),
-            batch_size: None,
-        };
-        let concurrent_key = SampleKey {
-            scenario: scenario.name.clone(),
-            repeat_index: 1,
-            mode: Mode::Throughput,
-            items_per_producer: 1,
-            queue_label: "concurrent-queue".to_string(),
-            batch_size: None,
-        };
-        let mut cache = ExistingRunsIndex::default();
-        cache.records.insert(
-            segqueue_key.clone(),
-            test_record("segqueue", Mode::Throughput, 1),
-        );
-        cache.records.insert(
-            concurrent_key.clone(),
-            test_record("concurrent-queue", Mode::Throughput, 1),
-        );
-
-        let (executed, crashed) =
-            execute_job_factories(&plan, &cache, Vec::new(), 2, TimingEstimator::default())
-                .expect("execute");
-        assert!(executed.is_empty());
-        assert!(crashed.is_none());
-
-        let mut files = Vec::new();
-        collect_run_jsons_recursive(&runs_dir, &mut files).expect("scan runs");
-        assert!(
-            files.is_empty(),
-            "a no-op resume must not rewrite cached samples"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn execute_job_factories_run_sequentially_on_the_same_core_range() {
-        let root =
-            std::env::temp_dir().join(format!("ubq_sequential_job_test_{}", now_unix_nanos()));
-        let runs_dir = root.join("runs");
-        fs::create_dir_all(&runs_dir).expect("mkdir");
-
-        let scenario = ScenarioConfig::new(1, 1);
-        let ubq_label = "balanced,1,31,crossbeam".to_string();
-        let plan = MatrixPlan {
-            plan_schema_version: PLAN_SCHEMA_VERSION,
-            core_placement: CorePlacement::Interleaved,
-            item_policy: ItemPolicy::Explicit,
-            machine_label: "local".to_string(),
-            runs_dir: runs_dir.clone(),
-            available_parallelism: 4,
-            core_ids: Vec::new(),
-            allow_unpinned: true,
-            schedule_seed: DEFAULT_SCHEDULE_SEED,
-            throughput_policy: ThroughputPolicy::default(),
-            job_timeout_secs: None,
-            baseline_queues: Vec::new(),
-            fastfifo_block_sizes: Vec::new(),
-            fastfifo_capacities: default_fastfifo_capacities(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: Vec::new(),
-            ubq_grid: None,
-            ubq_batch_sizes: Vec::new(),
-            planned_repeats: 1,
-            bundles: vec![
-                PlanBundle {
-                    scenario: scenario.clone(),
-                    repeat_index: 1,
-                    ubq_label: Some(ubq_label.clone()),
-                    dubq_label: None,
-                    modes: vec![Mode::Throughput],
-                    items_per_producer_values: vec![1],
-                },
-                PlanBundle {
-                    scenario: scenario.clone(),
-                    repeat_index: 2,
-                    ubq_label: Some(ubq_label.clone()),
-                    dubq_label: None,
-                    modes: vec![Mode::Throughput],
-                    items_per_producer_values: vec![1],
-                },
-            ],
-            reuse_existing: false,
-        };
-
-        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let start_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let core_offsets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let make_job = |repeat_index| {
-            let active = std::sync::Arc::clone(&active);
-            let max_active = std::sync::Arc::clone(&max_active);
-            let start_count = std::sync::Arc::clone(&start_count);
-            let core_offsets = std::sync::Arc::clone(&core_offsets);
-            JobFactory {
-                spec: JobSpec {
-                    scenario: scenario.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue: QueueKind::Ubq,
-                    ubq_label: Some(ubq_label.clone()),
-                    dubq_label: None,
-                    batch_size: None,
-                    fastfifo_block_size: None,
-                    fastfifo_capacity: None,
-                    lfqueue_segment_size: None,
-                    wcq_capacity: None,
-                },
-                run: std::sync::Arc::new(move |core_offset| {
-                    core_offsets.lock().unwrap().push(core_offset);
-                    start_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let now_active = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    max_active.fetch_max(now_active, std::sync::atomic::Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    test_record("ubq", Mode::Throughput, 1)
-                }),
-            }
-        };
-
-        let pending = vec![make_job(1), make_job(2)];
-        let (executed, crashed) = execute_job_factories(
-            &plan,
-            &ExistingRunsIndex::default(),
-            pending,
-            plan.available_parallelism,
-            TimingEstimator::default(),
-        )
-        .expect("execute");
-
-        assert!(crashed.is_none());
-        assert_eq!(executed.len(), 2);
-        assert_eq!(start_count.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(*core_offsets.lock().unwrap(), vec![0, 0]);
-
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -10343,598 +9162,5 @@ mod tests {
             .unwrap_err()
             .contains("version mismatch")
         );
-    }
-
-    #[test]
-    fn frontier_bootstraps_seed_across_all_scenarios() {
-        let config = FrontierConfig {
-            machine_label: "local".to_string(),
-            runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
-            scenarios: vec![ScenarioConfig::new(1, 1), ScenarioConfig::new(1, 4)],
-            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            fastfifo_block_sizes: Vec::new(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,1,127,crossbeam".to_string()],
-            modes: vec![Mode::Throughput],
-            items_per_producer_values: vec![1],
-            repeats: 2,
-            available_parallelism: 8,
-        };
-        let plan =
-            compute_frontier_round_plan(&config, &ExistingRunsIndex::default(), &BTreeSet::new())
-                .expect("plan");
-        assert_eq!(plan.bundles.len(), 4);
-    }
-
-    #[test]
-    fn frontier_expands_local_winners_only() {
-        let scenario = ScenarioConfig::new(1, 1);
-        let mut index = ExistingRunsIndex::default();
-        for repeat_index in 1..=2 {
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "segqueue".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "segqueue".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 10,
-                    ops_per_sec: Some(10.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "concurrent-queue".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "concurrent-queue".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 9,
-                    ops_per_sec: Some(9.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "ubq_balanced,1,127,crossbeam".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "ubq".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 20,
-                    ops_per_sec: Some(20.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-        }
-
-        let config = FrontierConfig {
-            machine_label: "local".to_string(),
-            runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
-            scenarios: vec![scenario.clone()],
-            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            fastfifo_block_sizes: Vec::new(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,1,127,crossbeam".to_string()],
-            modes: vec![Mode::Throughput],
-            items_per_producer_values: vec![1],
-            repeats: 2,
-            available_parallelism: 8,
-        };
-        let plan = compute_frontier_round_plan(&config, &index, &BTreeSet::new()).expect("plan");
-        assert!(
-            plan.bundles
-                .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,1,127,yield"))
-        );
-    }
-
-    #[test]
-    fn frontier_expands_local_best_ubq_even_when_baseline_wins() {
-        let scenario = ScenarioConfig::new(1, 1);
-        let mut index = ExistingRunsIndex::default();
-        for repeat_index in 1..=2 {
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "segqueue".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "segqueue".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 10,
-                    ops_per_sec: Some(30.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "concurrent-queue".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "concurrent-queue".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 11,
-                    ops_per_sec: Some(29.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "ubq_balanced,1,127,crossbeam".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "ubq".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 20,
-                    ops_per_sec: Some(20.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-        }
-
-        let config = FrontierConfig {
-            machine_label: "local".to_string(),
-            runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
-            scenarios: vec![scenario.clone()],
-            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            fastfifo_block_sizes: Vec::new(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,1,127,crossbeam".to_string()],
-            modes: vec![Mode::Throughput],
-            items_per_producer_values: vec![1],
-            repeats: 2,
-            available_parallelism: 8,
-        };
-        let plan = compute_frontier_round_plan(&config, &index, &BTreeSet::new()).expect("plan");
-        assert!(
-            plan.bundles
-                .iter()
-                .any(|bundle| bundle.ubq_label.as_deref() == Some("balanced,1,127,yield"))
-        );
-    }
-
-    #[test]
-    fn frontier_rejects_scenarios_without_valid_seed_labels() {
-        let config = FrontierConfig {
-            machine_label: "local".to_string(),
-            runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
-            scenarios: vec![ScenarioConfig::new(64, 1)],
-            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            fastfifo_block_sizes: Vec::new(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,1,63,crossbeam".to_string()],
-            modes: vec![Mode::Throughput],
-            items_per_producer_values: vec![1],
-            repeats: 1,
-            available_parallelism: 128,
-        };
-        let err =
-            compute_frontier_round_plan(&config, &ExistingRunsIndex::default(), &BTreeSet::new())
-                .expect_err("expected validation error");
-        assert!(err.contains("64p1c"));
-        assert!(err.contains("no valid seed labels"));
-    }
-
-    #[test]
-    fn frontier_runs_local_winner_across_all_scenarios() {
-        let winner_scenario = ScenarioConfig::new(1, 1);
-        let other_scenario = ScenarioConfig::new(1, 4);
-        let winning_label = "balanced,1,127,crossbeam";
-        let mut index = ExistingRunsIndex::default();
-
-        for repeat_index in 1..=2 {
-            index.records.insert(
-                SampleKey {
-                    scenario: winner_scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "segqueue".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "segqueue".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 10,
-                    ops_per_sec: Some(10.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: winner_scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "concurrent-queue".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "concurrent-queue".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 11,
-                    ops_per_sec: Some(11.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: winner_scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: format!("ubq_{winning_label}"),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "ubq".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 20,
-                    ops_per_sec: Some(20.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-        }
-
-        let config = FrontierConfig {
-            machine_label: "local".to_string(),
-            runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
-            scenarios: vec![winner_scenario.clone(), other_scenario.clone()],
-            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            fastfifo_block_sizes: Vec::new(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,1,31,crossbeam".to_string()],
-            modes: vec![Mode::Throughput],
-            items_per_producer_values: vec![1],
-            repeats: 2,
-            available_parallelism: 8,
-        };
-        let plan = compute_frontier_round_plan(&config, &index, &BTreeSet::new()).expect("plan");
-        let winner_bundles: Vec<_> = plan
-            .bundles
-            .iter()
-            .filter(|bundle| bundle.ubq_label.as_deref() == Some(winning_label))
-            .collect();
-
-        assert_eq!(winner_bundles.len(), 2);
-        assert!(
-            winner_bundles
-                .iter()
-                .all(|bundle| bundle.scenario.name == other_scenario.name)
-        );
-    }
-
-    #[test]
-    fn frontier_does_not_propagate_winner_invalid_for_scenario() {
-        let winner_scenario = ScenarioConfig::new(1, 1);
-        let constrained_scenario = ScenarioConfig::new(64, 1);
-        let winning_label = "balanced,1,31,crossbeam";
-        let mut index = ExistingRunsIndex::default();
-
-        for repeat_index in 1..=2 {
-            index.records.insert(
-                SampleKey {
-                    scenario: winner_scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "segqueue".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "segqueue".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 10,
-                    ops_per_sec: Some(10.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: winner_scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: "concurrent-queue".to_string(),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "concurrent-queue".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 11,
-                    ops_per_sec: Some(11.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-            index.records.insert(
-                SampleKey {
-                    scenario: winner_scenario.name.clone(),
-                    repeat_index,
-                    mode: Mode::Throughput,
-                    items_per_producer: 1,
-                    queue_label: format!("ubq_{winning_label}"),
-                    batch_size: None,
-                },
-                BenchRecord {
-                    queue: "ubq".to_string(),
-                    mode: "throughput".to_string(),
-                    batch_size: None,
-                    items_per_producer: 1,
-                    total_items: 1,
-                    consumed_items: 1,
-                    elapsed_ns: 20,
-                    ops_per_sec: Some(20.0),
-                    producer_ops_per_sec: None,
-                    consumer_ops_per_sec: None,
-                    written_bytes: None,
-                    flush_count: None,
-                    push_elapsed_ns: None,
-                    pop_elapsed_ns: None,
-                    fill_elapsed_ns: None,
-                    drain_elapsed_ns: None,
-                    avg_data_latency_ns: None,
-                    producer_fairness_ratio: None,
-                    consumer_fairness_ratio: None,
-                    status: BenchRecordStatus::Completed,
-                    failure_reason: None,
-                    timeout_ns: None,
-                    throughput_metrics: None,
-                },
-            );
-        }
-
-        let config = FrontierConfig {
-            machine_label: "local".to_string(),
-            runs_dir: PathBuf::from(DEFAULT_RUNS_DIR),
-            scenarios: vec![winner_scenario, constrained_scenario.clone()],
-            baseline_queues: vec![QueueKind::SegQueue, QueueKind::ConcurrentQueue],
-            fastfifo_block_sizes: Vec::new(),
-            lfqueue_segment_sizes: Vec::new(),
-            wcq_capacities: Vec::new(),
-            seed_labels: vec!["balanced,1,127,crossbeam".to_string()],
-            modes: vec![Mode::Throughput],
-            items_per_producer_values: vec![1],
-            repeats: 2,
-            available_parallelism: 128,
-        };
-        let plan = compute_frontier_round_plan(&config, &index, &BTreeSet::new()).expect("plan");
-        assert!(!plan.bundles.iter().any(|bundle| {
-            bundle.scenario.name == constrained_scenario.name
-                && bundle.ubq_label.as_deref() == Some(winning_label)
-        }));
     }
 }

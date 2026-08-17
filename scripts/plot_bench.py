@@ -1105,7 +1105,7 @@ def clear_generated_outputs(out_root: Path):
         print(f"Removed {removed} stale plot artifact(s) under: {out_root}")
 
 
-def load_record_samples(path: Path, include_legacy=False):
+def load_record_samples(path: Path):
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1113,36 +1113,14 @@ def load_record_samples(path: Path, include_legacy=False):
         print(f"warning: could not parse {path}: {exc}", file=sys.stderr)
         return
 
-    schema_version = data.get("schema_version")
-    is_v6 = schema_version in (6, "6")
-    if not is_v6 and not (
-        include_legacy and schema_version in (2, "2", 3, "3", 4, "4", 5, "5")
-    ):
+    if data.get("schema_version") not in (7, "7"):
         return
 
     meta = data.get("meta", {})
-    core_placement = (
-        str(meta.get("core_placement", "")).strip().lower()
-        if schema_version in (4, "4", 5, "5", 6, "6")
-        else "legacy_grouped"
-    )
-    if schema_version in (4, "4", 5, "5", 6, "6") and core_placement != "interleaved":
-        return
-    fingerprint = str(meta.get("experiment_fingerprint", "")).strip()
-    if is_v6 and not fingerprint:
-        return
-    if not fingerprint:
-        fingerprint = f"legacy-schema-{schema_version}"
-    repeat_index = int(meta.get("repeat_index", 0) or 0)
-    timestamp = int(meta.get("timestamp_unix_ms", 0) or 0)
-    authoritative = is_v6 and bool(meta.get("affinity_authoritative", False))
-    ubq_label = str(meta.get("ubq_label", "default"))
     machine_label = str(meta.get("machine_label", "local")).strip() or "local"
     scenario_meta = normalize_scenario(meta.get("scenario", ""))
 
     for rec in data.get("results", []):
-        if rec.get("skipped_reason"):
-            continue
         if rec.get("status", "completed") != "completed":
             continue
 
@@ -1151,6 +1129,19 @@ def load_record_samples(path: Path, include_legacy=False):
         mode = str(rec.get("mode", "throughput"))
         if is_obsolete_plot_mode(mode):
             continue
+
+        # A scenario's coalesced record can hold samples collected under
+        # different protocols across separate invocations; each record
+        # carries its own protocol/identity fields rather than the file-level
+        # meta a single-bundle-per-file schema used to rely on.
+        protocol = rec.get("protocol") or {}
+        core_placement = str(protocol.get("core_placement", "")).strip().lower()
+        if core_placement != "interleaved":
+            continue
+        authoritative = bool(protocol.get("affinity_authoritative", False))
+        repeat_index = int(rec.get("repeat_index", 0) or 0)
+        timestamp = int(rec.get("timestamp_unix_ms", 0) or 0)
+        ubq_label = str(rec.get("ubq_label") or "default")
 
         if queue == "ubq":
             batch_size = rec.get("batch_size")
@@ -1162,7 +1153,7 @@ def load_record_samples(path: Path, include_legacy=False):
                 except (TypeError, ValueError):
                     continue
         elif queue == "dubq":
-            dubq_label = str(meta.get("dubq_label", ""))
+            dubq_label = str(rec.get("dubq_label") or "")
             if not dubq_label:
                 continue
             batch_size = rec.get("batch_size")
@@ -1241,7 +1232,6 @@ def load_record_samples(path: Path, include_legacy=False):
                 "scenario": scenario,
                 "queue": queue_label,
                 "value": metric_value,
-                "fingerprint": fingerprint,
                 "repeat_index": repeat_index,
                 "timestamp": timestamp,
                 "authoritative": authoritative,
@@ -1249,8 +1239,8 @@ def load_record_samples(path: Path, include_legacy=False):
 
 
 def load_records(path: Path):
-    """Compatibility view of schema-v6 records without deduplication metadata."""
-    for sample in load_record_samples(path, include_legacy=True):
+    """Compatibility view of schema-v7 records without deduplication metadata."""
+    for sample in load_record_samples(path):
         yield (
             sample["machine"],
             sample["placement"],
@@ -1262,10 +1252,17 @@ def load_records(path: Path):
 
 
 def deduplicate_logical_samples(samples):
+    """Newest-timestamp-wins safety net keyed on sample identity.
+
+    A scenario's coalesced record already holds at most one record per
+    (queue, mode, repeat_index) by construction, so this only matters when
+    aggregating across multiple input files for the same machine (e.g. a
+    leftover copy alongside the live coalesced record).
+    """
     newest = {}
     for sample in samples:
         logical_key = (
-            sample["fingerprint"],
+            sample["machine"],
             sample["scenario"],
             sample["queue"],
             sample["mode"],
@@ -1277,26 +1274,16 @@ def deduplicate_logical_samples(samples):
     return list(newest.values())
 
 
-def load_grid_coverage(path: Path, include_legacy=True):
+def load_grid_coverage(path: Path):
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         return
 
-    schema_version = data.get("schema_version")
-    if schema_version not in (6, "6") and not (
-        include_legacy and schema_version in (3, "3", 4, "4", 5, "5")
-    ):
+    if data.get("schema_version") not in (7, "7"):
         return
     meta = data.get("meta", {})
-    core_placement = (
-        str(meta.get("core_placement", "")).strip().lower()
-        if schema_version in (4, "4", 5, "5", 6, "6")
-        else "legacy_grouped"
-    )
-    if schema_version in (4, "4", 5, "5", 6, "6") and core_placement != "interleaved":
-        return
     grid = str(meta.get("ubq_grid", "")).strip().lower()
     if grid not in ("sparse", "dense"):
         return
@@ -1309,7 +1296,6 @@ def load_grid_coverage(path: Path, include_legacy=True):
         planned_items = tuple(
             sorted({int(value) for value in meta.get("planned_items_per_producer", [])})
         )
-        repeat_index = int(meta["repeat_index"])
     except (KeyError, TypeError, ValueError):
         return
     if expected_configs <= 0 or planned_repeats <= 0 or not planned_items:
@@ -1317,21 +1303,18 @@ def load_grid_coverage(path: Path, include_legacy=True):
 
     machine = str(meta.get("machine_label", "local")).strip() or "local"
     scenario = normalize_scenario(meta.get("scenario", ""))
-    ubq_label = str(meta.get("ubq_label", ""))
-    dubq_label = str(meta.get("dubq_label", ""))
-    specification = {
-        "grid": grid,
-        "core_placement": core_placement,
-        "expected_configurations": expected_configs,
-        "planned_repeats": planned_repeats,
-        "batch_sizes": batch_sizes,
-        "planned_items": planned_items,
-    }
     for record in data.get("results", []):
         queue = record.get("queue")
         if queue not in ("ubq", "dubq"):
             continue
         if record.get("status", "completed") != "completed":
+            continue
+        # Each record carries its own protocol/identity, since a scenario's
+        # coalesced file can hold samples from several invocations.
+        core_placement = (
+            str((record.get("protocol") or {}).get("core_placement", "")).strip().lower()
+        )
+        if core_placement != "interleaved":
             continue
         mode = str(record.get("mode", "throughput"))
         try:
@@ -1343,16 +1326,24 @@ def load_grid_coverage(path: Path, include_legacy=True):
             )
             batch_size = record.get("batch_size")
             batch_size = None if batch_size is None else int(batch_size)
+            repeat_index = int(record.get("repeat_index", 0))
         except (KeyError, TypeError, ValueError):
             continue
-        config_label = ubq_label if queue == "ubq" else dubq_label
+        config_label = str(
+            (record.get("ubq_label") if queue == "ubq" else record.get("dubq_label")) or ""
+        )
         if not config_label:
             continue
         sample = (queue, config_label, batch_size, repeat_index, items)
-        record_specification = dict(specification)
-        if mode == "throughput":
-            record_specification["planned_items"] = planned_items[:1]
-        yield machine, mode, scenario, record_specification, sample
+        specification = {
+            "grid": grid,
+            "core_placement": core_placement,
+            "expected_configurations": expected_configs,
+            "planned_repeats": planned_repeats,
+            "batch_sizes": batch_sizes,
+            "planned_items": planned_items[:1] if mode == "throughput" else planned_items,
+        }
+        yield machine, mode, scenario, specification, sample
 
 
 def merge_grid_coverage(target, machine, mode, scenario, specification, sample):
@@ -3188,7 +3179,7 @@ def main():
         for path in files:
             for sample in load_record_samples(path):
                 logical_key = (
-                    sample["fingerprint"],
+                    sample["machine"],
                     sample["scenario"],
                     sample["queue"],
                     sample["mode"],
@@ -3198,9 +3189,7 @@ def main():
                 if previous is None or sample["timestamp"] >= previous["timestamp"]:
                     deduplicated[logical_key] = sample
                 sample_points += 1
-            for machine, mode, scenario, specification, sample in load_grid_coverage(
-                path, include_legacy=False
-            ):
+            for machine, mode, scenario, specification, sample in load_grid_coverage(path):
                 merge_grid_coverage(
                     grid_coverage,
                     machine,
@@ -3217,37 +3206,20 @@ def main():
         if not args.no_clean:
             clear_generated_outputs(out_root)
 
-        fingerprint_latest = {}
+        # Each (machine_label, scenario) already resolves to a single
+        # coalesced record on disk, so there's no cross-environment
+        # fingerprint to arbitrate between here: every deduplicated sample
+        # for a given axis is already the one measurement on record for it.
+        raw_data = {}
+        authoritative_data = {}
         for sample in deduplicated.values():
             key = (
                 sample["machine"],
                 sample["placement"],
                 sample["mode"],
                 sample["scenario"],
-                sample["fingerprint"],
+                sample["queue"],
             )
-            fingerprint_latest[key] = max(
-                fingerprint_latest.get(key, 0), sample["timestamp"]
-            )
-        selected_fingerprints = {}
-        for key, timestamp in fingerprint_latest.items():
-            base = key[:4]
-            candidate = (timestamp, key[4])
-            if candidate > selected_fingerprints.get(base, (-1, "")):
-                selected_fingerprints[base] = candidate
-
-        raw_data = {}
-        authoritative_data = {}
-        for sample in deduplicated.values():
-            base = (
-                sample["machine"],
-                sample["placement"],
-                sample["mode"],
-                sample["scenario"],
-            )
-            if sample["fingerprint"] != selected_fingerprints[base][1]:
-                continue
-            key = base + (sample["queue"],)
             raw_data.setdefault(key, []).append(sample["value"])
             authoritative_data[key] = authoritative_data.get(key, True) and sample["authoritative"]
 

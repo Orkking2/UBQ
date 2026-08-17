@@ -30,7 +30,7 @@ semantics, so UBQ does not have directly comparable operations.
 ## Plot coverage
 
 The plotting helpers generate both generic per-scenario plots and BBQ-style
-family scaling plots from the same schema-v6 JSON files:
+family scaling plots from the same schema-v7 JSON files:
 
 - SPSC throughput/latency/fairness-style bars:
   `plots/<machine>/<mode>/1p1c_<metric>.png`

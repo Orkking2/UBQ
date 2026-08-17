@@ -54,7 +54,8 @@ struct Args {
     #[arg(short = 'd', long)]
     dense: bool,
 
-    /// Ignore compatible schema-v6 results already present under --runs-dir.
+    /// Ignore existing data for this machine-label and recompute everything,
+    /// instead of greedily reusing samples already recorded under it.
     #[arg(long)]
     rerun: bool,
 
