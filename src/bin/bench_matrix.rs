@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use ubq::bench_harness::{
     DEFAULT_RUNS_DIR, DEFAULT_SCHEDULE_SEED, DEFAULT_THROUGHPUT_MAX_ROUND_ITEMS,
     DEFAULT_THROUGHPUT_PHASE_MS, DEFAULT_THROUGHPUT_PILOT_MS, DEFAULT_THROUGHPUT_WARMUP_MS,
-    MatrixPlan, ThroughputPolicy, build_direct_matrix_plan_with_dubq, detect_available_parallelism,
+    MatrixPlan, ThroughputPolicy, build_direct_matrix_plan, detect_available_parallelism,
     maybe_run_bench_worker, parse_core_ids, parse_fastfifo_block_sizes, parse_fastfifo_capacities,
     parse_items_per_producer, parse_lfqueue_segment_sizes, parse_modes, parse_queue_kinds,
     parse_scenarios_with_parallelism, parse_schedule_seed, parse_wcq_capacities,
@@ -45,10 +45,6 @@ struct Args {
 
     #[arg(long = "ubq-label")]
     ubq_labels: Vec<String>,
-
-    /// Runtime DUBQ configuration: pool,min_block,backoff.
-    #[arg(long = "dubq-label")]
-    dubq_labels: Vec<String>,
 
     #[arg(long, visible_alias = "rbbq-block-sizes")]
     fastfifo_block_sizes: Option<String>,
@@ -157,13 +153,12 @@ fn main() {
                         ok
                     })
                     .collect();
-                let mut plan = build_direct_matrix_plan_with_dubq(
+                let mut plan = build_direct_matrix_plan(
                     machine_label,
                     args.runs_dir.clone(),
                     available_parallelism,
                     &selected_queues,
                     &args.ubq_labels,
-                    &args.dubq_labels,
                     &fastfifo_block_sizes,
                     &lfqueue_segment_sizes,
                     &wcq_capacities,

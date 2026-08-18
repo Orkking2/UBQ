@@ -57,6 +57,11 @@ cd "$src_dir"
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:?}"
 export RUST_BACKTRACE=1
 
+# naive-faa-queue is deliberately excluded here: it's the pathological/DNF
+# baseline (src/bench_harness/baselines/naive_faa_queue.rs), meant to
+# demonstrate livelock under contention rather than produce a comparable
+# throughput number, and its own timeout needs are much tighter than the
+# rest of this grid's. Run it separately (own --job-timeout-secs) if wanted.
 srun \
   --ntasks=1 \
   --cpus-per-task="$SLURM_CPUS_PER_TASK" \
@@ -67,7 +72,7 @@ srun \
     --runs-dir "$runs_root" \
     --parallelism "$SLURM_CPUS_PER_TASK" \
     --scenarios "$scenario" \
-    --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
+    --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq,mutex-vecdeque,ms-queue,moodycamel-cq \
     --modes throughput \
     --repeats 3 \
     --batch-sizes 2,8,16,64,256,1024,4096 \

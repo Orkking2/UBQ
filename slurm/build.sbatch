@@ -9,6 +9,8 @@ module load gcc
 module load rust
 # module load rust/REPLACE_WITH_PINNED_VERSION
 # Or prepend a project-installed Rust 1.92 toolchain to PATH.
+# `gcc` above must provide a working `c++`/`g++` on PATH: bench_moodycamel
+# compiles third_party/moodycamel/shim.cpp via the `cc` crate at build time.
 
 : "${TMPDIR:?Slurm did not provide TMPDIR}"
 
@@ -25,7 +27,7 @@ cargo build \
     --release \
     --locked \
     --offline \
-    --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq \
+    --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq,bench_moodycamel \
     --bin bench_grid
 
 install -m 0755 \

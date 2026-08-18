@@ -89,9 +89,8 @@ TODO
 
 ## Benchmarks
 
-This repo includes a benchmark harness that compares static UBQ, the opt-in
-experimental dynamic implementation (`dubq`), and established
-MPMC queue implementations (`segqueue`, `concurrent-queue`, and optional
+This repo includes a benchmark harness that compares static UBQ against
+established MPMC queue implementations (`segqueue`, `concurrent-queue`, and optional
 RBBQ/BBQ, `lfqueue`/LSCQ, and wCQ variants). Unless `--scenarios` is supplied,
 each machine benchmarks the complete power-of-two producer/consumer grid:
 `2^n p 2^m c` for every `n,m >= 0` whose producer and consumer thread sum does
@@ -107,24 +106,21 @@ The schema-v7 comparative harness has two front ends:
 - `bench_matrix`: direct matrix execution. It dispatches through the
   precompiled benchmark registry and writes schema-v7 JSON files under
   `bench_results/runs`.
-- `bench_grid`: reproducible UBQ/DUBQ grid execution. Its default sparse grid is
+- `bench_grid`: reproducible UBQ grid execution. Its default sparse grid is
   `block=[31,127,511,2047,4095]` × both backoffs (10 static-UBQ configurations).
   `-d` selects all 8 block values × both backoffs (16 static-UBQ configurations).
-  DUBQ additionally retains its runtime pool dimension, giving 40 sparse or 128
-  dense configurations. Static configurations whose block is smaller than a
-  scenario's producer count are excluded before jobs are counted; DUBQ treats
-  the block dimension as a minimum and retains every grid point. Sparse and
-  dense select configuration coverage only; both run the same scenario grid.
+  Configurations whose block is smaller than a scenario's producer count are
+  excluded before jobs are counted. Sparse and dense select configuration
+  coverage only; both run the same scenario grid.
 
-For throughput, every selected UBQ or DUBQ configuration measures a
+For throughput, every selected UBQ configuration measures a
 scalar-compatible operation and batch-shaped operations at sizes `8,32,256`.
-Static UBQ and DUBQ use their native `push_batch` and `pop_batch` APIs. When
+Static UBQ uses its native `push_batch` and `pop_batch` APIs. When
 `segqueue` is selected, its normal
 `SegQueue::push`/`pop` run remains scalar and the same batch-size grid is run
 through the fork's separate `BatchQueue::push`/`pop` API. `--batch-sizes`
-replaces that shared batch-size list while retaining scalar measurements. DUBQ
-has a batch-only API, so its scalar-compatible variant uses one-item batches
-and is recorded without a batch size. Thus the static-UBQ default grid
+replaces that shared batch-size list while retaining scalar measurements.
+Thus the static-UBQ default grid
 has 160 sparse or 512 dense UBQ throughput jobs per unconstrained scenario and
 repeat. Scalar baselines are measured once rather than once per UBQ
 configuration, while the Crossbeam batch queue is measured once per requested
@@ -134,7 +130,7 @@ For workload-specific modes, when `--items-per-producer` is omitted,
 `bench_grid` uses the versioned
 `scenario_scaled_v1` workload: 1–8 producers get 1,000,000 items each, 9–16
 get 250,000, 17–32 get 62,500, and larger producer counts get 15,625. Every
-queue, UBQ/DUBQ configuration, batch size, mode, and repeat in a scenario receives
+queue, UBQ configuration, batch size, mode, and repeat in a scenario receives
 the same resolved count. Supplying one or more `--items-per-producer` values
 selects the `explicit` policy and runs every supplied value in every scenario.
 The selected policy and scenario mapping are printed before execution and
@@ -241,18 +237,6 @@ The pool field is retained for result-format compatibility and must be `1`.
 Static UBQ now manages its single recycle slot internally; block size and
 backoff are its configurable benchmark dimensions.
 
-DUBQ labels are 3-part runtime configurations:
-
-- `pool,min_block,backoff`
-- Example: `8,127,crossbeam`
-
-Select them directly with `--queues dubq --dubq-label 8,127,crossbeam`, or add
-`dubq` to `bench_grid --queues` to sweep the selected sparse/dense grid. DUBQ is
-opt-in and does not change either binary's default queue selection. Its current
-mixed-width atomic head accesses are an experimental hardware design outside
-Rust's supported overlapping-atomic memory model; results should be treated as
-experimental rather than production-safety evidence.
-
 Publication-backed baseline labels are emitted with their sizing knob:
 
 - RBBQ/BBQ: `fastfifo_b<block_size>_c<requested_capacity>`, for example
@@ -278,9 +262,8 @@ Run an explicit direct matrix:
 ```bash
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_matrix -- \
   --machine-label local \
-  --queues ubq,dubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
+  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
   --ubq-label balanced,1,127,crossbeam \
-  --dubq-label 8,127,crossbeam \
   --rbbq-block-sizes 64,256,1024,4096 \
   --lfqueue-segment-sizes 32,256,1024 \
   --wcq-capacities 4096,65536,1048576 \
@@ -327,7 +310,7 @@ Run the sparse grid on one machine:
 ```bash
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_grid -- \
   --machine-label local \
-  --queues ubq,dubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
+  --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
   --batch-sizes 8,32,128,512 \
   --rbbq-block-sizes 64,256,1024,4096 \
   --lfqueue-segment-sizes 32,256,1024 \
@@ -337,11 +320,10 @@ cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq
 Add `-d` for the dense grid or `--rerun` to benchmark every job without using
 compatible existing results. Batch sizes must be integers of at least 2;
 duplicates are removed. The scalar-compatible variant is always included.
-The sparse and dense static-UBQ grids vary block size and backoff. DUBQ retains
-its separate runtime pool-size dimension.
+The sparse and dense static-UBQ grids vary block size and backoff.
 
 To benchmark only scalar SegQueue and the forked BatchQueue—without scheduling
-any UBQ/DUBQ configurations—select `segqueue` by itself:
+any UBQ configurations—select `segqueue` by itself:
 
 ```bash
 cargo run --release --features bench_registry --bin bench_grid -- \
@@ -450,7 +432,7 @@ Omit the filenames to plot every JSON run discovered under `--runs-dir`.
 Python is only needed for the plotting helpers.
 
 Per-scenario CSVs retain every measured configuration, while plots display one
-best variation per queue family. Scalar and batched SegQueue, UBQ, and DUBQ are
+best variation per queue family. Scalar and batched SegQueue and UBQ are
 separate families. When both method kinds are present, each scenario also gets
 `*_scalar` and `*_batched` CSVs and bar graphs so scalar queue operations are
 not compared in the same panel as native batch operations. The original
@@ -462,11 +444,10 @@ badge reports that the declared grid is exhausted; a red badge reports
 incomplete or legacy coverage while the plotted winners remain the best
 measurements present.
 
-The MPSC and SPMC throughput outputs also include `*_batchcomp` and
-`*_dubq_batchcomp` plots. These show the best scalar-compatible configuration,
-the scalar counterpart of the best batched configuration, and every measured
-batch size for that underlying UBQ or DUBQ configuration. Duplicate scalar
-configurations are shown only once. Cool
+The MPSC and SPMC throughput outputs also include `*_batchcomp` plots. These
+show the best scalar-compatible configuration, the scalar counterpart of the
+best batched configuration, and every measured batch size for that underlying
+UBQ configuration. Duplicate scalar configurations are shown only once. Cool
 shades group batches below the selected winner, warm shades group larger
 batches, the winning batch uses a green star, the best scalar is black, and a
 distinct scalar counterpart is dashed gray.

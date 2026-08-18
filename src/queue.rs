@@ -107,7 +107,7 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
         I::IntoIter: ExactSizeIterator,
     {
         let mut items = items.into_iter();
-        let len = items.len();
+        let len = items.len().min(usize::MAX - 1);
 
         if len == 0 {
             return;
@@ -152,7 +152,8 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
             // Need (len + 1) for the exact-fill case, where we need to install
             // the successor block.
             blocks.grow_to_fit_with(
-                len.strict_add(1).saturating_sub(
+                // len < usize::MAX
+                (len + 1).saturating_sub(
                     BLOCK_SIZE - phead.index + if phead.has_next { BLOCK_SIZE } else { 0 },
                 ),
                 &self.pool,

@@ -41,7 +41,7 @@ struct Args {
     #[arg(long)]
     parallelism: Option<usize>,
 
-    /// Comma-separated UBQ/DUBQ/SegQueue batch sizes; scalar runs are always included.
+    /// Comma-separated UBQ/SegQueue batch sizes; scalar runs are always included.
     #[arg(
         long,
         value_delimiter = ',',
@@ -50,7 +50,7 @@ struct Args {
     )]
     batch_sizes: Vec<usize>,
 
-    /// Use all 16 static-UBQ block/backoff variants (and all 128 DUBQ variants).
+    /// Use all 16 static-UBQ block/backoff variants.
     #[arg(short = 'd', long)]
     dense: bool,
 
@@ -115,8 +115,6 @@ fn main() {
             .ok_or_else(|| "--machine-label is required".to_string())?;
         let queues = parse_queue_kinds(&args.queues)?;
         let includes_ubq = queues.contains(&QueueKind::Ubq);
-        let includes_dubq = queues.contains(&QueueKind::Dubq);
-        let includes_ubq_grid = includes_ubq || includes_dubq;
         let requested_core_ids = args.core_ids.as_deref().map(parse_core_ids).transpose()?;
         let available_parallelism = match args.parallelism {
             Some(value) => value,
@@ -210,29 +208,20 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        if includes_ubq_grid {
-            if includes_ubq {
-                println!(
-                    "static UBQ grid: {} ({} configurations before constraints)",
-                    grid.name(),
-                    grid.labels().len()
-                );
-            }
-            if includes_dubq {
-                println!(
-                    "DUBQ grid: {} ({} configurations before constraints)",
-                    grid.name(),
-                    grid.dubq_labels().len()
-                );
-            }
+        if includes_ubq {
             println!(
-                "throughput variants per UBQ/DUBQ configuration: {} (scalar-compatible + {} batch sizes)",
+                "static UBQ grid: {} ({} configurations before constraints)",
+                grid.name(),
+                grid.labels().len()
+            );
+            println!(
+                "throughput variants per UBQ configuration: {} (scalar-compatible + {} batch sizes)",
                 1 + plan.ubq_batch_sizes.len(),
                 plan.ubq_batch_sizes.len()
             );
         }
         println!(
-            "queue batch sizes (UBQ/DUBQ/SegQueue): {}",
+            "queue batch sizes (UBQ/SegQueue): {}",
             plan.ubq_batch_sizes
                 .iter()
                 .map(|size| size.to_string())
@@ -287,7 +276,6 @@ mod tests {
         assert_eq!(args.throughput_warmup_ms, DEFAULT_THROUGHPUT_WARMUP_MS);
         assert_eq!(args.throughput_phase_ms, DEFAULT_THROUGHPUT_PHASE_MS);
         assert_eq!(args.batch_sizes, DEFAULT_UBQ_BATCH_SIZES);
-        assert!(!args.queues.split(',').any(|queue| queue == "dubq"));
     }
 
     #[test]

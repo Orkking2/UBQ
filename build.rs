@@ -1,9 +1,9 @@
 use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
 
-// The public label retains a fixed `1` in the former pool position so existing
-// result-processing tools can distinguish static UBQ from runtime-configured
-// DUBQ. UBQ now owns its single-block recycle slot internally.
+// The public label retains a fixed `1` in the former pool position for
+// compatibility with existing result-processing tools. UBQ now owns its
+// single-block recycle slot internally.
 const PRESET_INFO: &[(&str, &[u8])] = &[("balanced", &[1])];
 
 const BLOCK_INFO: &[u16] = &[31, 63, 127, 255, 511, 1023, 2047, 4095];
@@ -15,6 +15,17 @@ const BACKOFF_INFO: &[(&str, &str)] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+
+    if std::env::var("CARGO_FEATURE_BENCH_MOODYCAMEL").is_ok() {
+        println!("cargo:rerun-if-changed=third_party/moodycamel/shim.cpp");
+        println!("cargo:rerun-if-changed=third_party/moodycamel/concurrentqueue.h");
+        cc::Build::new()
+            .cpp(true)
+            .file("third_party/moodycamel/shim.cpp")
+            .include("third_party/moodycamel")
+            .std("c++17")
+            .compile("moodycamel_shim");
+    }
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
     let path = PathBuf::from(&out_dir).join("bench_registry.rs");

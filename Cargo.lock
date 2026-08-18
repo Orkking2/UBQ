@@ -185,6 +185,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-epoch"
+version = "0.9.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+dependencies = [
+ "crossbeam-utils 0.8.21",
+]
+
+[[package]]
 name = "crossbeam-queue"
 version = "0.3.13"
 source = "git+https://github.com/Orkking2/crossbeam?branch=batch#b7cea043eab50fab779d58377e32c1d0664ae416"
@@ -686,9 +695,11 @@ dependencies = [
 name = "ubq"
 version = "6.0.0"
 dependencies = [
+ "cc",
  "clap",
  "concurrent-queue",
  "core_affinity",
+ "crossbeam-epoch",
  "crossbeam-queue",
  "crossbeam-utils 0.8.21",
  "lfqueue",

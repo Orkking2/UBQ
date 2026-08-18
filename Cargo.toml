@@ -16,9 +16,13 @@ categories = ["concurrency", "data-structures", "no-std"]
 [lib]
 bench = false
 
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 concurrent-queue = { version = "2", optional = true }
 core_affinity = { version = "0.8", optional = true }
+crossbeam-epoch = { version = "0.9", optional = true }
 crossbeam-queue = { git = "https://github.com/Orkking2/crossbeam", branch = "batch", optional = true }
 crossbeam-utils = { version = "0.8.21", default-features = false }
 lfqueue = { version = "0.8.1", optional = true }
@@ -42,6 +46,7 @@ bench_tools = [
     "dep:clap",
     "dep:concurrent-queue",
     "dep:core_affinity",
+    "dep:crossbeam-epoch",
     "dep:crossbeam-queue",
     "dep:portable-atomic",
     "dep:serde",
@@ -52,6 +57,8 @@ bench_fastfifo = ["bench_tools", "dep:rbbq"]
 bench_rbbq = ["bench_fastfifo"]
 bench_lfqueue = ["bench_tools", "dep:lfqueue"]
 bench_wcq = ["bench_tools", "dep:wcq"]
+# Compiles third_party/moodycamel/shim.cpp via cc; requires a C++ compiler.
+bench_moodycamel = ["bench_tools"]
 # Compile the full static UBQ variant registry.
 # Required for bench_grid and bench_matrix to run in-process.
 bench_registry = ["bench_tools"]

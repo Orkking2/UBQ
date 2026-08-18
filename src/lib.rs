@@ -73,8 +73,6 @@ pub mod backoff;
 #[cfg(feature = "bench_tools")]
 pub mod bench_harness;
 pub(crate) mod block;
-#[cfg(feature = "bench_tools")]
-pub(crate) mod dynamic;
 #[cfg(feature = "jni")]
 mod jni;
 pub(crate) mod queue;

@@ -11,10 +11,13 @@ from scripts.plot_bench import (
     batch_comparison_series_styles,
     best_family_variation_labels,
     clear_generated_outputs,
+    combined_batch_comparison_color_key,
+    combined_batch_comparison_families,
+    combined_batch_comparison_line_labels,
+    combined_batch_comparison_series_styles,
     combined_scenario_line_labels,
     display_label,
     deduplicate_logical_samples,
-    format_batched_dubq_label,
     format_batched_segqueue_label,
     format_batched_ubq_label,
     grid_coverage_report,
@@ -32,9 +35,12 @@ from scripts.plot_bench import (
     machine_display_label,
     machine_family_entries,
     plot_scenario_lines,
-    parse_batched_dubq_label,
+    parse_batched_plain_label,
     parse_batched_segqueue_label,
-    parse_dubq_variant,
+    plain_batch_comparison_line_labels,
+    plain_batch_comparison_series_styles,
+    plain_batch_family_queues,
+    plain_queue_display_name,
     pool_size_effect_observations,
     pool_size_effect_rows,
     preferred_core_placements,
@@ -45,6 +51,7 @@ from scripts.plot_bench import (
     publication_metric_value,
     publication_scenario_line_labels,
     queue_label_legend_title,
+    queue_method_kind,
     queue_metadata,
     scenario_family,
     scenario_line_uses_log_y,
@@ -53,6 +60,7 @@ from scripts.plot_bench import (
     summarize_ops,
     symmetric_scenarios,
     throughput_speedup_rows,
+    format_batched_plain_label,
     write_immediate_variant_csv,
     write_machine_line_csv,
     write_pool_size_effect_csv,
@@ -68,11 +76,51 @@ def stats(ops):
     }
 
 
+class FakeBbox:
+    def __init__(self, x0=0.1, y0=0.15, width=0.7, height=0.75):
+        self.x0 = x0
+        self.y0 = y0
+        self.width = width
+        self.height = height
+
+
+class FakeWindowExtent:
+    width = 120.0  # pixels; paired with FakeFigure.dpi=100 -> 1.2in
+
+
+class FakeLegend:
+    def get_window_extent(self, _renderer=None):
+        return FakeWindowExtent()
+
+
+class FakeCanvas:
+    def draw(self):
+        pass
+
+    def get_renderer(self):
+        return None
+
+
 class FakeFigure:
+    def __init__(self):
+        self.canvas = FakeCanvas()
+        self.dpi = 100
+
     def tight_layout(self, **_kwargs):
         pass
 
     def savefig(self, *_args, **_kwargs):
+        pass
+
+    def get_size_inches(self):
+        return (10.0, 6.5)
+
+    def set_size_inches(self, *_args, **_kwargs):
+        pass
+
+
+class FakeSpine:
+    def set_visible(self, *_args, **_kwargs):
         pass
 
 
@@ -82,6 +130,12 @@ class FakeAxes:
         self.grid_kwargs = None
         self.legend_kwargs = None
         self.transAxes = None
+        self.spines = {
+            "top": FakeSpine(),
+            "right": FakeSpine(),
+            "bottom": FakeSpine(),
+            "left": FakeSpine(),
+        }
 
     def plot(self, *_args, **_kwargs):
         pass
@@ -89,7 +143,16 @@ class FakeAxes:
     def errorbar(self, *_args, **_kwargs):
         pass
 
+    def imshow(self, *_args, **_kwargs):
+        pass
+
+    def tick_params(self, *_args, **_kwargs):
+        pass
+
     def set_xticks(self, *_args, **_kwargs):
+        pass
+
+    def set_yticks(self, *_args, **_kwargs):
         pass
 
     def set_xlabel(self, *_args, **_kwargs):
@@ -109,6 +172,13 @@ class FakeAxes:
 
     def legend(self, *_args, **_kwargs):
         self.legend_kwargs = _kwargs
+        return FakeLegend()
+
+    def get_position(self):
+        return FakeBbox()
+
+    def set_position(self, *_args, **_kwargs):
+        pass
 
     def text(self, *_args, **_kwargs):
         pass
@@ -118,8 +188,11 @@ class FakePyplot:
     def __init__(self):
         self.last_axes = None
 
-    def subplots(self, **_kwargs):
-        self.last_axes = FakeAxes()
+    def subplots(self, *args, **_kwargs):
+        if len(args) >= 2 and args[0] == 1 and args[1] == 2:
+            self.last_axes = (FakeAxes(), FakeAxes())
+        else:
+            self.last_axes = FakeAxes()
         return FakeFigure(), self.last_axes
 
     def get_cmap(self, *_args, **_kwargs):
@@ -157,23 +230,11 @@ class DisplayLabelTest(unittest.TestCase):
         self.assertEqual(32, parse_batched_segqueue_label(label))
         self.assertIsNone(parse_batched_segqueue_label("segqueue"))
 
-    def test_dynamic_variants_follow_the_same_vocabulary(self):
-        self.assertEqual(
-            "DUBQ 2,31,Cycle",
-            display_label("dubq_2,31,crossbeam"),
-        )
-        label = format_batched_dubq_label("2,31,yield", 8)
-        self.assertEqual(
-            "DUBQb (8) 2,31,Yield",
-            display_label(label),
-        )
-        self.assertEqual("DUBQb", publication_display_label(label))
-
     def test_queue_label_legend_explains_and_aligns_fields(self):
         title = queue_label_legend_title(
             [
                 "ubq_balanced,8,127,crossbeam",
-                format_batched_dubq_label("2,31,yield", 8),
+                format_batched_ubq_label("balanced,2,31,yield", 8),
             ]
         )
 
@@ -181,11 +242,11 @@ class DisplayLabelTest(unittest.TestCase):
         _heading, batched_schema, scalar_schema = title.splitlines()
         self.assertEqual(batched_schema.index("POOL_SZ"), scalar_schema.index("POOL_SZ"))
         self.assertEqual(
-            "D?UBQb (BATCH_SZ)  POOL_SZ,BLK_SZ,BACKOFF",
+            "UBQb (BATCH_SZ)  POOL_SZ,BLK_SZ,BACKOFF",
             batched_schema,
         )
         self.assertEqual(
-            "D?UBQ              POOL_SZ,BLK_SZ,BACKOFF",
+            "UBQ              POOL_SZ,BLK_SZ,BACKOFF",
             scalar_schema,
         )
 
@@ -507,12 +568,38 @@ class ScenarioLineLabelsTest(unittest.TestCase):
 
         self.assertEqual("#111111", styles[scalar_winner]["color"])
         self.assertEqual("--", styles[matching_scalar]["linestyle"])
-        self.assertEqual(("coolwarm", 0.05), styles[below]["color"])
-        self.assertEqual("#009E73", styles[best]["color"])
+        self.assertEqual(("coolwarm", 0.25), styles[below]["color"])
+        self.assertEqual(("coolwarm", 1.0), styles[best]["color"])
         self.assertEqual("*", styles[best]["marker"])
         self.assertEqual(("coolwarm", 0.6), styles[above]["color"])
-        self.assertIn("(below best)", styles[below]["label"])
-        self.assertIn("(above best)", styles[above]["label"])
+        self.assertEqual("batch=8", styles[below]["label"])
+        self.assertEqual("batch=128", styles[above]["label"])
+        self.assertEqual("batch=64 (best)", styles[best]["label"])
+
+    def test_batch_comparison_styles_prefix_labels_with_family_name(self):
+        class ColorPlot:
+            def get_cmap(self, name):
+                return lambda position: (name, round(position, 2))
+
+        scalar_winner = "ubq_balanced,8,127,crossbeam"
+        best = format_batched_ubq_label("balanced,8,127,crossbeam", 64)
+        entries_by_scenario = {
+            scenario: {scalar_winner: stats(100), best: stats(200)}
+            for scenario in ("4p1c", "64p1c")
+        }
+        labels = batch_comparison_line_labels(entries_by_scenario)
+
+        styles = batch_comparison_series_styles(
+            ColorPlot(),
+            labels,
+            entries_by_scenario,
+            cmap=ColorPlot().get_cmap("Blues"),
+            family_label="UBQ",
+        )
+
+        self.assertTrue(styles[scalar_winner]["label"].startswith("UBQ "))
+        self.assertTrue(styles[best]["label"].startswith("UBQ "))
+        self.assertEqual(("Blues", 1.0), styles[best]["color"])
 
 
 class FamilyVariationSelectionTest(unittest.TestCase):
@@ -539,50 +626,6 @@ class FamilyVariationSelectionTest(unittest.TestCase):
             {segqueue_batched, ubq_batched},
             set(groups["batched"]),
         )
-
-    def test_dubq_scalar_and_batched_are_independent_families(self):
-        scalar = "dubq_8,127,crossbeam"
-        batched = format_batched_dubq_label("8,127,crossbeam", 32)
-        labels = best_family_variation_labels(
-            {
-                "ubq_balanced,8,127,crossbeam": stats(100),
-                scalar: stats(120),
-                "dubq_1,31,yield": stats(90),
-                batched: stats(150),
-            },
-            "throughput",
-            "64p1c",
-        )
-        self.assertEqual(
-            ["ubq_balanced,8,127,crossbeam", scalar, batched], labels
-        )
-        self.assertEqual((8, 127, "crossbeam"), parse_dubq_variant(scalar))
-        self.assertEqual(
-            (32, (8, 127, "crossbeam")), parse_batched_dubq_label(batched)
-        )
-
-    def test_dubq_batch_comparison_uses_the_best_dynamic_configuration(self):
-        scalar = "dubq_2,31,crossbeam"
-        batch8 = format_batched_dubq_label("2,31,crossbeam", 8)
-        batch32 = format_batched_dubq_label("2,31,crossbeam", 32)
-        labels = batch_comparison_line_labels(
-            {
-                "2p1c": {
-                    scalar: stats(100),
-                    batch8: stats(150),
-                    batch32: stats(140),
-                },
-                "4p1c": {
-                    scalar: stats(110),
-                    batch8: stats(160),
-                    batch32: stats(170),
-                },
-            },
-            queue_family="DUBQ",
-        )
-        self.assertIn(scalar, labels)
-        self.assertIn(batch8, labels)
-        self.assertIn(batch32, labels)
 
     def test_bar_plot_picks_best_variation_of_every_family(self):
         scalar = "ubq_balanced,8,127,crossbeam"
@@ -915,14 +958,407 @@ class ThroughputSpeedupGridTest(unittest.TestCase):
     def test_rows_report_scalar_and_batched_ubq_separately(self):
         scalar = "ubq_balanced,8,127,crossbeam"
         batched = format_batched_ubq_label("balanced,1,511,yield", 64)
+        segqueue_batched = format_batched_segqueue_label(16)
         rows = throughput_speedup_rows(
-            {"1p1c": {scalar: stats(100), batched: stats(180), "segqueue": stats(60)}}
+            {
+                "1p1c": {
+                    scalar: stats(100),
+                    batched: stats(180),
+                    "segqueue": stats(60),
+                    segqueue_batched: stats(90),
+                }
+            }
         )
         by_comparison = {row["comparison"]: row for row in rows}
 
         self.assertEqual(100 / 60, by_comparison["scalar_segqueue"]["speedup"])
-        self.assertEqual(3.0, by_comparison["batched_segqueue"]["speedup"])
+        self.assertEqual(180 / 90, by_comparison["batched_segqueue"]["speedup"])
         self.assertEqual(batched, by_comparison["batched_segqueue"]["ubq_queue"])
+        self.assertEqual(
+            segqueue_batched, by_comparison["batched_segqueue"]["baseline_queue"]
+        )
+        self.assertEqual(
+            "best batched UBQ vs best batched SegQueue",
+            by_comparison["batched_segqueue"]["comparison_label"],
+        )
+
+    def test_batched_ubq_only_compares_against_baselines_with_batched_data(self):
+        """A baseline with no batched measurement (segqueue here) or no
+        batched form at all (BBQ) must not silently pull in its scalar value
+        when compared against batched UBQ — that would conflate UBQ's own
+        batching gain with its baseline architectural gain."""
+        scalar = "ubq_balanced,8,127,crossbeam"
+        batched = format_batched_ubq_label("balanced,1,511,yield", 64)
+        rows = throughput_speedup_rows(
+            {
+                "1p1c": {
+                    scalar: stats(100),
+                    batched: stats(180),
+                    "segqueue": stats(60),
+                    "fastfifo_256": stats(30),
+                }
+            }
+        )
+        by_comparison = {row["comparison"]: row for row in rows}
+
+        self.assertIn("scalar_segqueue", by_comparison)
+        self.assertIn("scalar_bbq", by_comparison)
+        self.assertNotIn("batched_segqueue", by_comparison)
+        self.assertNotIn("batched_bbq", by_comparison)
+
+    def test_batched_ubq_compares_against_batched_plain_baselines(self):
+        scalar = "ubq_balanced,8,127,crossbeam"
+        batched = format_batched_ubq_label("balanced,1,511,yield", 64)
+        mutex_batched = format_batched_plain_label("mutex-vecdeque", 32)
+        moodycamel_batched = format_batched_plain_label("moodycamel-cq", 8)
+        rows = throughput_speedup_rows(
+            {
+                "1p1c": {
+                    scalar: stats(100),
+                    batched: stats(200),
+                    "mutex-vecdeque": stats(4),
+                    mutex_batched: stats(20),
+                    "moodycamel-cq": stats(25),
+                    moodycamel_batched: stats(40),
+                }
+            }
+        )
+        by_comparison = {row["comparison"]: row for row in rows}
+
+        self.assertEqual(200 / 20, by_comparison["batched_mutex-vecdeque"]["speedup"])
+        self.assertEqual(
+            mutex_batched, by_comparison["batched_mutex-vecdeque"]["baseline_queue"]
+        )
+        self.assertEqual(
+            "best batched UBQ vs best batched Mutex+VecDeque",
+            by_comparison["batched_mutex-vecdeque"]["comparison_label"],
+        )
+        self.assertEqual(200 / 40, by_comparison["batched_moodycamel-cq"]["speedup"])
+        self.assertEqual(
+            moodycamel_batched,
+            by_comparison["batched_moodycamel-cq"]["baseline_queue"],
+        )
+
+    def test_rows_compare_ubq_to_newly_added_scalar_baselines(self):
+        entries_by_scenario = {
+            "1p1c": {
+                "ubq_balanced,8,127,crossbeam": stats(100.0),
+                "mutex-vecdeque": stats(4.0),
+                "ms-queue": stats(20.0),
+                "naive-faa-queue": stats(2.0),
+                "moodycamel-cq": stats(25.0),
+            }
+        }
+
+        rows = throughput_speedup_rows(entries_by_scenario)
+        by_comparison = {row["comparison"]: row for row in rows}
+
+        self.assertEqual(
+            {
+                "scalar_mutex-vecdeque",
+                "scalar_ms-queue",
+                "scalar_naive-faa-queue",
+                "scalar_moodycamel-cq",
+            },
+            set(by_comparison),
+        )
+        self.assertEqual(25.0, by_comparison["scalar_mutex-vecdeque"]["speedup"])
+        self.assertEqual(5.0, by_comparison["scalar_ms-queue"]["speedup"])
+        self.assertEqual(50.0, by_comparison["scalar_naive-faa-queue"]["speedup"])
+        self.assertEqual(4.0, by_comparison["scalar_moodycamel-cq"]["speedup"])
+
+
+class PlainBatchNativeQueueTest(unittest.TestCase):
+    """Covers the generic 'plain batch-native queue' path (no internal
+    variant params, unlike UBQ) that segqueue, mutex-vecdeque, and
+    moodycamel-cq all share — see format_batched_plain_label."""
+
+    def test_plain_label_round_trips_and_rejects_ubq_shaped_labels(self):
+        label = format_batched_plain_label("mutex-vecdeque", 32)
+        self.assertEqual("mutex-vecdeque_batched_32", label)
+        self.assertEqual(("mutex-vecdeque", 32), parse_batched_plain_label(label))
+
+        self.assertIsNone(parse_batched_plain_label("mutex-vecdeque"))
+        self.assertIsNone(parse_batched_plain_label("not_batched_at_all"))
+        # A UBQ-shaped label has non-digit content after the batch
+        # number (the variant params) — must not be mistaken for plain.
+        ubq_batched = format_batched_ubq_label("balanced,1,255,crossbeam", 8)
+        self.assertIsNone(parse_batched_plain_label(ubq_batched))
+
+    def test_segqueue_specific_helpers_delegate_to_the_generic_ones(self):
+        label = format_batched_segqueue_label(16)
+        self.assertEqual("segqueue_batched_16", label)
+        self.assertEqual(16, parse_batched_segqueue_label(label))
+        self.assertEqual(("segqueue", 16), parse_batched_plain_label(label))
+        # A different queue's batched label must not look like segqueue's.
+        self.assertIsNone(
+            parse_batched_segqueue_label(format_batched_plain_label("moodycamel-cq", 16))
+        )
+
+    def test_method_kind_and_metadata_recognize_any_plain_batched_queue(self):
+        label = format_batched_plain_label("moodycamel-cq", 256)
+        self.assertEqual("batched", queue_method_kind(label))
+        self.assertEqual("scalar", queue_method_kind("moodycamel-cq"))
+
+        meta = queue_metadata(label)
+        self.assertEqual("moodycamel-cq batched", meta["family"])
+        self.assertEqual("(256)", meta["variant"])
+        self.assertIn("moodycamel", meta["publication"].lower())
+
+        scalar_meta = queue_metadata("moodycamel-cq")
+        self.assertEqual("moodycamel-cq", scalar_meta["family"])
+
+    def test_display_label_uses_short_names_for_scalar_and_batched(self):
+        self.assertEqual("moodycamel::CQ", display_label("moodycamel-cq"))
+        self.assertEqual(
+            "moodycamel::CQb (256)", display_label(format_batched_plain_label("moodycamel-cq", 256))
+        )
+        self.assertEqual("Mutex+VecDeque", display_label("mutex-vecdeque"))
+        self.assertEqual("MS-Queue", plain_queue_display_name("ms-queue"))
+
+    def test_family_queues_discovers_every_plain_batch_native_queue_present(self):
+        entries_by_scenario = {
+            "1p1c": {
+                "segqueue": stats(10),
+                format_batched_plain_label("segqueue", 8): stats(12),
+                format_batched_plain_label("mutex-vecdeque", 32): stats(9),
+                "ubq_balanced,0,255,crossbeam": stats(20),
+            },
+            "4p4c": {
+                format_batched_plain_label("moodycamel-cq", 8): stats(30),
+            },
+        }
+        self.assertEqual(
+            ["moodycamel-cq", "mutex-vecdeque", "segqueue"],
+            plain_batch_family_queues(entries_by_scenario),
+        )
+
+    def test_line_labels_include_scalar_plus_every_batch_size_sorted(self):
+        entries_by_scenario = {
+            "2p2c": {
+                "mutex-vecdeque": stats(100),
+                format_batched_plain_label("mutex-vecdeque", 256): stats(300),
+                format_batched_plain_label("mutex-vecdeque", 8): stats(150),
+                "moodycamel-cq": stats(50),  # a different queue, must be excluded
+            },
+            "4p4c": {
+                format_batched_plain_label("mutex-vecdeque", 32): stats(220),
+            },
+        }
+
+        labels = plain_batch_comparison_line_labels(
+            entries_by_scenario, "throughput", "mutex-vecdeque"
+        )
+
+        self.assertEqual(
+            [
+                "mutex-vecdeque",
+                format_batched_plain_label("mutex-vecdeque", 8),
+                format_batched_plain_label("mutex-vecdeque", 32),
+                format_batched_plain_label("mutex-vecdeque", 256),
+            ],
+            labels,
+        )
+
+    def test_line_labels_omit_scalar_when_the_queue_has_no_scalar_data(self):
+        entries_by_scenario = {
+            "2p2c": {format_batched_plain_label("mutex-vecdeque", 8): stats(150)},
+        }
+
+        labels = plain_batch_comparison_line_labels(
+            entries_by_scenario, "throughput", "mutex-vecdeque"
+        )
+
+        self.assertEqual([format_batched_plain_label("mutex-vecdeque", 8)], labels)
+
+    def test_series_styles_give_scalar_a_fixed_color_and_batches_a_gradient(self):
+        labels = [
+            "mutex-vecdeque",
+            format_batched_plain_label("mutex-vecdeque", 8),
+            format_batched_plain_label("mutex-vecdeque", 256),
+        ]
+
+        styles = plain_batch_comparison_series_styles(FakePyplot(), labels, "mutex-vecdeque")
+
+        self.assertEqual(set(labels), set(styles))
+        self.assertEqual("#111111", styles["mutex-vecdeque"]["color"])
+        for label in labels[1:]:
+            self.assertIn("batch=", styles[label]["label"])
+
+    def test_plain_series_styles_take_a_family_hue_and_label_prefix(self):
+        class ColorPlot:
+            def get_cmap(self, name):
+                return lambda position: (name, round(position, 2))
+
+        labels = ["mutex-vecdeque", format_batched_plain_label("mutex-vecdeque", 8)]
+        styles = plain_batch_comparison_series_styles(
+            ColorPlot(),
+            labels,
+            "mutex-vecdeque",
+            cmap=ColorPlot().get_cmap("Greens"),
+            family_label="Mutex+VecDeque",
+        )
+
+        self.assertTrue(styles["mutex-vecdeque"]["label"].startswith("Mutex+VecDeque "))
+        batched_label = format_batched_plain_label("mutex-vecdeque", 8)
+        self.assertEqual("Greens", styles[batched_label]["color"][0])
+
+
+class CombinedBatchComparisonTest(unittest.TestCase):
+    def test_combined_families_include_ubq_and_every_batched_plain_queue(self):
+        ubq_scalar = "ubq_balanced,8,127,crossbeam"
+        ubq_batched = format_batched_ubq_label("balanced,8,127,crossbeam", 32)
+        mutex_batched = format_batched_plain_label("mutex-vecdeque", 8)
+        entries_by_scenario = {
+            "1p1c": {
+                ubq_scalar: stats(100),
+                ubq_batched: stats(200),
+                "mutex-vecdeque": stats(10),
+                mutex_batched: stats(20),
+                # segqueue never measured batched: must be excluded entirely.
+                "segqueue": stats(5),
+            }
+        }
+
+        families = combined_batch_comparison_families(entries_by_scenario)
+        family_keys = [key for key, _labels in families]
+
+        self.assertEqual(["UBQ", "mutex-vecdeque"], family_keys)
+        self.assertNotIn("segqueue", family_keys)
+
+        labels = combined_batch_comparison_line_labels(entries_by_scenario)
+        self.assertIn(ubq_batched, labels)
+        self.assertIn(mutex_batched, labels)
+
+    def test_combined_styles_give_each_family_a_distinct_colormap(self):
+        class ColorPlot:
+            def get_cmap(self, name):
+                return lambda position: (name, round(position, 2))
+
+        ubq_scalar = "ubq_balanced,8,127,crossbeam"
+        ubq_batched = format_batched_ubq_label("balanced,8,127,crossbeam", 32)
+        mutex_batched = format_batched_plain_label("mutex-vecdeque", 8)
+        entries_by_scenario = {
+            "1p1c": {
+                ubq_scalar: stats(100),
+                ubq_batched: stats(200),
+                "mutex-vecdeque": stats(10),
+                mutex_batched: stats(20),
+            }
+        }
+
+        plt = ColorPlot()
+        families = combined_batch_comparison_families(entries_by_scenario)
+        styles = combined_batch_comparison_series_styles(plt, families, entries_by_scenario)
+
+        self.assertEqual("Blues", styles[ubq_batched]["color"][0])
+        self.assertEqual("Oranges", styles[mutex_batched]["color"][0])
+        self.assertTrue(styles[ubq_scalar]["label"].startswith("UBQ "))
+        self.assertTrue(styles["mutex-vecdeque"]["label"].startswith("Mutex+VecDeque "))
+
+    def test_color_key_lays_out_families_as_rows_and_batch_sizes_as_columns(self):
+        ubq_scalar = "ubq_balanced,8,127,crossbeam"
+        ubq_batch8 = format_batched_ubq_label("balanced,8,127,crossbeam", 8)
+        ubq_batch32 = format_batched_ubq_label("balanced,8,127,crossbeam", 32)
+        mutex_batch8 = format_batched_plain_label("mutex-vecdeque", 8)
+        entries_by_scenario = {
+            "1p1c": {
+                ubq_scalar: stats(100),
+                ubq_batch8: stats(150),
+                ubq_batch32: stats(200),
+                "mutex-vecdeque": stats(10),
+                mutex_batch8: stats(20),
+            }
+        }
+
+        plt = FakePyplot()
+        families = combined_batch_comparison_families(entries_by_scenario)
+        styles = combined_batch_comparison_series_styles(plt, families, entries_by_scenario)
+        row_labels, col_keys, cell_colors, best_cells = combined_batch_comparison_color_key(
+            families, styles
+        )
+
+        self.assertEqual(["UBQ", "Mutex+VecDeque"], row_labels)
+        self.assertEqual(["scalar", 8, 32], col_keys)
+        # The best (highest-throughput) batch for UBQ is 32; mutex-vecdeque
+        # only has one batch size measured, so there's nothing to compare it
+        # against and it gets no star.
+        self.assertEqual({(0, 32)}, best_cells)
+        # No batch=32 measurement exists for mutex-vecdeque: that cell must
+        # be absent so the renderer falls back to its "n/a" blank fill,
+        # rather than silently reusing another cell's color.
+        self.assertNotIn((1, 32), cell_colors)
+
+    def test_color_key_scalar_column_is_uniform_across_families(self):
+        """All scalar entries share one fixed color regardless of family
+        (see batch_comparison_series_styles/plain_batch_comparison_series_
+        styles) — the color key's "scalar" column should show that
+        directly: every row's scalar cell is the same color."""
+        ubq_scalar = "ubq_balanced,8,127,crossbeam"
+        ubq_batched = format_batched_ubq_label("balanced,8,127,crossbeam", 8)
+        mutex_batched = format_batched_plain_label("mutex-vecdeque", 8)
+        entries_by_scenario = {
+            "1p1c": {
+                ubq_scalar: stats(100),
+                ubq_batched: stats(150),
+                "mutex-vecdeque": stats(10),
+                mutex_batched: stats(20),
+            }
+        }
+
+        plt = FakePyplot()
+        families = combined_batch_comparison_families(entries_by_scenario)
+        styles = combined_batch_comparison_series_styles(plt, families, entries_by_scenario)
+        row_labels, _col_keys, cell_colors, _best_cells = combined_batch_comparison_color_key(
+            families, styles
+        )
+
+        scalar_colors = {cell_colors[(idx, "scalar")] for idx in range(len(row_labels))}
+        self.assertEqual({"#111111"}, scalar_colors)
+
+
+class ColorKeyRenderingSmokeTest(unittest.TestCase):
+    def test_plot_scenario_lines_renders_a_color_key_without_crashing(self):
+        ubq_scalar = "ubq_balanced,8,127,crossbeam"
+        ubq_batched = format_batched_ubq_label("balanced,8,127,crossbeam", 8)
+        mutex_batched = format_batched_plain_label("mutex-vecdeque", 8)
+        entries_by_scenario = {
+            "1p1c": {
+                ubq_scalar: stats(100),
+                ubq_batched: stats(150),
+                "mutex-vecdeque": stats(10),
+                mutex_batched: stats(20),
+            },
+            "4p4c": {
+                ubq_scalar: stats(90),
+                ubq_batched: stats(160),
+                "mutex-vecdeque": stats(9),
+                mutex_batched: stats(22),
+            },
+        }
+        plt = FakePyplot()
+        families = combined_batch_comparison_families(entries_by_scenario)
+        labels = [label for _family, family_labels in families for label in family_labels]
+        styles = combined_batch_comparison_series_styles(plt, families, entries_by_scenario)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "batchcomp.png"
+            plot_scenario_lines(
+                plt,
+                out_path,
+                "local",
+                "throughput",
+                ["1p1c", "4p4c"],
+                labels,
+                entries_by_scenario,
+                "sem",
+                series_styles=styles,
+                color_key_families=families,
+            )
+
+        # FakeFigure.savefig is a no-op, so this just proves the whole
+        # render path (building the grid, drawing both axes) runs clean.
+        self.assertEqual(2, len(plt.last_axes))
 
 
 class PoolSizeEffectTest(unittest.TestCase):
@@ -1008,47 +1444,6 @@ class MetricExtractionTest(unittest.TestCase):
         }
         record.update(overrides)
         return record
-
-    def test_dubq_scalar_and_batched_load_as_distinct_series_with_coverage(self):
-        payload = {
-            "schema_version": 7,
-            "meta": {
-                "machine_label": "local",
-                "scenario": "1p1c",
-                "ubq_grid": "sparse",
-                "expected_ubq_configurations": 0,
-                "expected_dubq_configurations": 1,
-                "ubq_batch_sizes": [8],
-                "planned_repeats": 1,
-                "planned_items_per_producer": [10],
-            },
-            "results": [
-                self._record(queue="dubq", mode="throughput", dubq_label="2,31,crossbeam"),
-                self._record(
-                    queue="dubq",
-                    mode="throughput",
-                    dubq_label="2,31,crossbeam",
-                    batch_size=8,
-                    ops_per_sec=140.0,
-                ),
-            ],
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "dubq.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
-            rows = list(load_records(path))
-            coverage_rows = list(load_grid_coverage(path))
-
-        labels = {row[4] for row in rows}
-        self.assertEqual(
-            {
-                "dubq_2,31,crossbeam",
-                "dubq_batched_8_2,31,crossbeam",
-            },
-            labels,
-        )
-        self.assertEqual(2, len(coverage_rows))
-        self.assertTrue(all(row[4][0] == "dubq" for row in coverage_rows))
 
     def test_ubq_scalar_and_batched_load_as_distinct_series(self):
         payload = {
@@ -1197,6 +1592,84 @@ class MetricExtractionTest(unittest.TestCase):
         coverage = target[("local", "throughput", "1p1c")]
         self.assertEqual("interleaved", coverage["core_placement"])
         self.assertEqual({("current", None, 1, 10)}, coverage["present"])
+
+    def test_timed_out_and_failed_records_are_tracked_but_not_counted_present(self):
+        payload = {
+            "schema_version": 7,
+            "meta": {
+                "machine_label": "local",
+                "scenario": "1p1c",
+                "ubq_grid": "sparse",
+                "expected_ubq_configurations": 1,
+                "ubq_batch_sizes": [],
+                "planned_repeats": 3,
+                "planned_items_per_producer": [10],
+            },
+            "results": [
+                self._record(
+                    queue="ubq",
+                    mode="throughput",
+                    ubq_label="balanced,8,127,crossbeam",
+                    repeat_index=1,
+                    status="completed",
+                ),
+                self._record(
+                    queue="ubq",
+                    mode="throughput",
+                    ubq_label="balanced,8,127,crossbeam",
+                    repeat_index=2,
+                    status="timed_out",
+                    ops_per_sec=None,
+                ),
+                self._record(
+                    queue="ubq",
+                    mode="throughput",
+                    ubq_label="balanced,8,127,crossbeam",
+                    repeat_index=3,
+                    status="failed",
+                    ops_per_sec=None,
+                ),
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            coverage_rows = list(load_grid_coverage(path))
+
+        statuses_by_repeat = {row[4][3]: row[5] for row in coverage_rows}
+        self.assertEqual(
+            {1: "completed", 2: "timed_out", 3: "failed"}, statuses_by_repeat
+        )
+
+        target = {}
+        for machine, mode, scenario, specification, sample, status in coverage_rows:
+            merge_grid_coverage(target, machine, mode, scenario, specification, sample, status)
+        report = grid_coverage_report(target[("local", "throughput", "1p1c")], "throughput")
+
+        self.assertEqual(1, report["present"])
+        self.assertEqual(1, report["timed_out"])
+        self.assertEqual(1, report["failed"])
+        self.assertEqual(0, report["not_attempted"])
+        self.assertEqual(3, report["expected"])
+        self.assertFalse(report["complete"])
+
+    def test_completed_status_wins_over_timed_out_for_same_sample(self):
+        target = {}
+        base = {
+            "grid": "sparse",
+            "core_placement": "interleaved",
+            "expected_configurations": 1,
+            "planned_repeats": 1,
+            "batch_sizes": (),
+            "planned_items": (10,),
+        }
+        sample = ("ubq", "label", None, 1, 10)
+        merge_grid_coverage(target, "local", "throughput", "1p1c", base, sample, "timed_out")
+        merge_grid_coverage(target, "local", "throughput", "1p1c", base, sample, "completed")
+
+        coverage = target[("local", "throughput", "1p1c")]
+        self.assertEqual({sample}, coverage["present"])
+        self.assertEqual(set(), coverage["timed_out"])
 
     def test_grid_report_selects_best_scalar_and_best_batch(self):
         scalar_slow = "ubq_balanced,0,31,crossbeam"
@@ -1458,6 +1931,51 @@ class SchemaV7StatisticsTest(unittest.TestCase):
             {sample["mode"]: sample["value"] for sample in samples},
         )
         self.assertTrue(all(sample["repeat_index"] == 2 for sample in samples))
+
+    def test_load_record_samples_carries_available_parallelism(self):
+        payload = {
+            "schema_version": 7,
+            "meta": {"machine_label": "local", "scenario": "1p1c"},
+            "results": [{
+                "repeat_index": 1,
+                "queue": "segqueue",
+                "mode": "throughput",
+                "ops_per_sec": 10.0,
+                "protocol": {
+                    "core_placement": "interleaved",
+                    "affinity_authoritative": True,
+                    "available_parallelism": 112,
+                },
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            samples = list(load_record_samples(path))
+        self.assertTrue(samples)
+        self.assertTrue(all(sample["available_parallelism"] == 112 for sample in samples))
+
+    def test_load_record_samples_tolerates_missing_available_parallelism(self):
+        payload = {
+            "schema_version": 7,
+            "meta": {"machine_label": "local", "scenario": "1p1c"},
+            "results": [{
+                "repeat_index": 1,
+                "queue": "segqueue",
+                "mode": "throughput",
+                "ops_per_sec": 10.0,
+                "protocol": {
+                    "core_placement": "interleaved",
+                    "affinity_authoritative": True,
+                },
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            samples = list(load_record_samples(path))
+        self.assertTrue(samples)
+        self.assertTrue(all(sample["available_parallelism"] is None for sample in samples))
 
     def test_duplicate_reruns_prefer_newest_completed_sample(self):
         base = {
