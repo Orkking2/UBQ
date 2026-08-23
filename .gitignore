@@ -1,5 +1,6 @@
 /target
 /bench_results*
+/performix_results/
 .*/
 __pycache__/
 *.pyc

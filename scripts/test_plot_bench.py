@@ -31,6 +31,7 @@ from scripts.plot_bench import (
     load_grid_coverage,
     load_record_samples,
     load_records,
+    lubq_throughput_speedup_rows,
     merge_grid_coverage,
     machine_display_label,
     machine_family_entries,
@@ -62,6 +63,7 @@ from scripts.plot_bench import (
     throughput_speedup_rows,
     format_batched_plain_label,
     write_immediate_variant_csv,
+    write_lubq_throughput_speedup_csv,
     write_machine_line_csv,
     write_pool_size_effect_csv,
 )
@@ -221,6 +223,28 @@ class DisplayLabelTest(unittest.TestCase):
         self.assertEqual(
             "UBQb (64) 4,255,Yield",
             display_label(label),
+        )
+
+    def test_legacy_large_block_labels_share_the_ordinary_ubq_family(self):
+        self.assertEqual(
+            "UBQ",
+            queue_metadata("ubq_balanced,1,65535,crossbeam")["family"],
+        )
+        self.assertEqual(
+            "UBQ",
+            queue_metadata("ubq_balanced,1,4095,crossbeam")["family"],
+        )
+        self.assertEqual(
+            "UBQ batched",
+            queue_metadata(format_batched_ubq_label("balanced,1,65535,crossbeam", 8192))["family"],
+        )
+        self.assertEqual(
+            "UBQ 1,65535,Cycle",
+            display_label("ubq_balanced,1,65535,crossbeam"),
+        )
+        self.assertEqual(
+            "UBQ 1,page,Cycle",
+            display_label("ubq_balanced,1,page,crossbeam"),
         )
 
     def test_batched_segqueue_label_is_distinct_from_scalar(self):
@@ -1067,11 +1091,90 @@ class ThroughputSpeedupGridTest(unittest.TestCase):
         self.assertEqual(50.0, by_comparison["scalar_naive-faa-queue"]["speedup"])
         self.assertEqual(4.0, by_comparison["scalar_moodycamel-cq"]["speedup"])
 
+    def test_lubq_gets_its_own_scalar_and_native_batch_baseline_suite(self):
+        lubq_batched = format_batched_plain_label("lubq", 64)
+        segqueue_batched = format_batched_segqueue_label(16)
+        mutex_batched = format_batched_plain_label("mutex-vecdeque", 32)
+        moodycamel_batched = format_batched_plain_label("moodycamel-cq", 8)
+        rows = lubq_throughput_speedup_rows(
+            {
+                "1p1c": {
+                    "lubq": stats(120),
+                    lubq_batched: stats(240),
+                    "segqueue": stats(60),
+                    segqueue_batched: stats(80),
+                    "concurrent-queue": stats(40),
+                    "fastfifo_256": stats(30),
+                    "lfqueue_32": stats(24),
+                    "wcq_65536": stats(20),
+                    "mutex-vecdeque": stats(12),
+                    mutex_batched: stats(30),
+                    "ms-queue": stats(15),
+                    "naive-faa-queue": stats(10),
+                    "moodycamel-cq": stats(48),
+                    moodycamel_batched: stats(60),
+                    # UBQ is the subject of its own comparison suite, not an
+                    # external baseline in LUBQ's dedicated view.
+                    "ubq_balanced,1,511,crossbeam": stats(500),
+                }
+            }
+        )
+        by_comparison = {row["comparison"]: row for row in rows}
+
+        self.assertEqual(
+            {
+                "scalar_segqueue",
+                "scalar_concurrent-queue",
+                "scalar_bbq",
+                "scalar_lscq",
+                "scalar_wcq",
+                "scalar_mutex-vecdeque",
+                "scalar_ms-queue",
+                "scalar_naive-faa-queue",
+                "scalar_moodycamel-cq",
+                "batched_segqueue",
+                "batched_mutex-vecdeque",
+                "batched_moodycamel-cq",
+            },
+            set(by_comparison),
+        )
+        self.assertEqual(3.0, by_comparison["scalar_concurrent-queue"]["speedup"])
+        self.assertEqual(240 / 80, by_comparison["batched_segqueue"]["speedup"])
+        self.assertEqual(
+            lubq_batched,
+            by_comparison["batched_moodycamel-cq"]["lubq_queue"],
+        )
+        self.assertEqual(
+            "best batched LUBQ vs best batched moodycamel::CQ",
+            by_comparison["batched_moodycamel-cq"]["comparison_label"],
+        )
+
+    def test_lubq_speedup_csv_has_lubq_specific_columns(self):
+        rows = lubq_throughput_speedup_rows(
+            {"1p1c": {"lubq": stats(90), "segqueue": stats(30)}}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / "lubq.csv"
+            write_lubq_throughput_speedup_csv(out_path, rows)
+            with out_path.open(encoding="utf-8", newline="") as f:
+                written = list(csv.DictReader(f))
+
+        self.assertEqual("scalar", written[0]["lubq_kind"])
+        self.assertEqual("lubq", written[0]["lubq_queue"])
+        self.assertNotIn("ubq_kind", written[0])
+
 
 class PlainBatchNativeQueueTest(unittest.TestCase):
     """Covers the generic 'plain batch-native queue' path (no internal
-    variant params, unlike UBQ) that segqueue, mutex-vecdeque, and
+    variant params, unlike UBQ) that LUBQ, segqueue, mutex-vecdeque, and
     moodycamel-cq all share — see format_batched_plain_label."""
+
+    def test_lubq_scalar_and_batch_metadata(self):
+        batch_label = format_batched_plain_label("lubq", 256)
+        self.assertEqual("LUBQ", display_label("lubq"))
+        self.assertEqual("LUBQb (256)", display_label(batch_label))
+        self.assertEqual("LUBQ", queue_metadata("lubq")["family"])
+        self.assertEqual("LUBQ batched", queue_metadata(batch_label)["family"])
 
     def test_plain_label_round_trips_and_rejects_ubq_shaped_labels(self):
         label = format_batched_plain_label("mutex-vecdeque", 32)
@@ -1289,6 +1392,53 @@ class CombinedBatchComparisonTest(unittest.TestCase):
         # rather than silently reusing another cell's color.
         self.assertNotIn((1, 32), cell_colors)
 
+    def test_combined_families_do_not_split_legacy_large_block_labels(self):
+        ubq_scalar = "ubq_balanced,8,127,crossbeam"
+        ubq_batched = format_batched_ubq_label("balanced,8,127,crossbeam", 32)
+        legacy_scalar = "ubq_balanced,1,65535,crossbeam"
+        legacy_batched = format_batched_ubq_label("balanced,1,65535,crossbeam", 8192)
+        entries_by_scenario = {
+            "1p1c": {
+                ubq_scalar: stats(100),
+                ubq_batched: stats(200),
+                legacy_scalar: stats(90),
+                legacy_batched: stats(150),
+            }
+        }
+
+        families = combined_batch_comparison_families(entries_by_scenario)
+        family_keys = [key for key, _labels in families]
+
+        self.assertEqual(["UBQ"], family_keys)
+        self.assertNotIn("UBQ (huge-heap)", dict(families))
+
+    def test_legacy_large_block_labels_use_normal_ubq_batch_cells(self):
+        legacy_scalar = "ubq_balanced,1,65535,crossbeam"
+        legacy_batch8192 = format_batched_ubq_label("balanced,1,65535,crossbeam", 8192)
+        legacy_batch65536 = format_batched_ubq_label("balanced,1,65535,crossbeam", 65536)
+        entries_by_scenario = {
+            "1p1c": {
+                legacy_scalar: stats(90),
+                legacy_batch8192: stats(150),
+                legacy_batch65536: stats(200),
+            }
+        }
+
+        plt = FakePyplot()
+        families = combined_batch_comparison_families(entries_by_scenario)
+        styles = combined_batch_comparison_series_styles(plt, families, entries_by_scenario)
+        row_labels, col_keys, cell_colors, best_cells = combined_batch_comparison_color_key(
+            families, styles
+        )
+
+        self.assertEqual(["UBQ"], row_labels)
+        self.assertEqual(["scalar", 8192, 65536], col_keys)
+        # Before the fix, both batch sizes collapsed into (0, "scalar") and
+        # neither (0, 8192) nor (0, 65536) was ever set.
+        self.assertIn((0, 8192), cell_colors)
+        self.assertIn((0, 65536), cell_colors)
+        self.assertEqual({(0, 65536)}, best_cells)
+
     def test_color_key_scalar_column_is_uniform_across_families(self):
         """All scalar entries share one fixed color regardless of family
         (see batch_comparison_series_styles/plain_batch_comparison_series_
@@ -1451,8 +1601,8 @@ class MetricExtractionTest(unittest.TestCase):
             "meta": {
                 "machine_label": "local",
                 "scenario": "1p1c",
-                "ubq_grid": "sparse",
-                "expected_ubq_configurations": 40,
+                "ubq_grid": "page",
+                "expected_ubq_configurations": 2,
                 "ubq_batch_sizes": [2, 4],
                 "planned_repeats": 1,
                 "planned_items_per_producer": [10],

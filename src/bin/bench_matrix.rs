@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use ubq::bench_harness::{
     DEFAULT_RUNS_DIR, DEFAULT_SCHEDULE_SEED, DEFAULT_THROUGHPUT_MAX_ROUND_ITEMS,
     DEFAULT_THROUGHPUT_PHASE_MS, DEFAULT_THROUGHPUT_PILOT_MS, DEFAULT_THROUGHPUT_WARMUP_MS,
-    MatrixPlan, ThroughputPolicy, build_direct_matrix_plan, detect_available_parallelism,
-    maybe_run_bench_worker, parse_core_ids, parse_fastfifo_block_sizes, parse_fastfifo_capacities,
-    parse_items_per_producer, parse_lfqueue_segment_sizes, parse_modes, parse_queue_kinds,
-    parse_scenarios_with_parallelism, parse_schedule_seed, parse_wcq_capacities,
-    run_matrix_plan_in_process,
+    MatrixPlan, ThroughputPolicy, build_direct_matrix_plan_with_batch_sizes,
+    detect_available_parallelism, maybe_run_bench_worker, parse_core_ids,
+    parse_fastfifo_block_sizes, parse_fastfifo_capacities, parse_items_per_producer,
+    parse_lfqueue_segment_sizes, parse_modes, parse_queue_kinds, parse_scenarios_with_parallelism,
+    parse_schedule_seed, parse_wcq_capacities, run_matrix_plan_in_process,
 };
 
 #[derive(Parser, Debug)]
@@ -45,6 +45,11 @@ struct Args {
 
     #[arg(long = "ubq-label")]
     ubq_labels: Vec<String>,
+
+    /// Comma-separated UBQ batch sizes to sweep, in addition to the
+    /// scalar-compatible run; omitted runs scalar-only.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    batch_sizes: Vec<usize>,
 
     #[arg(long, visible_alias = "rbbq-block-sizes")]
     fastfifo_block_sizes: Option<String>,
@@ -116,7 +121,7 @@ fn main() {
                 let selected_queues = parse_queue_kinds(
                     args.queues
                         .as_deref()
-                        .unwrap_or("ubq,segqueue,concurrent-queue"),
+                        .unwrap_or("ubq,lubq,segqueue,concurrent-queue"),
                 )?;
                 let requested_core_ids =
                     args.core_ids.as_deref().map(parse_core_ids).transpose()?;
@@ -153,12 +158,13 @@ fn main() {
                         ok
                     })
                     .collect();
-                let mut plan = build_direct_matrix_plan(
+                let mut plan = build_direct_matrix_plan_with_batch_sizes(
                     machine_label,
                     args.runs_dir.clone(),
                     available_parallelism,
                     &selected_queues,
                     &args.ubq_labels,
+                    &args.batch_sizes,
                     &fastfifo_block_sizes,
                     &lfqueue_segment_sizes,
                     &wcq_capacities,

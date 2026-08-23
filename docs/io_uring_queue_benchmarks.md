@@ -66,7 +66,7 @@ scripts/run_io_uring_queue_bench.sh \
   --requests 1000000 \
   --repeats 10 \
   --bbq-block-size 64 \
-  --ubq-label balanced,1,2047,crossbeam
+  --ubq-label balanced,1,page,crossbeam
 ```
 
 `summary.csv` reports median submit/end-to-end latency per request, median

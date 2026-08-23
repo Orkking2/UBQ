@@ -4,8 +4,8 @@
 [![Docs.rs](https://docs.rs/ubq/badge.svg)](https://docs.rs/ubq)
 
 UBQ is a **lock-free, unbounded, multi-producer/multi-consumer (MPMC) queue**
-built from a linked ring of fixed-size blocks, intended for concurrent producers
-and consumers.
+built from linked, page-sized blocks, intended for concurrent producers and
+consumers.
 
 ## Features
 
@@ -70,8 +70,8 @@ See the full API reference on [docs.rs](https://docs.rs/ubq).
 
 ### `no_std + alloc`
 
-UBQ supports `no_std` targets that provide heap allocation and native 8-bit
-and pointer-width atomics:
+UBQ supports `no_std + alloc` on Unix, Windows, and WebAssembly targets that
+provide native 8-bit and pointer-width atomics:
 
 ```toml
 [dependencies]
@@ -79,19 +79,34 @@ ubq = { version = "5", default-features = false }
 ```
 
 The final application must install a global allocator. UBQ remains unbounded,
-so a push may allocate a new aligned block; applications with a fixed memory
-budget must enforce their own queue-depth limit. In `no_std` builds the built-in
-backoff policies spin instead of yielding to an operating-system scheduler.
+so a push may allocate a new base-page-sized, base-page-aligned block;
+applications with a fixed memory budget must enforce their own queue-depth
+limit. In `no_std` builds the built-in backoff policies spin instead of yielding
+to an operating-system scheduler.
 
 ## How it works
 
-TODO
+UBQ and LUBQ share one internal page-block substrate: every allocation is
+exactly one operating-system base page and carries the same intrusive successor
+link. Their synchronization remains specialized. UBQ fills the trailing area
+with stateful MPMC `Slot<T>` cells; each LUBQ shard fills it with plain `T`
+payload cells and publishes contiguous prefixes through block-level counters.
+This keeps allocation geometry and pointer tagging homogeneous without adding
+per-item atomic state to the SPMC path.
+
+The const UBQ block parameter is an upper bound on slots used in one page. If
+that many `Slot<T>` cells do not fit, UBQ uses the page's maximum capacity.
+[`UBQ::block_length`](https://docs.rs/ubq/latest/ubq/struct.UBQ.html#method.block_length)
+reports the effective value. Element types whose slot cannot fit in one base
+page, or whose alignment exceeds the base-page alignment, are rejected when
+the queue is constructed.
 
 ## Benchmarks
 
-This repo includes a benchmark harness that compares static UBQ against
-established MPMC queue implementations (`segqueue`, `concurrent-queue`, and optional
-RBBQ/BBQ, `lfqueue`/LSCQ, and wCQ variants). Unless `--scenarios` is supplied,
+This repo includes a benchmark harness that compares static UBQ and linked-shard
+LUBQ against established MPMC queue implementations (`segqueue`,
+`concurrent-queue`, and optional RBBQ/BBQ, `lfqueue`/LSCQ, and wCQ variants).
+Unless `--scenarios` is supplied,
 each machine benchmarks the complete power-of-two producer/consumer grid:
 `2^n p 2^m c` for every `n,m >= 0` whose producer and consumer thread sum does
 not exceed detected available parallelism. For example, a 16-thread machine
@@ -106,31 +121,31 @@ The schema-v7 comparative harness has two front ends:
 - `bench_matrix`: direct matrix execution. It dispatches through the
   precompiled benchmark registry and writes schema-v7 JSON files under
   `bench_results/runs`.
-- `bench_grid`: reproducible UBQ grid execution. Its default sparse grid is
-  `block=[31,127,511,2047,4095]` × both backoffs (10 static-UBQ configurations).
-  `-d` selects all 8 block values × both backoffs (16 static-UBQ configurations).
-  Configurations whose block is smaller than a scenario's producer count are
-  excluded before jobs are counted. Sparse and dense select configuration
-  coverage only; both run the same scenario grid.
+- `bench_grid`: reproducible UBQ execution across both backoff policies. UBQ
+  always uses the number of `Slot<T>` values that fit in one system base page;
+  block size is no longer a benchmark dimension.
 
-For throughput, every selected UBQ configuration measures a
+For throughput, each UBQ backoff policy and LUBQ measures a
 scalar-compatible operation and batch-shaped operations at sizes `8,32,256`.
-Static UBQ uses its native `push_batch` and `pop_batch` APIs. When
-`segqueue` is selected, its normal
+Static UBQ uses its native `push_batch` and `pop_batch` APIs; LUBQ uses
+`Sender::send_batch` and native per-shard `Receiver::try_recv_batch_into`
+claims with a reusable caller-owned `Vec`, one persistent private sender shard
+per producer, and one cursor per consumer. LUBQ retains its stable shard list
+until final root teardown and reuses inactive empty shards across sender churn.
+When `segqueue` is selected, its normal
 `SegQueue::push`/`pop` run remains scalar and the same batch-size grid is run
 through the fork's separate `BatchQueue::push`/`pop` API. `--batch-sizes`
 replaces that shared batch-size list while retaining scalar measurements.
-Thus the static-UBQ default grid
-has 160 sparse or 512 dense UBQ throughput jobs per unconstrained scenario and
-repeat. Scalar baselines are measured once rather than once per UBQ
-configuration, while the Crossbeam batch queue is measured once per requested
-batch size. Other benchmark modes remain scalar.
+Thus the default three batch sizes produce eight UBQ throughput jobs per
+scenario and repeat: scalar plus three batched runs for each backoff. Scalar
+baselines are measured once, while the Crossbeam batch queue is measured once
+per requested batch size. Other benchmark modes remain scalar.
 
 For workload-specific modes, when `--items-per-producer` is omitted,
 `bench_grid` uses the versioned
 `scenario_scaled_v1` workload: 1–8 producers get 1,000,000 items each, 9–16
 get 250,000, 17–32 get 62,500, and larger producer counts get 15,625. Every
-queue, UBQ configuration, batch size, mode, and repeat in a scenario receives
+queue, UBQ backoff, batch size, mode, and repeat in a scenario receives
 the same resolved count. Supplying one or more `--items-per-producer` values
 selects the `explicit` policy and runs every supplied value in every scenario.
 The selected policy and scenario mapping are printed before execution and
@@ -183,7 +198,8 @@ sizes the array from the manifest itself (`manifests/mn5-112.txt` /
 no `%K` concurrency throttle and no node-count cap: every scenario in the
 manifest gets a task regardless of how many run concurrently, and Slurm's own
 partition/QOS/fairshare limits decide actual concurrency.
-`slurm/submit_build.sh {mn5|grace}` builds the `bench_grid` binary first;
+`slurm/submit_build.sh {mn5|grace}` builds `bench_grid` plus the symbolized
+`bench_profile` foreground profiler workload;
 chain the two with `--after`:
 
 ```bash
@@ -191,12 +207,45 @@ build_id=$(slurm/submit_build.sh mn5)
 slurm/submit_bench_grid.sh mn5 mn5-1 --after "$build_id"
 ```
 
+The comparative array explicitly runs both scalar and every requested native
+batch size for LUBQ alongside UBQ, SegQueue, concurrent-queue, BBQ, LSCQ, wCQ,
+Mutex+VecDeque, MS-Queue, and moodycamel::CQ. Each task records that exact
+queue set in its scenario's `slurm-info.txt` provenance file.
+
 `<machine-label>` is a required, explicit choice, not a default — per the
 reuse rule above, bump it for a fresh sweep or hold it steady to greedily
 resume/extend a batch. Both scripts default `ACCOUNT=bsc18` and
 `UBQ=/gpfs/projects/$ACCOUNT/$USER/UBQ` (the repo's deployed location on the
 cluster), overridable via env; run `--help` on either for the full option
 list.
+
+### Arm Performix on Grace
+
+`slurm/submit_performix.sh` profiles one exact `ubq`, `lubq`, or `segqueue`
+handoff case on an exclusive Grace node and exports the portable Performix run.
+For example, this submits the motivating `1p1c`, batch-256 SegQueue case:
+
+```bash
+build_id=$(slurm/submit_build.sh grace)
+slurm/submit_performix.sh grace segqueue 1p1c \
+  --batch-size 256 --after "$build_id"
+```
+
+Use the same scenario/batch for LUBQ and UBQ to compare their hotspots:
+
+```bash
+slurm/submit_performix.sh grace lubq 1p1c --batch-size 256 --after "$build_id"
+slurm/submit_performix.sh grace ubq 1p1c --batch-size 256 \
+  --ubq-label balanced,1,page,crossbeam --after "$build_id"
+```
+
+The default recipe is `code_hotspots`; `--recipe cpu_microarchitecture` and
+`--recipe instruction_mix` select the other unprivileged optimization views.
+Results are written below `performix_results/grace/<case>/<job-id>/`, including
+the run ID, readiness/run logs, provenance, and exported archive. The wrapper
+deliberately rejects MN5 because `arm_performix/2026.3.1` is not known to be
+available on `mn5gpp`. See [docs/performix.md](docs/performix.md) for the full
+workflow and interpretation order.
 
 ### Personal machines
 
@@ -228,14 +277,15 @@ dequeue without credits or producer throttling. It therefore measures latency
 under an unbounded saturated workload; backlog and item count can affect the
 average, so compare subjects using the same scenario and resolved workload.
 
-UBQ labels are 4-part identifiers:
+UBQ labels remain four-part identifiers for result compatibility:
 
-- `preset,pool,block,backoff`
-- Example: `balanced,1,127,crossbeam`
+- `preset,pool,page,backoff`
+- Example: `balanced,1,page,crossbeam`
 
-The pool field is retained for result-format compatibility and must be `1`.
-Static UBQ now manages its single recycle slot internally; block size and
-backoff are its configurable benchmark dimensions.
+The pool field is retained for result-format compatibility and must be `1`;
+`page` records that block capacity is derived from the host base page and value
+type. Numeric block labels from older plans are accepted and normalized to
+`page`. Backoff is the only remaining static UBQ benchmark dimension.
 
 Publication-backed baseline labels are emitted with their sizing knob:
 
@@ -263,7 +313,7 @@ Run an explicit direct matrix:
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_matrix -- \
   --machine-label local \
   --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
-  --ubq-label balanced,1,127,crossbeam \
+  --ubq-label balanced,1,page,crossbeam \
   --rbbq-block-sizes 64,256,1024,4096 \
   --lfqueue-segment-sizes 32,256,1024 \
   --wcq-capacities 4096,65536,1048576 \
@@ -298,14 +348,14 @@ Run the application-level suite:
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue --bin bench_matrix -- \
   --machine-label local \
   --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue \
-  --ubq-label balanced,1,127,crossbeam \
+  --ubq-label balanced,1,page,crossbeam \
   --scenarios 1p1c,4p1c,1p4c,4p4c,8p8c,16p16c \
   --modes app_log_fan_in,app_pipeline,app_task_roundtrip \
   --items-per-producer 100000 \
   --repeats 3
 ```
 
-Run the sparse grid on one machine:
+Run the benchmark grid on one machine:
 
 ```bash
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_grid -- \
@@ -317,10 +367,9 @@ cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq
   --wcq-capacities 4096,65536,1048576
 ```
 
-Add `-d` for the dense grid or `--rerun` to benchmark every job without using
-compatible existing results. Batch sizes must be integers of at least 2;
-duplicates are removed. The scalar-compatible variant is always included.
-The sparse and dense static-UBQ grids vary block size and backoff.
+Add `--rerun` to benchmark every job without using compatible existing
+results. Batch sizes must be integers of at least 2; duplicates are removed.
+The scalar-compatible variant is always included.
 
 To benchmark only scalar SegQueue and the forked BatchQueue—without scheduling
 any UBQ configurations—select `segqueue` by itself:
@@ -452,6 +501,12 @@ shades group batches below the selected winner, warm shades group larger
 batches, the winning batch uses a green star, the best scalar is black, and a
 distinct scalar counterpart is dashed gray.
 
+LUBQ also gets dedicated speedup grids rather than appearing only as one line
+in the general queue-family plots. The scalar grid compares scalar LUBQ with
+each available external baseline; the batched grid compares the best measured
+LUBQ batch size only with baselines that have native batch measurements. This
+keeps architectural gains separate from the gain due merely to batching.
+
 Set up a minimal plotting environment:
 
 ```bash
@@ -494,6 +549,10 @@ Outputs are grouped by `meta.machine_label` and mode, e.g.:
 - `bench_results/plots/hebrides/csv/throughput/pool_size_matched_throughput.csv`
 - `bench_results/plots/hebrides/csv/throughput/pool_size_effect_throughput.csv`
 - `bench_results/plots/hebrides/throughput/pool_size_effect_throughput.png`
+- `bench_results/plots/hebrides/throughput/lubq_speedup_grid_throughput_scalar.png`
+- `bench_results/plots/hebrides/throughput/lubq_speedup_grid_throughput_batched.png`
+- `bench_results/plots/hebrides/csv/throughput/lubq_speedup_grid_throughput_scalar.csv`
+- `bench_results/plots/hebrides/csv/throughput/lubq_speedup_grid_throughput_batched.csv`
 - `bench_results/plots/grace/throughput/mpsc_line_throughput.png`
 - `bench_results/plots/grace/throughput/mpsc_line_throughput_batchcomp.png`
 - `bench_results/plots/grace/throughput/spmc_line_throughput_batchcomp.png`

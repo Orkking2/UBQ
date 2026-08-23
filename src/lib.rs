@@ -67,7 +67,11 @@ extern crate alloc;
 extern crate std;
 
 mod head;
+mod page;
 mod slot;
+
+#[cfg(any(unix, windows, target_family = "wasm"))]
+pub mod kfifo;
 
 pub mod backoff;
 #[cfg(feature = "bench_tools")]
@@ -83,7 +87,6 @@ compile_error!("ubq requires native 8-bit and pointer-width atomic operations");
 #[cfg(test)]
 mod tests;
 
-pub use block::DEFAULT_BLOCK_SIZE;
 pub use queue::UBQ;
 
 /*

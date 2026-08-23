@@ -12,6 +12,7 @@ from pathlib import Path
 try:
     from scripts.ubq_labels import (
         UBQ_IMMEDIATE_DIMS,
+        UBQ_PAGE_BLOCK_VALUE,
         bench_label_sort_key,
         format_ubq_label_parts,
         is_valid_ubq_params,
@@ -20,6 +21,7 @@ try:
 except ImportError:
     from ubq_labels import (  # type: ignore
         UBQ_IMMEDIATE_DIMS,
+        UBQ_PAGE_BLOCK_VALUE,
         bench_label_sort_key,
         format_ubq_label_parts,
         is_valid_ubq_params,
@@ -34,7 +36,8 @@ LEGACY_SCENARIO_MAP = {
 }
 BASELINE_QUEUE_PRIORITY = {
     "segqueue": 0,
-    "concurrent-queue": 1,
+    "lubq": 1,
+    "concurrent-queue": 2,
 }
 LINE_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "*")
 def _is_batched_plain_queue(label: str, queue: str) -> bool:
@@ -45,11 +48,17 @@ def _is_batched_plain_queue(label: str, queue: str) -> bool:
 # Each entry is (key, display title, scalar predicate, batched predicate).
 # The batched predicate is None for baselines this harness never runs in
 # batched form (BBQ/LSCQ/MS-Queue/Naive FAA are single-shot; only the "plain
-# batch-native" queues — SegQueue, Mutex+VecDeque, moodycamel::CQ — get swept
+# batch-native" queues — LUBQ, SegQueue, Mutex+VecDeque, moodycamel::CQ — get swept
 # across batch sizes, see required_job_specs). A batched-UBQ heatmap panel is
 # only produced for baselines with a real batched measurement to compare
 # against, so batched UBQ is never silently compared to a scalar baseline.
 THROUGHPUT_SPEEDUP_BASELINES = (
+    (
+        "lubq",
+        "LUBQ",
+        lambda label: label == "lubq",
+        lambda label: _is_batched_plain_queue(label, "lubq"),
+    ),
     (
         "segqueue",
         "SegQueue",
@@ -93,8 +102,72 @@ THROUGHPUT_SPEEDUP_BASELINES = (
         lambda label: _is_batched_plain_queue(label, "moodycamel-cq"),
     ),
 )
+
+# LUBQ is a queue architecture in its own right, not a UBQ tuning variant.
+# Give it a separate comparison suite against every external baseline the
+# harness knows how to identify. As above, batched panels are emitted only
+# where the baseline has a native batch measurement; scalar fallbacks would
+# mix batching gains into the architectural comparison.
+LUBQ_THROUGHPUT_SPEEDUP_BASELINES = (
+    (
+        "segqueue",
+        "SegQueue",
+        lambda label: label == "segqueue",
+        lambda label: parse_batched_segqueue_label(label) is not None,
+    ),
+    (
+        "concurrent-queue",
+        "concurrent-queue",
+        lambda label: label == "concurrent-queue",
+        None,
+    ),
+    (
+        "bbq",
+        "best BBQ",
+        lambda label: queue_metadata(label)["family"] == "RBBQ/BBQ",
+        None,
+    ),
+    (
+        "lscq",
+        "best LSCQ",
+        lambda label: queue_metadata(label)["family"] == "LSCQ",
+        None,
+    ),
+    (
+        "wcq",
+        "best wCQ",
+        lambda label: queue_metadata(label)["family"] == "wCQ",
+        None,
+    ),
+    (
+        "mutex-vecdeque",
+        "Mutex+VecDeque",
+        lambda label: label == "mutex-vecdeque",
+        lambda label: _is_batched_plain_queue(label, "mutex-vecdeque"),
+    ),
+    (
+        "ms-queue",
+        "MS-Queue",
+        lambda label: label == "ms-queue",
+        None,
+    ),
+    (
+        "naive-faa-queue",
+        "Naive FAA",
+        lambda label: label == "naive-faa-queue",
+        None,
+    ),
+    (
+        "moodycamel-cq",
+        "moodycamel::CQ",
+        lambda label: label == "moodycamel-cq",
+        lambda label: _is_batched_plain_queue(label, "moodycamel-cq"),
+    ),
+)
 UBQ_BATCHED_PREFIX = "ubq_batched_"
 PUBLICATION_SERIES = (
+    ("LUBQ", lambda label: label == "lubq"),
+    ("LUBQ batched", lambda label: _is_batched_plain_queue(label, "lubq")),
     ("segqueue", lambda label: label == "segqueue"),
     ("SegQueue batched", lambda label: parse_batched_segqueue_label(label) is not None),
     ("concurrent-queue", lambda label: label == "concurrent-queue"),
@@ -105,6 +178,7 @@ PUBLICATION_SERIES = (
     ("UBQ batched", lambda label: queue_metadata(label)["family"] == "UBQ batched"),
 )
 FAMILY_DISPLAY_LABELS = {
+    "LUBQ batched": "LUBQb",
     "RBBQ/BBQ": "BBQ",
     "crossbeam SegQueue batched": "SegQueueb",
     "UBQ batched": "UBQb",
@@ -116,21 +190,24 @@ QUEUE_FAMILY_PRIORITY = {
     "RBBQ/BBQ": 3,
     "LSCQ": 4,
     "wCQ": 5,
+    "LUBQ": 6,
+    "LUBQ batched": 7,
+    "UBQ": 8,
+    "UBQ batched": 9,
     "mutex-vecdeque": 10,
     "mutex-vecdeque batched": 11,
     "ms-queue": 12,
     "naive-faa-queue": 13,
     "moodycamel-cq": 14,
     "moodycamel-cq batched": 15,
-    "UBQ": 6,
-    "UBQ batched": 7,
 }
-# "Plain" batch-native queues: no internal variant params like UBQ has
-# (pool/block/backoff), just a queue name and optionally a batch size. Covers
+# "Plain" batch-native queues: no historical UBQ-style variant parameters,
+# just a queue name and optionally a batch size. Covers
 # every Phase 1+/2+/3+ baseline added via src/bench_harness/baselines/ plus
 # segqueue itself. New plain batch-native queues need no plotting-side
 # changes beyond an optional display-name entry here.
 PLAIN_QUEUE_DISPLAY_NAMES = {
+    "lubq": "LUBQ",
     "segqueue": "SegQueue",
     "mutex-vecdeque": "Mutex+VecDeque",
     "ms-queue": "MS-Queue",
@@ -144,6 +221,12 @@ def plain_queue_display_name(queue: str) -> str:
 
 
 PLAIN_QUEUE_METADATA = {
+    "lubq": {
+        "family": "LUBQ",
+        "publication": "this repository (linked per-producer UBQ shards)",
+        "capacity_model": "unbounded",
+        "ordering": "per-producer FIFO; round-robin shard consumption",
+    },
     "mutex-vecdeque": {
         "family": "mutex-vecdeque",
         "publication": "naive floor baseline (Mutex<VecDeque>)",
@@ -498,7 +581,7 @@ def label_sort_key(label: str):
         except ValueError:
             capacity = 2**31
         return (1, 4, capacity, label)
-    order = {"segqueue": 0, "concurrent-queue": 2}
+    order = {"segqueue": 0, "lubq": 1, "concurrent-queue": 2}
     return (1, order.get(label, 99), 0, label)
 
 
@@ -523,6 +606,7 @@ def backoff_display_name(backoff: str) -> str:
 
 def format_ubq_display_params(params) -> str:
     _version, pool, block, backoff = params[:4]
+    block = "page" if int(block) == UBQ_PAGE_BLOCK_VALUE else block
     return f"{pool},{block},{backoff_display_name(backoff)}"
 
 
@@ -596,12 +680,18 @@ def publication_display_label(label: str):
     return display_label(label)
 
 
+def ubq_family_for_params(params, *, batched: bool) -> str:
+    suffix = " batched" if batched else ""
+    return f"UBQ{suffix}"
+
+
 def queue_metadata(label: str):
     batched = parse_batched_ubq_label(label)
     if batched is not None:
         batch_size, params = batched
+        family = ubq_family_for_params(params, batched=True)
         return {
-            "family": "UBQ batched",
+            "family": family,
             "variant": f"({batch_size}) {format_ubq_display_params(params)}",
             "publication": "this repository",
             "capacity_model": "unbounded",
@@ -609,8 +699,9 @@ def queue_metadata(label: str):
         }
     if label.startswith("ubq_"):
         params = parse_ubq_variant(label)
+        family = ubq_family_for_params(params, batched=False)
         return {
-            "family": "UBQ",
+            "family": family,
             "variant": (
                 format_ubq_display_params(params)
                 if params is not None
@@ -677,7 +768,7 @@ def queue_metadata(label: str):
         queue, batch_size = plain_batched
         base = PLAIN_QUEUE_METADATA.get(queue, {})
         return {
-            "family": f"{queue} batched",
+            "family": f"{base.get('family', queue)} batched",
             "variant": f"({batch_size})",
             "publication": base.get("publication", ""),
             "capacity_model": base.get("capacity_model", ""),
@@ -736,6 +827,17 @@ def best_batched_ubq_throughput_entry(entries, scenario):
         return parsed is not None and ubq_params_valid_for_scenario(parsed[1], scenario)
 
     return best_throughput_entry(entries, is_valid_batched_ubq)
+
+
+def best_lubq_throughput_entry(entries, _scenario=None):
+    return best_throughput_entry(entries, lambda label: label == "lubq")
+
+
+def best_batched_lubq_throughput_entry(entries, _scenario=None):
+    return best_throughput_entry(
+        entries,
+        lambda label: _is_batched_plain_queue(label, "lubq"),
+    )
 
 
 def labels_by_ops_desc(entries):
@@ -1342,7 +1444,7 @@ def load_grid_coverage(path: Path):
         return
     meta = data.get("meta", {})
     grid = str(meta.get("ubq_grid", "")).strip().lower()
-    if grid not in ("sparse", "dense"):
+    if grid not in ("page", "sparse", "dense"):
         return
     try:
         expected_configs = int(meta.get("expected_ubq_configurations") or 0)
@@ -1813,10 +1915,17 @@ def scenario_line_labels(entries_by_scenario, max_series: int, mode: str):
     return aggregate_family_variation_labels(entries_by_scenario, mode)
 
 
-def batch_comparison_line_labels(entries_by_scenario, mode: str = "throughput"):
-    """Return scalar references plus every batch size of the best batched config."""
-    scalar_family = "UBQ"
-    batched_family = "UBQ batched"
+def batch_comparison_line_labels(
+    entries_by_scenario,
+    mode: str = "throughput",
+    scalar_family: str = "UBQ",
+    batched_family: str = "UBQ batched",
+):
+    """Return scalar references plus every batch size of the best batched config.
+
+    `scalar_family`/`batched_family` select the queue_metadata() family pair
+    to compare.
+    """
     parse_scalar = parse_ubq_variant
     parse_batched = parse_batched_ubq_label
     family_winners = aggregate_family_variation_labels(entries_by_scenario, mode)
@@ -1879,7 +1988,14 @@ def batch_comparison_line_labels(entries_by_scenario, mode: str = "throughput"):
 
 
 def batch_comparison_series_styles(
-    plt, labels, entries_by_scenario, mode="throughput", cmap=None, family_label=""
+    plt,
+    labels,
+    entries_by_scenario,
+    mode="throughput",
+    cmap=None,
+    family_label="",
+    scalar_family: str = "UBQ",
+    batched_family: str = "UBQ batched",
 ):
     """Build coordinated styles around the contention-weighted winning batch.
 
@@ -1889,9 +2005,10 @@ def batch_comparison_series_styles(
     marker, with a family-name legend prefix, while the scalar-reference
     styling stays a fixed neutral color across every family so it always
     reads as "no batching" regardless of hue.
+
+    `scalar_family`/`batched_family` select which queue_metadata() family pair
+    this call is styling.
     """
-    scalar_family = "UBQ"
-    batched_family = "UBQ batched"
     parse_scalar = parse_ubq_variant
     parse_batched = parse_batched_ubq_label
     family_winners = aggregate_family_variation_labels(entries_by_scenario, mode)
@@ -2107,19 +2224,36 @@ BATCH_COMPARISON_FAMILY_COLORMAPS = (
 )
 
 
+# UBQ-shaped families handled by batch_comparison_line_labels/_series_styles
+# (a scalar reference plus every batch size of the contention-weighted best
+# config) rather than plain_batch_comparison_*'s "just show every batch size
+# observed" treatment — each entry is (family_key, scalar_family,
+# batched_family). New UBQ-shaped families with their own scalar/batched
+# family pair just need an entry added here.
+UBQ_SHAPED_BATCH_FAMILIES = (
+    ("UBQ", "UBQ", "UBQ batched"),
+)
+
+
 def combined_batch_comparison_families(entries_by_scenario, mode="throughput"):
     """Ordered (family_key, labels) pairs spanning UBQ and every plain
-    batch-native queue with real batched data — the family/label breakdown
-    behind the single combined batch-size-comparison plot/CSV that replaces
-    one plot per family. `family_key` is "UBQ" or a plain queue name (e.g.
-    "segqueue"); a family with no real batched measurement is omitted
-    entirely. No `plt` dependency, so this alone is enough to drive the CSV
-    output where matplotlib isn't needed.
+    batch-native queue with real batched data — the
+    family/label breakdown behind the single combined batch-size-comparison
+    plot/CSV that replaces one plot per family. `family_key` is "UBQ" or a
+    plain queue name (e.g. "segqueue"); a family
+    with no real batched measurement is omitted entirely. No `plt`
+    dependency, so this alone is enough to drive the CSV output where
+    matplotlib isn't needed.
     """
     families = []
-    ubq_labels = batch_comparison_line_labels(entries_by_scenario, mode)
-    if ubq_labels and any(parse_batched_ubq_label(label) is not None for label in ubq_labels):
-        families.append(("UBQ", ubq_labels))
+    for family_key, scalar_family, batched_family in UBQ_SHAPED_BATCH_FAMILIES:
+        family_ubq_labels = batch_comparison_line_labels(
+            entries_by_scenario, mode, scalar_family, batched_family
+        )
+        if family_ubq_labels and any(
+            parse_batched_ubq_label(label) is not None for label in family_ubq_labels
+        ):
+            families.append((family_key, family_ubq_labels))
     for queue in plain_batch_family_queues(entries_by_scenario):
         queue_labels = plain_batch_comparison_line_labels(entries_by_scenario, mode, queue)
         if any(parse_batched_plain_label(label) is not None for label in queue_labels):
@@ -2144,12 +2278,17 @@ def combined_batch_comparison_series_styles(plt, families, entries_by_scenario, 
     gradient-by-batch-size/scalar-reference/"best" structure within each
     family stays the same as the single-family plots this replaces.
     """
+    ubq_shaped_families = {
+        family_key: (scalar_family, batched_family)
+        for family_key, scalar_family, batched_family in UBQ_SHAPED_BATCH_FAMILIES
+    }
     styles = {}
     for idx, (family, family_labels) in enumerate(families):
         cmap = plt.get_cmap(
             BATCH_COMPARISON_FAMILY_COLORMAPS[idx % len(BATCH_COMPARISON_FAMILY_COLORMAPS)]
         )
-        if family == "UBQ":
+        if family in ubq_shaped_families:
+            scalar_family, batched_family = ubq_shaped_families[family]
             styles.update(
                 batch_comparison_series_styles(
                     plt,
@@ -2157,7 +2296,9 @@ def combined_batch_comparison_series_styles(plt, families, entries_by_scenario, 
                     entries_by_scenario,
                     mode,
                     cmap=cmap,
-                    family_label="UBQ",
+                    family_label=FAMILY_DISPLAY_LABELS.get(family, family),
+                    scalar_family=scalar_family,
+                    batched_family=batched_family,
                 )
             )
         else:
@@ -2186,6 +2327,7 @@ def combined_batch_comparison_color_key(families, styles):
     color; `best_cells` is the set of `(row_index, col_key)` pairs to mark
     as that family's best-performing batch size.
     """
+    ubq_shaped_family_keys = {family_key for family_key, _, _ in UBQ_SHAPED_BATCH_FAMILIES}
     row_labels = []
     cell_colors = {}
     best_cells = set()
@@ -2193,7 +2335,7 @@ def combined_batch_comparison_color_key(families, styles):
     has_scalar_column = False
 
     for family_key, family_labels in families:
-        if family_key == "UBQ":
+        if family_key in ubq_shaped_family_keys:
 
             def batch_size_of(label):
                 parsed = parse_batched_ubq_label(label)
@@ -2205,7 +2347,9 @@ def combined_batch_comparison_color_key(families, styles):
                 return None if parsed is None else parsed[1]
 
         row_idx = len(row_labels)
-        row_labels.append("UBQ" if family_key == "UBQ" else plain_queue_display_name(family_key))
+        row_labels.append(
+            family_key if family_key in ubq_shaped_family_keys else plain_queue_display_name(family_key)
+        )
         for label in family_labels:
             style = styles.get(label)
             if style is None:
@@ -2333,7 +2477,15 @@ def write_queue_metadata_csv(out_path: Path, labels):
     return out_path
 
 
-def throughput_speedup_rows(entries_by_scenario):
+def _target_throughput_speedup_rows(
+    entries_by_scenario,
+    *,
+    target_key,
+    target_title,
+    scalar_selector,
+    batched_selector,
+    baseline_specs,
+):
     rows = []
     for scenario in sorted(entries_by_scenario, key=scenario_sort_key):
         threads = parse_scenario_threads(scenario)
@@ -2341,21 +2493,29 @@ def throughput_speedup_rows(entries_by_scenario):
             continue
         producers, consumers = threads
         entries = entries_by_scenario[scenario]
-        ubq_variants = (
-            ("scalar", "best scalar UBQ", best_ubq_throughput_entry(entries, scenario)),
-            ("batched", "best batched UBQ", best_batched_ubq_throughput_entry(entries, scenario)),
+        target_variants = (
+            (
+                "scalar",
+                f"best scalar {target_title}",
+                scalar_selector(entries, scenario),
+            ),
+            (
+                "batched",
+                f"best batched {target_title}",
+                batched_selector(entries, scenario),
+            ),
         )
-        for ubq_kind, ubq_title, ubq in ubq_variants:
-            if ubq is None:
+        for target_kind, variant_title, target in target_variants:
+            if target is None:
                 continue
-            ubq_label, ubq_value = ubq
+            target_label, target_value = target
             for (
                 baseline_key,
                 baseline_title,
                 scalar_predicate,
                 batched_predicate,
-            ) in THROUGHPUT_SPEEDUP_BASELINES:
-                if ubq_kind == "batched":
+            ) in baseline_specs:
+                if target_kind == "batched":
                     if batched_predicate is None:
                         continue
                     predicate = batched_predicate
@@ -2372,17 +2532,39 @@ def throughput_speedup_rows(entries_by_scenario):
                         "scenario": scenario,
                         "producers": producers,
                         "consumers": consumers,
-                        "ubq_kind": ubq_kind,
-                        "comparison": f"{ubq_kind}_{baseline_key}",
-                        "comparison_label": f"{ubq_title} vs {comparison_title}",
-                        "ubq_queue": ubq_label,
-                        "ubq_ops_per_sec": ubq_value,
+                        f"{target_key}_kind": target_kind,
+                        "comparison": f"{target_kind}_{baseline_key}",
+                        "comparison_label": f"{variant_title} vs {comparison_title}",
+                        f"{target_key}_queue": target_label,
+                        f"{target_key}_ops_per_sec": target_value,
                         "baseline_queue": baseline_label,
                         "baseline_ops_per_sec": baseline_value,
-                        "speedup": ubq_value / baseline_value,
+                        "speedup": target_value / baseline_value,
                     }
                 )
     return rows
+
+
+def throughput_speedup_rows(entries_by_scenario):
+    return _target_throughput_speedup_rows(
+        entries_by_scenario,
+        target_key="ubq",
+        target_title="UBQ",
+        scalar_selector=best_ubq_throughput_entry,
+        batched_selector=best_batched_ubq_throughput_entry,
+        baseline_specs=THROUGHPUT_SPEEDUP_BASELINES,
+    )
+
+
+def lubq_throughput_speedup_rows(entries_by_scenario):
+    return _target_throughput_speedup_rows(
+        entries_by_scenario,
+        target_key="lubq",
+        target_title="LUBQ",
+        scalar_selector=best_lubq_throughput_entry,
+        batched_selector=best_batched_lubq_throughput_entry,
+        baseline_specs=LUBQ_THROUGHPUT_SPEEDUP_BASELINES,
+    )
 
 
 def percentile(values, fraction: float):
@@ -2539,7 +2721,10 @@ def pool_size_effect_rows(entries_by_scenario, mode: str = "throughput"):
     )
 
 
-def write_throughput_speedup_csv(out_path: Path, rows):
+def _write_target_throughput_speedup_csv(out_path: Path, rows, target_key):
+    kind_key = f"{target_key}_kind"
+    queue_key = f"{target_key}_queue"
+    ops_key = f"{target_key}_ops_per_sec"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
@@ -2550,9 +2735,9 @@ def write_throughput_speedup_csv(out_path: Path, rows):
                 "consumers",
                 "comparison",
                 "comparison_label",
-                "ubq_kind",
-                "ubq_queue",
-                "ubq_ops_per_sec",
+                kind_key,
+                queue_key,
+                ops_key,
                 "baseline_queue",
                 "baseline_ops_per_sec",
                 "speedup",
@@ -2566,15 +2751,23 @@ def write_throughput_speedup_csv(out_path: Path, rows):
                     row["consumers"],
                     row["comparison"],
                     row["comparison_label"],
-                    row["ubq_kind"],
-                    row["ubq_queue"],
-                    f"{row['ubq_ops_per_sec']:.6f}",
+                    row[kind_key],
+                    row[queue_key],
+                    f"{row[ops_key]:.6f}",
                     row["baseline_queue"],
                     f"{row['baseline_ops_per_sec']:.6f}",
                     f"{row['speedup']:.6f}",
                 ]
             )
     return out_path
+
+
+def write_throughput_speedup_csv(out_path: Path, rows):
+    return _write_target_throughput_speedup_csv(out_path, rows, "ubq")
+
+
+def write_lubq_throughput_speedup_csv(out_path: Path, rows):
+    return _write_target_throughput_speedup_csv(out_path, rows, "lubq")
 
 
 def write_pool_size_observations_csv(out_path: Path, observations, mode: str = "throughput"):
@@ -2865,15 +3058,20 @@ def annotate_immediate_variant_status(ax, coverage_csv_name: str, report):
     )
 
 
-def plot_throughput_speedup_grid(
+def _plot_target_throughput_speedup_grid(
     plt,
     out_path: Path,
     machine: str,
     entries_by_scenario,
+    rows,
+    *,
+    target_key,
+    target_title,
+    baseline_specs,
     capacity=None,
-    ubq_kind_filter=None,
+    target_kind_filter=None,
 ):
-    """`ubq_kind_filter`: None draws both scalar and batched UBQ panels in one
+    """`target_kind_filter`: None draws both scalar and batched panels in one
     figure (the original combined view); "scalar" or "batched" restricts the
     figure to just that kind, for the split scalar/batched heatmap outputs.
 
@@ -2885,9 +3083,9 @@ def plot_throughput_speedup_grid(
     falls back to being treated as infeasible only if no scenario for it was
     observed at all.
     """
-    rows = throughput_speedup_rows(entries_by_scenario)
-    if ubq_kind_filter is not None:
-        rows = [row for row in rows if row["ubq_kind"] == ubq_kind_filter]
+    kind_key = f"{target_key}_kind"
+    if target_kind_filter is not None:
+        rows = [row for row in rows if row[kind_key] == target_kind_filter]
     if not rows:
         return False
 
@@ -2926,16 +3124,19 @@ def plot_throughput_speedup_grid(
     cmap = plt.get_cmap("RdYlGn").copy()
     cmap.set_bad("#f2f2f2")
 
-    all_ubq_kinds = (("scalar", "best scalar UBQ"), ("batched", "best batched UBQ"))
-    ubq_kinds = (
-        tuple(kind for kind in all_ubq_kinds if kind[0] == ubq_kind_filter)
-        if ubq_kind_filter is not None
-        else all_ubq_kinds
+    all_target_kinds = (
+        ("scalar", f"best scalar {target_title}"),
+        ("batched", f"best batched {target_title}"),
+    )
+    target_kinds = (
+        tuple(kind for kind in all_target_kinds if kind[0] == target_kind_filter)
+        if target_kind_filter is not None
+        else all_target_kinds
     )
     panels = []
-    for ubq_kind, _ubq_title in ubq_kinds:
-        for baseline_key, *_rest in THROUGHPUT_SPEEDUP_BASELINES:
-            comparison = f"{ubq_kind}_{baseline_key}"
+    for target_kind, _variant_title in target_kinds:
+        for baseline_key, *_rest in baseline_specs:
+            comparison = f"{target_kind}_{baseline_key}"
             matching_row = next(
                 (row for row in rows if row["comparison"] == comparison), None
             )
@@ -2971,8 +3172,8 @@ def plot_throughput_speedup_grid(
         ax.set_xticks(range(len(consumers)), [str(value) for value in consumers])
         ax.set_yticks(range(len(producers)), [str(value) for value in producers])
         ax.set_xlabel("Consumers")
-        # Two panel titles now routinely share a figure (up to 7 baselines x
-        # 2 UBQ kinds), so break each at "vs" to stop long baseline names
+        # Several panel titles routinely share a figure, so break each at
+        # "vs" to stop long baseline names
         # (e.g. "moodycamel::CQ") from bleeding into the neighboring panel.
         ax.set_title(title.replace(" vs ", "\nvs ", 1), fontsize=9)
         ax.set_xticks([idx - 0.5 for idx in range(1, len(consumers))], minor=True)
@@ -3005,9 +3206,12 @@ def plot_throughput_speedup_grid(
 
     axes[0].set_ylabel("Producers")
     title_suffix = {
-        "scalar": "scalar UBQ throughput speedup",
-        "batched": "batched UBQ throughput speedup",
-    }.get(ubq_kind_filter, "scalar and batched UBQ throughput speedup")
+        "scalar": f"scalar {target_title} throughput speedup",
+        "batched": f"batched {target_title} throughput speedup",
+    }.get(
+        target_kind_filter,
+        f"scalar and batched {target_title} throughput speedup",
+    )
     fig.suptitle(f"{machine_display_label(machine)}: {title_suffix}", y=0.99)
     fig.subplots_adjust(top=0.86, right=0.90, wspace=0.34)
     if image is not None:
@@ -3015,12 +3219,56 @@ def plot_throughput_speedup_grid(
         ticks = [tick for tick in range(math.ceil(vmin), math.floor(vmax) + 1)]
         colorbar.set_ticks(ticks)
         colorbar.set_ticklabels([f"{2 ** tick:g}x" for tick in ticks])
-        colorbar.set_label("UBQ speedup")
+        colorbar.set_label(f"{target_title} speedup")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return True
+
+
+def plot_throughput_speedup_grid(
+    plt,
+    out_path: Path,
+    machine: str,
+    entries_by_scenario,
+    capacity=None,
+    ubq_kind_filter=None,
+):
+    return _plot_target_throughput_speedup_grid(
+        plt,
+        out_path,
+        machine,
+        entries_by_scenario,
+        throughput_speedup_rows(entries_by_scenario),
+        target_key="ubq",
+        target_title="UBQ",
+        baseline_specs=THROUGHPUT_SPEEDUP_BASELINES,
+        capacity=capacity,
+        target_kind_filter=ubq_kind_filter,
+    )
+
+
+def plot_lubq_throughput_speedup_grid(
+    plt,
+    out_path: Path,
+    machine: str,
+    entries_by_scenario,
+    capacity=None,
+    lubq_kind_filter=None,
+):
+    return _plot_target_throughput_speedup_grid(
+        plt,
+        out_path,
+        machine,
+        entries_by_scenario,
+        lubq_throughput_speedup_rows(entries_by_scenario),
+        target_key="lubq",
+        target_title="LUBQ",
+        baseline_specs=LUBQ_THROUGHPUT_SPEEDUP_BASELINES,
+        capacity=capacity,
+        target_kind_filter=lubq_kind_filter,
+    )
 
 
 def plot_pool_size_effect(plt, out_path: Path, machine: str, entries_by_scenario):
@@ -3722,6 +3970,44 @@ def main():
                 )
                 print(f"Wrote CSV: {batch_csv_path}")
 
+    # Speedup tables do not depend on matplotlib. Emit them before importing
+    # the plotting runtime so CSV-only environments still receive both the
+    # UBQ and first-class LUBQ comparison artifacts.
+    for machine in sorted(grouped):
+        entries_by_scenario = grouped[machine].get("throughput")
+        if not entries_by_scenario:
+            continue
+        comparison_suites = (
+            (
+                "ubq",
+                throughput_speedup_rows(entries_by_scenario),
+                "ubq_kind",
+                write_throughput_speedup_csv,
+            ),
+            (
+                "lubq",
+                lubq_throughput_speedup_rows(entries_by_scenario),
+                "lubq_kind",
+                write_lubq_throughput_speedup_csv,
+            ),
+        )
+        for target_slug, speedup_rows, kind_key, writer in comparison_suites:
+            for target_kind in ("scalar", "batched"):
+                kind_rows = [
+                    row for row in speedup_rows if row[kind_key] == target_kind
+                ]
+                if not kind_rows:
+                    continue
+                csv_path = (
+                    out_root
+                    / machine
+                    / "csv"
+                    / "throughput"
+                    / f"{target_slug}_speedup_grid_throughput_{target_kind}.csv"
+                )
+                writer(csv_path, kind_rows)
+                print(f"Wrote CSV: {csv_path}")
+
     ensure_plot_runtime_env(out_root)
     try:
         import matplotlib.pyplot as plt
@@ -3747,37 +4033,42 @@ def main():
         if plot_pool_size_effect(plt, pool_png_path, machine, entries_by_scenario):
             print(f"Wrote PNG: {pool_png_path}")
 
-        speedup_rows = throughput_speedup_rows(entries_by_scenario)
-        if not speedup_rows:
-            continue
-        for ubq_kind in ("scalar", "batched"):
-            kind_rows = [row for row in speedup_rows if row["ubq_kind"] == ubq_kind]
-            if not kind_rows:
-                continue
-            csv_path = (
-                out_root
-                / machine
-                / "csv"
-                / "throughput"
-                / f"ubq_speedup_grid_throughput_{ubq_kind}.csv"
-            )
-            write_throughput_speedup_csv(csv_path, kind_rows)
-            print(f"Wrote CSV: {csv_path}")
-            png_path = (
-                out_root
-                / machine
-                / "throughput"
-                / f"ubq_speedup_grid_throughput_{ubq_kind}.png"
-            )
-            if plot_throughput_speedup_grid(
-                plt,
-                png_path,
-                machine,
-                entries_by_scenario,
-                capacity,
-                ubq_kind_filter=ubq_kind,
-            ):
-                print(f"Wrote PNG: {png_path}")
+        comparison_suites = (
+            (
+                "ubq",
+                throughput_speedup_rows(entries_by_scenario),
+                "ubq_kind",
+                plot_throughput_speedup_grid,
+            ),
+            (
+                "lubq",
+                lubq_throughput_speedup_rows(entries_by_scenario),
+                "lubq_kind",
+                plot_lubq_throughput_speedup_grid,
+            ),
+        )
+        for target_slug, speedup_rows, kind_key, plotter in comparison_suites:
+            for target_kind in ("scalar", "batched"):
+                if not any(
+                    row[kind_key] == target_kind for row in speedup_rows
+                ):
+                    continue
+                png_path = (
+                    out_root
+                    / machine
+                    / "throughput"
+                    / f"{target_slug}_speedup_grid_throughput_{target_kind}.png"
+                )
+                filter_keyword = {f"{target_slug}_kind_filter": target_kind}
+                if plotter(
+                    plt,
+                    png_path,
+                    machine,
+                    entries_by_scenario,
+                    capacity,
+                    **filter_keyword,
+                ):
+                    print(f"Wrote PNG: {png_path}")
 
     for machine in sorted(grouped):
         for mode in sorted(grouped[machine], key=mode_sort_key):

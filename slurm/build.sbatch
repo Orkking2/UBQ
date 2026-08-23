@@ -34,6 +34,21 @@ install -m 0755 \
     "$CARGO_TARGET_DIR/release/bench_grid" \
     "$artifact_dir/bench_grid"
 
+# Keep profiling-only code generation separate from the comparative grid so
+# frame pointers/debug symbols cannot perturb the benchmark artifact.
+export CARGO_TARGET_DIR="$TMPDIR/ubq-profile-target"
+profile_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-C force-frame-pointers=yes"
+RUSTFLAGS="$profile_rustflags" CARGO_PROFILE_RELEASE_DEBUG=1 cargo build \
+    --release \
+    --locked \
+    --offline \
+    --features bench_registry \
+    --bin bench_profile
+
+install -m 0755 \
+    "$CARGO_TARGET_DIR/release/bench_profile" \
+    "$artifact_dir/bench_profile"
+
 {
     date --iso-8601=seconds
     hostname
@@ -42,6 +57,8 @@ install -m 0755 \
     rustc -Vv
     cargo -V
     printf 'RUSTFLAGS=%s\n' "${RUSTFLAGS-}"
+    printf 'BENCH_PROFILE_RUSTFLAGS=%s\n' "$profile_rustflags"
     module -t list 2>&1
     sha256sum "$artifact_dir/bench_grid"
+    sha256sum "$artifact_dir/bench_profile"
 } > "$artifact_dir/build-info-${SLURM_JOB_ID}.txt"

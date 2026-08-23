@@ -16,6 +16,8 @@ UBQ_POOL_VALUES = (0, 1, 2, 4, 8, 16, 32, 64)
 UBQ_BLOCK_VALUES = (31, 63, 127, 255, 511, 1023, 2047, 4095)
 UBQ_BACKOFF_VALUES = ("", "b")
 UBQ_SYNC_VALUES = ("cas",)
+UBQ_LEGACY_BLOCK_VALUES = UBQ_BLOCK_VALUES + (8191, 16383, 32767, 65535)
+UBQ_PAGE_BLOCK_VALUE = 65536
 
 UBQ_IMMEDIATE_DIMS = {
     1: list(UBQ_POOL_VALUES),
@@ -51,7 +53,8 @@ def format_ubq_label_parts(
     if sync_name not in UBQ_SYNC_VALUES:
         raise ValueError(f"unknown UBQ sync mode: {sync}")
 
-    label = f"{preset},{pool},{block},{backoff_name}"
+    block_token = "page" if int(block) == UBQ_PAGE_BLOCK_VALUE else str(block)
+    label = f"{preset},{pool},{block_token},{backoff_name}"
     if include_sync:
         label = f"{label},{sync_name}"
     return label
@@ -69,7 +72,7 @@ def parse_ubq_queue_label(token: str, require_valid: bool = True):
         try:
             version = int(parts[0][1:])
             pool = int(parts[1])
-            block = int(parts[2])
+            block = UBQ_PAGE_BLOCK_VALUE if parts[2] == "page" else int(parts[2])
         except ValueError:
             return None
         backoff = parts[3] if len(parts) >= 4 else ""
@@ -81,7 +84,7 @@ def parse_ubq_queue_label(token: str, require_valid: bool = True):
             return None
         try:
             pool = int(parts[1])
-            block = int(parts[2])
+            block = UBQ_PAGE_BLOCK_VALUE if parts[2] == "page" else int(parts[2])
         except ValueError:
             return None
         backoff_name = parts[3] if len(parts) >= 4 else "crossbeam"
@@ -109,13 +112,14 @@ def is_valid_ubq_params(params: Sequence[object]) -> bool:
 
     backoff = str(params[3]) if len(params) >= 4 else ""
     sync = str(params[4]).strip().lower() if len(params) >= 5 else "cas"
-    if version not in UBQ_VERSIONS:
-        return False
-    if block not in UBQ_BLOCK_VALUES:
-        return False
     if backoff not in UBQ_BACKOFF_VALUES:
         return False
     if sync not in UBQ_SYNC_VALUES:
+        return False
+
+    if version not in UBQ_VERSIONS:
+        return False
+    if block not in UBQ_LEGACY_BLOCK_VALUES and block != UBQ_PAGE_BLOCK_VALUE:
         return False
     return pool in UBQ_POOL_VALUES
 

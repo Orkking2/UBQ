@@ -34,7 +34,7 @@ Run the application modes directly:
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue --bin bench_matrix -- \
   --machine-label local \
   --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue \
-  --ubq-label balanced,1,127,crossbeam \
+  --ubq-label balanced,1,page,crossbeam \
   --scenarios 1p1c,4p1c,1p4c,4p4c,8p8c,16p16c \
   --modes app_log_fan_in,app_pipeline,app_task_roundtrip \
   --items-per-producer 100000 \

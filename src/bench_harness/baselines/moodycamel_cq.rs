@@ -22,6 +22,7 @@
 //! harness to shuttle non-`u64` payloads through a `u64`-typed channel (see
 //! `bench_data_latency_with_queue` in `crate::bench_harness`).
 
+use std::cell::UnsafeCell;
 use std::os::raw::c_void;
 use std::sync::Arc;
 
@@ -44,8 +45,11 @@ unsafe extern "C" {
     ) -> bool;
     fn mc_queue_create_consumer_token(handle: *mut c_void) -> *mut c_void;
     fn mc_queue_free_consumer_token(token: *mut c_void);
-    fn mc_queue_try_dequeue_with_token(handle: *mut c_void, token: *mut c_void, out: *mut u64)
-    -> bool;
+    fn mc_queue_try_dequeue_with_token(
+        handle: *mut c_void,
+        token: *mut c_void,
+        out: *mut u64,
+    ) -> bool;
     fn mc_queue_try_dequeue_bulk_with_token(
         handle: *mut c_void,
         token: *mut c_void,
@@ -108,25 +112,40 @@ impl Drop for ConsumerTokenHandle {
     }
 }
 
-/// Per-thread moodycamel handle: a producer token and a consumer token,
-/// created together once when a benchmark thread starts up and reused for
-/// every enqueue/dequeue call that thread makes for the rest of the job.
-/// Every spawned thread gets both, since a single `BenchQueueThreadOps`/
-/// `LogQueueThreadOps` handle type must serve producer and consumer roles
-/// alike; whichever token a given thread's role doesn't need simply goes
-/// unused.
-pub struct MoodycamelThreadHandle {
-    queue: Arc<MoodycamelQueue>,
-    producer_token: ProducerTokenHandle,
-    consumer_token: ConsumerTokenHandle,
+enum MoodycamelThreadRole {
+    Producer {
+        token: ProducerTokenHandle,
+        batch: UnsafeCell<Vec<u64>>,
+    },
+    Consumer {
+        token: ConsumerTokenHandle,
+        batch: UnsafeCell<Vec<u64>>,
+    },
 }
 
-fn new_thread_handle(queue: &Arc<MoodycamelQueue>) -> MoodycamelThreadHandle {
+/// Per-thread moodycamel handle with exactly the token required by its role.
+/// Batch storage is retained for the thread's full benchmark lifetime.
+pub struct MoodycamelThreadHandle {
+    queue: Arc<MoodycamelQueue>,
+    role: MoodycamelThreadRole,
+}
+
+fn new_producer_handle(queue: &Arc<MoodycamelQueue>) -> MoodycamelThreadHandle {
     let producer_token = unsafe { mc_queue_create_producer_token(queue.handle) };
     assert!(
         !producer_token.is_null(),
         "moodycamel producer token allocation failed"
     );
+    MoodycamelThreadHandle {
+        queue: queue.clone(),
+        role: MoodycamelThreadRole::Producer {
+            token: ProducerTokenHandle(producer_token),
+            batch: UnsafeCell::new(Vec::new()),
+        },
+    }
+}
+
+fn new_consumer_handle(queue: &Arc<MoodycamelQueue>) -> MoodycamelThreadHandle {
     let consumer_token = unsafe { mc_queue_create_consumer_token(queue.handle) };
     assert!(
         !consumer_token.is_null(),
@@ -134,8 +153,10 @@ fn new_thread_handle(queue: &Arc<MoodycamelQueue>) -> MoodycamelThreadHandle {
     );
     MoodycamelThreadHandle {
         queue: queue.clone(),
-        producer_token: ProducerTokenHandle(producer_token),
-        consumer_token: ConsumerTokenHandle(consumer_token),
+        role: MoodycamelThreadRole::Consumer {
+            token: ConsumerTokenHandle(consumer_token),
+            batch: UnsafeCell::new(Vec::new()),
+        },
     }
 }
 
@@ -143,7 +164,15 @@ impl BenchQueueHandleFactory for MoodycamelQueue {
     type ThreadHandle = MoodycamelThreadHandle;
 
     fn thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
-        new_thread_handle(self)
+        panic!("moodycamel handles must be requested for a producer or consumer role")
+    }
+
+    fn producer_thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
+        new_producer_handle(self)
+    }
+
+    fn consumer_thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
+        new_consumer_handle(self)
     }
 }
 
@@ -151,24 +180,40 @@ impl LogQueueHandleFactory for MoodycamelQueue {
     type ThreadHandle = MoodycamelThreadHandle;
 
     fn log_thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
-        new_thread_handle(self)
+        panic!("moodycamel log handles must be requested for a producer or consumer role")
+    }
+
+    fn log_producer_thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
+        new_producer_handle(self)
+    }
+
+    fn log_consumer_thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
+        new_consumer_handle(self)
     }
 }
 
 impl BenchQueueThreadOps for MoodycamelThreadHandle {
     fn try_send_value(&self, value: u64) -> bool {
-        unsafe {
-            mc_queue_enqueue_with_token(self.queue.handle, self.producer_token.0, value)
-        }
+        let MoodycamelThreadRole::Producer { token, .. } = &self.role else {
+            panic!("attempted to send through a moodycamel consumer handle");
+        };
+        unsafe { mc_queue_enqueue_with_token(self.queue.handle, token.0, value) }
     }
 
     fn send_batch(&self, base: u64, offsets: std::ops::Range<usize>) {
-        let items: Vec<u64> = offsets.map(|offset| base + offset as u64).collect();
+        let MoodycamelThreadRole::Producer { token, batch } = &self.role else {
+            panic!("attempted to send a batch through a moodycamel consumer handle");
+        };
+        // SAFETY: the harness moves this non-Sync handle into one worker and
+        // never overlaps calls on it.
+        let items = unsafe { &mut *batch.get() };
+        items.clear();
+        items.extend(offsets.map(|offset| base + offset as u64));
         let backoff = crossbeam_utils::Backoff::new();
         while !unsafe {
             mc_queue_enqueue_bulk_with_token(
                 self.queue.handle,
-                self.producer_token.0,
+                token.0,
                 items.as_ptr(),
                 items.len(),
             )
@@ -178,19 +223,27 @@ impl BenchQueueThreadOps for MoodycamelThreadHandle {
     }
 
     fn try_recv_value(&self) -> Option<u64> {
-        let mut value = 0_u64;
-        let ok = unsafe {
-            mc_queue_try_dequeue_with_token(self.queue.handle, self.consumer_token.0, &mut value)
+        let MoodycamelThreadRole::Consumer { token, .. } = &self.role else {
+            panic!("attempted to receive through a moodycamel producer handle");
         };
+        let mut value = 0_u64;
+        let ok = unsafe { mc_queue_try_dequeue_with_token(self.queue.handle, token.0, &mut value) };
         ok.then_some(value)
     }
 
     fn try_recv_batch(&self, request_size: usize) -> usize {
-        let mut buf = vec![0_u64; request_size];
+        let MoodycamelThreadRole::Consumer { token, batch } = &self.role else {
+            panic!("attempted to receive a batch through a moodycamel producer handle");
+        };
+        // SAFETY: the harness moves this non-Sync handle into one worker and
+        // never overlaps calls on it. Keeping len at the requested size makes
+        // every FFI output slot valid without re-zeroing an established buffer.
+        let buf = unsafe { &mut *batch.get() };
+        buf.resize(request_size, 0);
         unsafe {
             mc_queue_try_dequeue_bulk_with_token(
                 self.queue.handle,
-                self.consumer_token.0,
+                token.0,
                 buf.as_mut_ptr(),
                 request_size,
             )
@@ -200,20 +253,22 @@ impl BenchQueueThreadOps for MoodycamelThreadHandle {
 
 impl LogQueueThreadOps for MoodycamelThreadHandle {
     fn send_log(&self, record: LogRecord) {
+        let MoodycamelThreadRole::Producer { token, .. } = &self.role else {
+            panic!("attempted to send a log through a moodycamel consumer handle");
+        };
         let ptr = Box::into_raw(Box::new(record)) as usize as u64;
         let backoff = crossbeam_utils::Backoff::new();
-        while !unsafe {
-            mc_queue_enqueue_with_token(self.queue.handle, self.producer_token.0, ptr)
-        } {
+        while !unsafe { mc_queue_enqueue_with_token(self.queue.handle, token.0, ptr) } {
             backoff.snooze();
         }
     }
 
     fn try_recv_log(&self) -> Option<LogRecord> {
-        let mut ptr = 0_u64;
-        let ok = unsafe {
-            mc_queue_try_dequeue_with_token(self.queue.handle, self.consumer_token.0, &mut ptr)
+        let MoodycamelThreadRole::Consumer { token, .. } = &self.role else {
+            panic!("attempted to receive a log through a moodycamel producer handle");
         };
+        let mut ptr = 0_u64;
+        let ok = unsafe { mc_queue_try_dequeue_with_token(self.queue.handle, token.0, &mut ptr) };
         ok.then(|| *unsafe { Box::from_raw(ptr as usize as *mut LogRecord) })
     }
 }

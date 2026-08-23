@@ -1,7 +1,7 @@
 use crate::{
     backoff::{BackoffPolicy, Crossbeam},
-    block::{Block, BlockChain, DEFAULT_BLOCK_SIZE},
-    head::Head,
+    block::{BlockChain, MpmcBlock as Block},
+    head::{Head, HeadCodec},
 };
 use alloc::sync::Arc;
 use core::{
@@ -16,57 +16,69 @@ use core::{
 use crossbeam_utils::CachePadded;
 
 /// A lock-free, unbounded multi-producer/multi-consumer (MPMC) queue.
-pub struct UBQ<T, const BLOCK_SIZE: usize = DEFAULT_BLOCK_SIZE, B = Crossbeam> {
+pub struct UBQ<T, B = Crossbeam> {
     /// Atomic pointer to phead: the block currently accepting producer pushes.
     phead: CachePadded<AtomicUsize>,
     /// Atomic pointer to chead: the block currently being drained by consumers.
     chead: CachePadded<AtomicUsize>,
     /// Recycled blocks used to avoid repeated allocations.
-    pool: CachePadded<AtomicPtr<Block<T, BLOCK_SIZE>>>,
+    pool: CachePadded<AtomicPtr<Block<T>>>,
+
+    /// Type- and page-specific packed-head geometry.
+    head_codec: HeadCodec,
 
     _marker: PhantomData<B>,
 }
 
 // SAFETY: Slot ownership is assigned with atomic counters, and producer/consumer
 // commits are synchronized with Release/Acquire ordering before cross-thread reads.
-unsafe impl<T: Send, const BLOCK_SIZE: usize, B> Sync for UBQ<T, BLOCK_SIZE, B> {}
-unsafe impl<T: Send, const BLOCK_SIZE: usize, B> Send for UBQ<T, BLOCK_SIZE, B> {}
+unsafe impl<T: Send, B> Sync for UBQ<T, B> {}
+unsafe impl<T: Send, B> Send for UBQ<T, B> {}
 
-impl<T, const BLOCK_SIZE: usize, B> fmt::Debug for UBQ<T, BLOCK_SIZE, B> {
+impl<T, B> fmt::Debug for UBQ<T, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("UBQ { .. }")
     }
 }
 
-impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
-    /// Number of slots in each block for this queue type.
-    pub const BLOCK_LENGTH: usize = BLOCK_SIZE;
-
-    fn acquire_phead(&self) -> Head<T, BLOCK_SIZE> {
-        Head::from_usize(self.phead.load(Acquire))
+impl<T, B: BackoffPolicy> UBQ<T, B> {
+    /// Number of slots that fit in each one-page block.
+    #[inline]
+    pub fn block_length(&self) -> usize {
+        self.head_codec.block_length()
     }
 
-    fn acquire_chead(&self) -> Head<T, BLOCK_SIZE> {
-        Head::from_usize(self.chead.load(Acquire))
+    fn acquire_phead(&self) -> Head<T> {
+        Head::from_usize(self.phead.load(Acquire), self.head_codec)
+    }
+
+    fn acquire_chead(&self) -> Head<T> {
+        Head::from_usize(self.chead.load(Acquire), self.head_codec)
     }
 
     /// Creates a new, empty queue.
     ///
     /// No blocks are allocated until the first call to [`push`](Self::push).
+    ///
+    /// # Panics
+    ///
+    /// Panics if one `Slot<T>` does not fit in or requires greater alignment
+    /// than a system base page.
     #[inline]
     pub fn new() -> Self {
         Self {
             phead: CachePadded::new(AtomicUsize::new(0)),
             chead: CachePadded::new(AtomicUsize::new(0)),
             pool: CachePadded::new(AtomicPtr::new(null_mut())),
+            head_codec: HeadCodec::new::<T>(),
 
             _marker: PhantomData,
         }
     }
 
-    /// Creates a new queue, like [`new`](Self::new), but using [`Arc::new_zeroed`].
+    /// Creates a new queue in an [`Arc`].
     pub fn new_arc() -> Arc<Self> {
-        unsafe { Arc::new_zeroed().assume_init() }
+        Arc::new(Self::new())
     }
 
     /// Returns `true` if this UBQ contains no values.
@@ -113,6 +125,7 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
             return;
         }
 
+        let block_length = self.block_length();
         let mut blocks = BlockChain::new();
 
         let backoff = B::new();
@@ -127,13 +140,14 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
             let new_phead = Head::from_ptr(root);
 
             match self.phead.compare_exchange(
-                phead.to_usize(),
-                new_phead.to_usize(),
+                phead.to_usize(self.head_codec),
+                new_phead.to_usize(self.head_codec),
                 Release,
                 Relaxed,
             ) {
                 Ok(_) => {
-                    self.chead.store(Head::from_ptr(root).to_usize(), Release);
+                    self.chead
+                        .store(Head::from_ptr(root).to_usize(self.head_codec), Release);
                     phead = new_phead;
                 }
                 Err(_) => blocks.give_back(root, size),
@@ -143,7 +157,7 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
         let mut new_phead;
 
         loop {
-            if phead.index >= BLOCK_SIZE {
+            if phead.index >= block_length {
                 backoff.snooze();
                 phead = self.acquire_phead();
                 continue;
@@ -154,32 +168,32 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
             blocks.grow_to_fit_with(
                 // len < usize::MAX
                 (len + 1).saturating_sub(
-                    BLOCK_SIZE - phead.index + if phead.has_next { BLOCK_SIZE } else { 0 },
+                    block_length - phead.index + if phead.has_next { block_length } else { 0 },
                 ),
                 &self.pool,
             );
 
             new_phead = Head {
                 block: phead.block,
-                index: phead.index.saturating_add(len).min(BLOCK_SIZE),
+                index: phead.index.saturating_add(len).min(block_length),
                 ..Head::ZERO
             };
 
             match self.phead.compare_exchange_weak(
-                phead.to_usize(),
-                new_phead.to_usize(),
+                phead.to_usize(self.head_codec),
+                new_phead.to_usize(self.head_codec),
                 AcqRel,
                 Acquire,
             ) {
                 Ok(_) => break,
                 Err(real) => {
-                    phead = Head::from_usize(real);
+                    phead = Head::from_usize(real, self.head_codec);
                     backoff.spin();
                 }
             }
         }
 
-        if new_phead.index == BLOCK_SIZE {
+        if new_phead.index == block_length {
             let (mut root, size) = blocks.take();
 
             let mut remaining = len;
@@ -197,7 +211,7 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
                     root = null_mut();
                 }
 
-                let available = BLOCK_SIZE - index;
+                let available = block_length - index;
 
                 if remaining < available {
                     self.phead.store(
@@ -206,7 +220,7 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
                             index: index + remaining,
                             has_next: !next.is_null(),
                         }
-                        .to_usize(),
+                        .to_usize(self.head_codec),
                         Release,
                     );
 
@@ -228,14 +242,14 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
         /* Our iterator is:
          * phead.block.slots[phead.index]
          * where phead.block = phead.block->next and phead.index = 0
-         * when (++phead.index) == BLOCK_LENGTH
+         * when (++phead.index) == self.block_length()
          */
         for _ in 0..len {
             let slot = unsafe { (*phead.block).get_unchecked(phead.index) };
 
             phead.index += 1;
 
-            if phead.index == BLOCK_SIZE {
+            if phead.index == block_length {
                 phead = Head {
                     // TODO: Do we really have to do any waiting? Are we not guaranteed that !next.is_null()?
                     block: unsafe { &*phead.block }.wait_next(&backoff),
@@ -262,11 +276,12 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
     /// Reserves and returns up to `size` items from the front of the queue.
     #[doc(alias = "dequeue_batch")]
     #[doc(alias = "receive_batch")]
-    pub fn pop_batch(&self, size: usize) -> UBQIter<'_, T, BLOCK_SIZE, B> {
-        if size == 0 || self.chead.load(Acquire) == Head::<T, BLOCK_SIZE>::ZERO.to_usize() {
+    pub fn pop_batch(&self, size: usize) -> UBQIter<'_, T, B> {
+        if size == 0 || self.chead.load(Acquire) == Head::<T>::ZERO.to_usize(self.head_codec) {
             return UBQIter::empty(self);
         }
 
+        let block_length = self.block_length();
         let backoff = B::new();
 
         let mut chead = self.acquire_chead();
@@ -275,7 +290,7 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
         let mut new_chead;
 
         loop {
-            if chead.index == BLOCK_SIZE {
+            if chead.index == block_length {
                 backoff.snooze();
                 chead = self.acquire_chead();
                 continue;
@@ -300,13 +315,13 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
             }
 
             new_chead = Head {
-                index: BLOCK_SIZE.min(chead.index + len),
+                index: block_length.min(chead.index + len),
                 ..new_chead
             };
 
             match self.chead.compare_exchange_weak(
-                chead.to_usize(),
-                new_chead.to_usize(),
+                chead.to_usize(self.head_codec),
+                new_chead.to_usize(self.head_codec),
                 AcqRel,
                 Acquire,
             ) {
@@ -316,14 +331,14 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
                         let phead = self.acquire_phead();
 
                         if phead.block == chead.block && phead.index < new_chead.index {
-                            if new_chead.index == BLOCK_SIZE {
+                            if new_chead.index == block_length {
                                 let x = self.chead.compare_exchange(
-                                    new_chead.to_usize(),
+                                    new_chead.to_usize(self.head_codec),
                                     Head {
                                         has_next: false,
                                         ..phead
                                     }
-                                    .to_usize(),
+                                    .to_usize(self.head_codec),
                                     Release,
                                     Relaxed,
                                 );
@@ -347,13 +362,13 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
                     break;
                 }
                 Err(real) => {
-                    chead = Head::from_usize(real);
+                    chead = Head::from_usize(real, self.head_codec);
                     backoff.spin();
                 }
             }
         }
 
-        if new_chead.index == BLOCK_SIZE {
+        if new_chead.index == block_length {
             let mut phead = self.acquire_phead();
 
             let mut remaining = len;
@@ -364,10 +379,10 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
             loop {
                 let mut next = unsafe { &*block }.next().load(Acquire);
 
-                let available = BLOCK_SIZE - index;
+                let available = block_length - index;
 
                 if phead.block == block {
-                    while phead.block == block && phead.index == BLOCK_SIZE {
+                    while phead.block == block && phead.index == block_length {
                         backoff.snooze();
                         phead = self.acquire_phead();
                     }
@@ -379,7 +394,7 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
                                 index: phead.index.min(index + remaining),
                                 has_next: false,
                             }
-                            .to_usize(),
+                            .to_usize(self.head_codec),
                             Release,
                         );
 
@@ -399,7 +414,7 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
                             index: index + remaining,
                             has_next: true,
                         }
-                        .to_usize(),
+                        .to_usize(self.head_codec),
                         Release,
                     );
 
@@ -412,28 +427,28 @@ impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQ<T, BLOCK_SIZE, B> {
             }
         }
 
-        return UBQIter {
+        UBQIter {
             queue: self,
             block: chead.block,
             index: chead.index,
             len,
-        };
+        }
     }
 }
 
-impl<T, const BLOCK_SIZE: usize, B: BackoffPolicy> Default for UBQ<T, BLOCK_SIZE, B> {
+impl<T, B: BackoffPolicy> Default for UBQ<T, B> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, const BLOCK_SIZE: usize, B> Drop for UBQ<T, BLOCK_SIZE, B> {
+impl<T, B> Drop for UBQ<T, B> {
     fn drop(&mut self) {
-        let mut block = Head::from_usize(*self.chead.get_mut()).block;
+        let mut block = Head::from_usize(*self.chead.get_mut(), self.head_codec).block;
 
         while !block.is_null() {
             let next = unsafe { *(*block).next_mut().get_mut() };
-            Block::<T, BLOCK_SIZE>::free(block);
+            Block::<T>::free(block);
             block = next;
         }
 
@@ -445,23 +460,23 @@ impl<T, const BLOCK_SIZE: usize, B> Drop for UBQ<T, BLOCK_SIZE, B> {
     }
 }
 
-pub struct UBQIter<'a, T, const BLOCK_SIZE: usize, B: BackoffPolicy> {
-    queue: &'a UBQ<T, BLOCK_SIZE, B>,
-    block: *mut Block<T, BLOCK_SIZE>,
+pub struct UBQIter<'a, T, B: BackoffPolicy> {
+    queue: &'a UBQ<T, B>,
+    block: *mut Block<T>,
     index: usize,
     /// Length, in slots, until we are exhausted
     len: usize,
 }
 
-impl<'a, T, const BLOCK_SIZE: usize, B: BackoffPolicy> Drop for UBQIter<'a, T, BLOCK_SIZE, B> {
+impl<'a, T, B: BackoffPolicy> Drop for UBQIter<'a, T, B> {
     fn drop(&mut self) {
         // TODO: This could be made more specialized
         for _ in self {}
     }
 }
 
-impl<'a, T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQIter<'a, T, BLOCK_SIZE, B> {
-    fn empty(queue: &'a UBQ<T, BLOCK_SIZE, B>) -> Self {
+impl<'a, T, B: BackoffPolicy> UBQIter<'a, T, B> {
+    fn empty(queue: &'a UBQ<T, B>) -> Self {
         Self {
             queue,
             block: null_mut(),
@@ -471,7 +486,7 @@ impl<'a, T, const BLOCK_SIZE: usize, B: BackoffPolicy> UBQIter<'a, T, BLOCK_SIZE
     }
 }
 
-impl<'a, T, const BLOCK_SIZE: usize, B: BackoffPolicy> Iterator for UBQIter<'a, T, BLOCK_SIZE, B> {
+impl<'a, T, B: BackoffPolicy> Iterator for UBQIter<'a, T, B> {
     type Item = T;
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -479,6 +494,7 @@ impl<'a, T, const BLOCK_SIZE: usize, B: BackoffPolicy> Iterator for UBQIter<'a, 
     }
 
     fn next(&mut self) -> Option<Self::Item> {
+        let block_length = self.queue.block_length();
         let backoff = B::new();
         while self.len != 0 {
             let block = self.block;
@@ -489,7 +505,7 @@ impl<'a, T, const BLOCK_SIZE: usize, B: BackoffPolicy> Iterator for UBQIter<'a, 
             self.index += 1;
             self.len -= 1;
 
-            if self.index == BLOCK_SIZE {
+            if self.index == block_length {
                 self.block = bref.next().load(Acquire);
                 self.index = 0;
             }
@@ -534,109 +550,3 @@ impl<T> Iterator for FalseIterator<T> {
         None
     }
 }
-
-// /// Guaranteed exclusive access to the slot represented by [left..right]; right is past
-// /// the terminal slot, giving left == right => EMPTY. Otherwise, as pops happen,
-// /// left will traverse the singly linked list of blocks in search of right, returning
-// /// blocks to the queue's pool as they are consumed.
-// pub struct TransBlockIter<'a, T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A> {
-//     queue: &'a UBQ<T, B, POOL, BLOCK_SIZE, A>,
-//     max_size: usize,
-//     right: usize,
-//     left: usize,
-// }
-
-// impl<'a, T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A>
-//     TransBlockIter<'a, T, B, POOL, BLOCK_SIZE, A>
-// {
-//     fn empty(queue: &'a UBQ<T, B, POOL, BLOCK_SIZE, A>) -> Self {
-//         let zero = Head::<T, BLOCK_SIZE, A>::zero().pack();
-
-//         Self {
-//             queue,
-//             max_size: 0,
-//             right: zero,
-//             left: zero,
-//         }
-//     }
-
-//     fn new(
-//         queue: &'a UBQ<T, B, POOL, BLOCK_SIZE, A>,
-//         left: Head<T, BLOCK_SIZE, A>,
-//         right: Head<T, BLOCK_SIZE, A>,
-//         max_size: usize,
-//     ) -> Self {
-//         Self {
-//             queue,
-//             max_size,
-//             right: right.pack(),
-//             left: left.pack(),
-//         }
-//     }
-// }
-
-// impl<'a, T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A> Drop
-//     for TransBlockIter<'a, T, B, POOL, BLOCK_SIZE, A>
-// {
-//     fn drop(&mut self) {
-//         while self.max_size != 0 {
-//             let _ = self.next();
-//         }
-//     }
-// }
-
-// impl<'a, T, B: BackoffPolicy, const POOL: usize, const BLOCK_SIZE: usize, A> Iterator
-//     for TransBlockIter<'a, T, B, POOL, BLOCK_SIZE, A>
-// {
-//     type Item = T;
-
-//     fn next(&mut self) -> Option<Self::Item> {
-//         let backoff = B::new();
-
-//         while self.left != self.right {
-//             let mut left = Head::<T, BLOCK_SIZE, A>::new(self.left);
-//             let block = left.block;
-//             let slot = unsafe { (*block).slots.get_unchecked(left.index) };
-
-//             left.index += 1;
-//             self.max_size -= 1;
-
-//             // Cache the successor before this slot can make us the last
-//             // consumer and allow the current block to be reset and recycled.
-//             if left.index == BLOCK_SIZE {
-//                 left = Head {
-//                     block: loop {
-//                         let next = unsafe { (*block).next.load(Acquire) };
-
-//                         if !next.is_null() {
-//                             break next;
-//                         }
-
-//                         backoff.snooze();
-//                     },
-//                     index: 0,
-//                 };
-//             }
-
-//             self.left = left.pack();
-
-//             let slot = slot.busy_wait_state(&backoff);
-//             let out = (slot.state.load(Acquire) != SKIP)
-//                 .then(|| unsafe { slot.value.get().read().assume_init() });
-
-//             if unsafe { (*block).consumed.fetch_add(1, AcqRel) } + 1 == BLOCK_SIZE {
-//                 self.queue.give_to_pool(Block::reset(block));
-//             }
-
-//             if out.is_some() {
-//                 return out;
-//             }
-//         }
-
-//         None
-//     }
-
-//     fn size_hint(&self) -> (usize, Option<usize>) {
-//         (0, Some(self.max_size))
-//     }
-// }

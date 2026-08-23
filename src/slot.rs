@@ -19,6 +19,13 @@ pub struct Slot<T> {
 }
 
 impl<T> Slot<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+            state: AtomicU8::new(ZERO),
+        }
+    }
+
     fn acquire_state(&self) -> u8 {
         self.state.load(Acquire)
     }

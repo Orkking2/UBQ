@@ -10,12 +10,28 @@ use std::{
     vec::Vec,
 };
 
-use crate::{DEFAULT_BLOCK_SIZE, UBQ, backoff};
+use crate::{UBQ, backoff};
+
+#[test]
+fn block_length_is_derived_from_one_page() {
+    let queue = UBQ::<usize>::new();
+    let block_length = queue.block_length();
+    assert!(block_length > 0);
+
+    let count = block_length + 3;
+    queue.push_batch(0..count);
+    assert_eq!(
+        queue.pop_batch(count).collect::<Vec<_>>(),
+        (0..count).collect::<Vec<_>>()
+    );
+}
 
 #[test]
 fn drop_releases_all_enqueued_values() {
     let token = Arc::new(());
-    let n = (DEFAULT_BLOCK_SIZE * 3) + 7;
+    let queue = UBQ::<Arc<()>>::new();
+    let n = (queue.block_length() * 3) + 7;
+    drop(queue);
 
     for _ in 0..16 {
         let q = UBQ::<Arc<()>>::new();
@@ -51,7 +67,7 @@ fn fill_drain_ordered() {
 #[test]
 fn refill_drain_recycled_blocks() {
     let q = UBQ::<(usize, usize)>::new();
-    let per_round = DEFAULT_BLOCK_SIZE * 3 + 17;
+    let per_round = q.block_length() * 3 + 17;
 
     for round in 0..64 {
         for i in 0..per_round {
@@ -137,36 +153,6 @@ fn mpmc() {
 }
 
 #[test]
-fn configured_queue_supports_non_default_block() {
-    let q = UBQ::<u64, 127>::new();
-
-    for i in 0..10_000 {
-        q.push(i);
-    }
-
-    for i in 0..10_000 {
-        assert_eq!(q.pop(), Some(i));
-    }
-
-    assert_eq!(q.pop(), None);
-}
-
-#[test]
-fn configured_queue_supports_arbitrary_block() {
-    let q = UBQ::<u64, 100>::new();
-
-    for i in 0..2_000 {
-        q.push(i);
-    }
-
-    for i in 0..2_000 {
-        assert_eq!(q.pop(), Some(i));
-    }
-
-    assert_eq!(q.pop(), None);
-}
-
-#[test]
 fn default_queue_uses_public_ubq_type() {
     let q = UBQ::<u64>::new();
     q.push(9);
@@ -174,8 +160,8 @@ fn default_queue_uses_public_ubq_type() {
 }
 
 #[test]
-fn queue_accepts_explicit_block_and_backoff() {
-    let q = UBQ::<u64, 127, backoff::Yield>::new();
+fn queue_accepts_explicit_backoff() {
+    let q = UBQ::<u64, backoff::Yield>::new();
 
     q.push(11);
     assert_eq!(q.pop(), Some(11));
@@ -183,7 +169,7 @@ fn queue_accepts_explicit_block_and_backoff() {
 
 #[test]
 fn queue_arc_constructor_uses_explicit_configuration() {
-    let q = UBQ::<u64, 100, backoff::Crossbeam>::new_arc();
+    let q = UBQ::<u64, backoff::Crossbeam>::new_arc();
 
     q.push(13);
     assert_eq!(q.pop(), Some(13));

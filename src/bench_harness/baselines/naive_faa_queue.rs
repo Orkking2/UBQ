@@ -27,7 +27,7 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::bench_harness::{BenchQueue, BenchQueueOps, LogQueue, LogQueueOps, LogRecord};
 

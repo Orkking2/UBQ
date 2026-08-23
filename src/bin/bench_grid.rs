@@ -21,7 +21,7 @@ struct Args {
     #[arg(long, default_value = DEFAULT_RUNS_DIR)]
     runs_dir: PathBuf,
 
-    #[arg(long, default_value = "ubq,segqueue,concurrent-queue")]
+    #[arg(long, default_value = "ubq,lubq,segqueue,concurrent-queue")]
     queues: String,
 
     /// Explicit selectors; omitted runs every feasible power-of-two producer/consumer pair.
@@ -41,7 +41,7 @@ struct Args {
     #[arg(long)]
     parallelism: Option<usize>,
 
-    /// Comma-separated UBQ/SegQueue batch sizes; scalar runs are always included.
+    /// Comma-separated UBQ/LUBQ/SegQueue batch sizes; scalar runs are always included.
     #[arg(
         long,
         value_delimiter = ',',
@@ -49,10 +49,6 @@ struct Args {
         default_values_t = DEFAULT_UBQ_BATCH_SIZES
     )]
     batch_sizes: Vec<usize>,
-
-    /// Use all 16 static-UBQ block/backoff variants.
-    #[arg(short = 'd', long)]
-    dense: bool,
 
     /// Ignore existing data for this machine-label and recompute everything,
     /// instead of greedily reusing samples already recorded under it.
@@ -148,17 +144,12 @@ fn main() {
         let lfqueue_segment_sizes =
             parse_lfqueue_segment_sizes(args.lfqueue_segment_sizes.as_deref())?;
         let wcq_capacities = parse_wcq_capacities(args.wcq_capacities.as_deref())?;
-        let grid = if args.dense {
-            UbqGrid::Dense
-        } else {
-            UbqGrid::Sparse
-        };
         let mut plan = build_grid_matrix_plan(
             machine_label,
             args.runs_dir.clone(),
             available_parallelism,
             &queues,
-            grid,
+            UbqGrid::Page,
             &args.batch_sizes,
             &fastfifo_block_sizes,
             &lfqueue_segment_sizes,
@@ -210,9 +201,8 @@ fn main() {
         );
         if includes_ubq {
             println!(
-                "static UBQ grid: {} ({} configurations before constraints)",
-                grid.name(),
-                grid.labels().len()
+                "static UBQ variants: page-derived ({} backoff configurations before constraints)",
+                UbqGrid::Page.labels().len()
             );
             println!(
                 "throughput variants per UBQ configuration: {} (scalar-compatible + {} batch sizes)",
@@ -221,7 +211,7 @@ fn main() {
             );
         }
         println!(
-            "queue batch sizes (UBQ/SegQueue): {}",
+            "queue batch sizes (UBQ/LUBQ/SegQueue): {}",
             plan.ubq_batch_sizes
                 .iter()
                 .map(|size| size.to_string())
@@ -266,10 +256,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sparse_is_the_default_grid() {
+    fn page_sized_backoff_variants_are_the_default() {
         let args =
             Args::try_parse_from(["bench_grid", "--machine-label", "local"]).expect("arguments");
-        assert!(!args.dense);
         assert!(!args.rerun);
         assert_eq!(args.repeats, 3);
         assert_eq!(args.schedule_seed, DEFAULT_SCHEDULE_SEED);
@@ -279,12 +268,8 @@ mod tests {
     }
 
     #[test]
-    fn short_dense_flag_and_rerun_are_supported() {
-        let args =
-            Args::try_parse_from(["bench_grid", "--machine-label", "local", "-d", "--rerun"])
-                .expect("arguments");
-        assert!(args.dense);
-        assert!(args.rerun);
+    fn removed_dense_flag_is_rejected() {
+        assert!(Args::try_parse_from(["bench_grid", "--machine-label", "local", "-d"]).is_err());
     }
 
     #[test]

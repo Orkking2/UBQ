@@ -69,9 +69,10 @@ The following BBQ paper figures are not reproduced directly by this harness:
 - `figure_self_feat_faa_lse.pdf` and `figure_self_feat_dynamic_size.pdf`:
   BBQ implementation feature ablations do not map to current UBQ knobs, though
   UBQ label sweeps can still be plotted as variant comparisons.
-- `figure_self_blknum_{thpt,lat}_mpsc.pdf`: block-size sweeps can be approximated
-  by running several `fastfifo_*` sizes and UBQ block labels, but there is not
-  yet a dedicated block-size x-axis plot.
+- `figure_self_blknum_{thpt,lat}_mpsc.pdf`: RBBQ block-size sweeps can be
+  approximated by running several `fastfifo_*` sizes. UBQ now always derives
+  its capacity from one system base page, so it has no corresponding block-size
+  sweep.
 - `figure_dpdk.pdf` and `figure_disruptor_x86.pdf`: application benchmarks are
   outside the microbenchmark harness.
 - `figure_io_uring_*.pdf`: covered by the dedicated three-thread SQ/CQ
@@ -83,7 +84,7 @@ Example direct run:
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_matrix -- \
   --machine-label local \
   --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq \
-  --ubq-label balanced,1,127,crossbeam \
+  --ubq-label balanced,1,page,crossbeam \
   --scenarios bbq-atc22-x86-88t \
   --modes throughput,complex_throughput,data_latency,fairness \
   --items-per-producer 1000000 \
@@ -96,7 +97,7 @@ Example oversubscription run on a 12-hyperthread machine:
 cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq --bin bench_matrix -- \
   --machine-label x86-12t \
   --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue \
-  --ubq-label balanced,1,127,crossbeam \
+  --ubq-label balanced,1,page,crossbeam \
   --scenarios bbq-atc22-oversub-x86-12t \
   --modes throughput,complex_throughput \
   --items-per-producer 1000000 \
@@ -116,7 +117,6 @@ cargo run --release --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq
   --repeats 3
 ```
 
-For reproducible UBQ variation coverage, use `bench_grid`; it defaults to the
-sparse grid, with `-d` selecting the dense grid. For fixed paper-style
-comparisons, use `bench_matrix` with explicit `--ubq-label` values for each UBQ
-variant you want in the paper plots.
+For reproducible UBQ variation coverage, use `bench_grid`; it runs both backoff
+policies with page-derived block capacity. For a fixed paper-style comparison,
+use `bench_matrix` with an explicit `--ubq-label`.

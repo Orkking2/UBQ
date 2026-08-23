@@ -29,7 +29,7 @@ use ubq::{UBQ, backoff};
 
 const CHILD_ENV: &str = "UBQ_ABA_CHILD";
 const DEFAULT_TRIALS: usize = 50;
-const DEFAULT_ITEMS: usize = 2048;
+const DEFAULT_ITEMS: usize = 16_384;
 const DEFAULT_IN_FLIGHT: usize = 2;
 const DEFAULT_TIMEOUT_MS: u64 = 1000;
 const DEFAULT_STOP_AFTER_OBSERVED: usize = 10;
@@ -109,7 +109,7 @@ fn recycled_block_aba_child_process() {
 }
 
 fn run_public_api_worst_case(items: usize, consumers: usize, in_flight: usize) {
-    type Q = UBQ<u64, 1, backoff::Yield>;
+    type Q = UBQ<u64, backoff::Yield>;
 
     let q = Arc::new(Q::new());
     let seen = Arc::new((0..items).map(|_| AtomicU8::new(0)).collect::<Vec<_>>());

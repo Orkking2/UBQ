@@ -7,14 +7,14 @@ use std::{
 };
 use ubq::{UBQ, backoff};
 
-type TinyQueue<T> = UBQ<T, 7, backoff::Crossbeam>;
+type PageQueue<T> = UBQ<T, backoff::Crossbeam>;
 
 #[test]
 fn empty_single_and_varied_batch_lengths_preserve_fifo_order() {
     const LENGTHS: &[usize] = &[0, 1, 2, 6, 7, 8, 13, 14, 15, 22, 23, 64];
 
     for &len in LENGTHS {
-        let q = TinyQueue::new();
+        let q = PageQueue::new();
         q.push_batch(0..len);
 
         for expected in 0..len {
@@ -27,17 +27,19 @@ fn empty_single_and_varied_batch_lengths_preserve_fifo_order() {
 
 #[test]
 fn batches_work_from_every_offset_and_across_multiple_blocks() {
-    const BATCH_LEN: usize = 23;
+    let probe = PageQueue::<usize>::new();
+    let block_length = probe.block_length();
+    let batch_len = 23;
 
-    for prefix in 0..TinyQueue::<usize>::BLOCK_LENGTH {
-        let q = TinyQueue::new();
+    for prefix in [0, 1, block_length / 2, block_length - 1] {
+        let q = PageQueue::new();
 
         for value in 0..prefix {
             q.push(value);
         }
-        q.push_batch(prefix..prefix + BATCH_LEN);
+        q.push_batch(prefix..prefix + batch_len);
 
-        for expected in 0..prefix + BATCH_LEN {
+        for expected in 0..prefix + batch_len {
             assert_eq!(q.pop(), Some(expected), "starting offset {prefix}");
         }
         assert_eq!(q.pop(), None, "starting offset {prefix}");
@@ -46,7 +48,7 @@ fn batches_work_from_every_offset_and_across_multiple_blocks() {
 
 #[test]
 fn scalar_and_batched_pushes_can_be_mixed_at_boundaries() {
-    let q = TinyQueue::new();
+    let q = PageQueue::new();
 
     q.push(0);
     q.push_batch(1..7);
@@ -65,7 +67,7 @@ fn scalar_and_batched_pushes_can_be_mixed_at_boundaries() {
 fn blocks_can_be_recycled_across_many_batched_rounds() {
     const ITEMS_PER_ROUND: usize = 53;
 
-    let q = TinyQueue::new();
+    let q = PageQueue::new();
     for round in 0..100 {
         let base = round * ITEMS_PER_ROUND;
         let end = base + ITEMS_PER_ROUND;
@@ -83,7 +85,7 @@ fn blocks_can_be_recycled_across_many_batched_rounds() {
 #[test]
 fn dropping_queue_releases_all_batched_values() {
     let token = Arc::new(());
-    let q = TinyQueue::new();
+    let q = PageQueue::new();
     let values = (0..25).map(|_| Arc::clone(&token)).collect::<Vec<_>>();
 
     q.push_batch(values);
@@ -100,12 +102,12 @@ fn dropping_queue_releases_all_batched_values() {
 
 #[test]
 fn zero_sized_and_large_values_cross_block_boundaries() {
-    let zst = TinyQueue::new();
+    let zst = PageQueue::new();
     zst.push_batch([(); 25]);
     assert_eq!((0..25).filter_map(|_| zst.pop()).count(), 25);
     assert_eq!(zst.pop(), None);
 
-    let large = TinyQueue::new();
+    let large = PageQueue::new();
     large.push_batch((0_u8..25).map(|value| [value; 256]));
     for expected in 0_u8..25 {
         assert_eq!(large.pop(), Some([expected; 256]));
@@ -119,7 +121,7 @@ fn concurrent_batches_are_never_interleaved() {
     const BATCHES: usize = 250;
     const BATCH_LEN: usize = 11;
 
-    let q = Arc::new(TinyQueue::new());
+    let q = Arc::new(PageQueue::new());
     let producers = (0..PRODUCERS)
         .map(|producer| {
             let q = Arc::clone(&q);
@@ -152,7 +154,7 @@ fn mixed_concurrent_producers_deliver_every_item_once() {
     const ITEMS_PER_PRODUCER: usize = 5_000;
     const TOTAL: usize = PRODUCERS * ITEMS_PER_PRODUCER;
 
-    let q = Arc::new(TinyQueue::new());
+    let q = Arc::new(PageQueue::new());
     let producers = (0..PRODUCERS)
         .map(|producer| {
             let q = Arc::clone(&q);
@@ -196,7 +198,7 @@ fn batched_mpmc_delivers_every_item_once() {
     const ITEMS_PER_PRODUCER: usize = 10_000;
     const TOTAL: usize = PRODUCERS * ITEMS_PER_PRODUCER;
 
-    let q: Arc<TinyQueue<usize>> = Arc::new(TinyQueue::new());
+    let q: Arc<PageQueue<usize>> = Arc::new(PageQueue::new());
     let consumed = Arc::new(AtomicUsize::new(0));
     let seen: Arc<Vec<AtomicUsize>> = Arc::new((0..TOTAL).map(|_| AtomicUsize::new(0)).collect());
 

@@ -2,6 +2,23 @@
 
 All notable changes to UBQ are documented in this file.
 
+## Unreleased
+
+### Changed
+
+- UBQ block capacity is derived from the number of `Slot<T>` values that fit
+  in one system base page. `UBQ<T, B>` now has only the element and backoff type
+  parameters.
+- Benchmark and JNI registries expose only the page-sized Crossbeam and yield
+  backoff variants. Historical numeric result labels remain readable and
+  normalize to the corresponding `page` label.
+
+### Removed
+
+- The public `DEFAULT_BLOCK_SIZE` constant and the `BLOCK_SIZE` const generic.
+- The misleading `huge-heap` UBQ plot family and live huge-block benchmark
+  variant.
+
 ## 5.0.0 - 2026-07-17
 
 ### Added

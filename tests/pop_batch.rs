@@ -7,11 +7,11 @@ use std::{
 };
 use ubq::{UBQ, backoff};
 
-type TinyQueue<T> = UBQ<T, 7, backoff::Crossbeam>;
+type PageQueue<T> = UBQ<T, backoff::Crossbeam>;
 
 #[test]
 fn empty_zero_and_oversized_requests_stop_at_the_producer_frontier() {
-    let queue = TinyQueue::new();
+    let queue = PageQueue::new();
 
     assert_eq!(queue.pop_batch(0).next(), None);
     assert_eq!(queue.pop_batch(3).next(), None);
@@ -28,31 +28,35 @@ fn empty_zero_and_oversized_requests_stop_at_the_producer_frontier() {
 
 #[test]
 fn reservations_cross_multiple_fixed_blocks_and_preserve_fifo_order() {
-    let queue = TinyQueue::new();
-
-    queue.push_batch(0..31);
+    let queue = PageQueue::new();
+    let block_length = queue.block_length();
+    let total = block_length * 3 + 3;
+    queue.push_batch(0..total);
 
     assert_eq!(
-        queue.pop_batch(3).collect::<Vec<_>>(),
-        (0..3).collect::<Vec<_>>()
+        queue.pop_batch(block_length - 1).collect::<Vec<_>>(),
+        (0..block_length - 1).collect::<Vec<_>>()
     );
     assert_eq!(
-        queue.pop_batch(19).collect::<Vec<_>>(),
-        (3..22).collect::<Vec<_>>()
+        queue.pop_batch(block_length + 2).collect::<Vec<_>>(),
+        (block_length - 1..block_length * 2 + 1).collect::<Vec<_>>()
     );
     assert_eq!(
-        queue.pop_batch(20).collect::<Vec<_>>(),
-        (22..31).collect::<Vec<_>>()
+        queue.pop_batch(total).collect::<Vec<_>>(),
+        (block_length * 2 + 1..total).collect::<Vec<_>>()
     );
     assert!(queue.is_empty());
 }
 
 #[test]
 fn every_start_offset_and_boundary_endpoint_interoperate_with_scalar_pop() {
-    for prefix in 0..TinyQueue::<usize>::BLOCK_LENGTH {
-        for request in 1..=TinyQueue::<usize>::BLOCK_LENGTH * 3 {
-            let queue = TinyQueue::new();
-            queue.push_batch(0..40);
+    let probe = PageQueue::<usize>::new();
+    let block_length = probe.block_length();
+    for prefix in [0, 1, block_length - 1, block_length, block_length + 1] {
+        for request in [1, block_length - 1, block_length, block_length + 1] {
+            let queue = PageQueue::new();
+            let total = prefix + request + 1;
+            queue.push_batch(0..total);
 
             assert_eq!(
                 queue.pop_batch(prefix).collect::<Vec<_>>(),
@@ -69,7 +73,7 @@ fn every_start_offset_and_boundary_endpoint_interoperate_with_scalar_pop() {
 
 #[test]
 fn skipped_positions_do_not_appear_as_items() {
-    let queue = TinyQueue::new();
+    let queue = PageQueue::new();
 
     queue.push_batch(ShortExactSize {
         values: 10..12,
@@ -84,7 +88,7 @@ fn skipped_positions_do_not_appear_as_items() {
 #[test]
 fn dropping_an_iterator_drains_its_entire_reservation() {
     let dropped = Arc::new(AtomicUsize::new(0));
-    let queue = TinyQueue::new();
+    let queue = PageQueue::new();
 
     queue.push_batch((0..20).map(|_| DropCounter(Arc::clone(&dropped))));
 
@@ -104,7 +108,7 @@ fn concurrent_batch_consumers_deliver_every_item_once() {
     const CONSUMERS: usize = 4;
     const ITEMS: usize = 20_000;
 
-    let queue: Arc<TinyQueue<usize>> = Arc::new(TinyQueue::new());
+    let queue: Arc<PageQueue<usize>> = Arc::new(PageQueue::new());
     queue.push_batch(0..ITEMS);
 
     let seen = Arc::new((0..ITEMS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
@@ -151,7 +155,7 @@ fn concurrent_batched_producers_and_consumers_deliver_every_item_once() {
     const ITEMS_PER_PRODUCER: usize = 4_000;
     const ITEMS: usize = PRODUCERS * ITEMS_PER_PRODUCER;
 
-    let queue: Arc<TinyQueue<usize>> = Arc::new(TinyQueue::new());
+    let queue: Arc<PageQueue<usize>> = Arc::new(PageQueue::new());
     let seen = Arc::new((0..ITEMS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
     let consumed = Arc::new(AtomicUsize::new(0));
 

@@ -117,14 +117,14 @@ sbatch \
     --cpus-per-task="$cpus" \
     --exclusive \
     "${extra_sbatch_args[@]+"${extra_sbatch_args[@]}"}" \
-    --time=02:00:00 \
+    --time=04:00:00 \
     --array="0-$((scenario_count - 1))" \
     "${dependency_args[@]+"${dependency_args[@]}"}" \
     --job-name="ubq-$cluster" \
     --output="$UBQ/logs/$cluster-%A_%a.out" \
     --error="$UBQ/logs/$cluster-%A_%a.err" \
     "$UBQ/slurm/bench_grid_array.sbatch" \
-    "$UBQ/src" \
+    "$UBQ" \
     "$UBQ/artifacts/$cluster/bench_grid" \
     "$manifest" \
     "$UBQ/bench_results/runs" \

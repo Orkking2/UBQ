@@ -24,6 +24,7 @@ if ((index >= ${#scenarios[@]})); then
 fi
 
 scenario=${scenarios[$index]}
+queue_set=ubq,lubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq,mutex-vecdeque,ms-queue,moodycamel-cq
 
 if [[ ! "$scenario" =~ ^[0-9]+p[0-9]+c$ ]]; then
     echo "Invalid scenario: $scenario" >&2
@@ -46,6 +47,7 @@ install -m 0755 "$binary" "$TMPDIR/bench_grid"
     date --iso-8601=seconds
     hostname
     printf 'scenario=%s\n' "$scenario"
+    printf 'queues=%s\n' "$queue_set"
     sha256sum "$TMPDIR/bench_grid"
     lscpu
     env | LC_ALL=C sort | sed -n '/^SLURM_/p'
@@ -62,6 +64,11 @@ export RUST_BACKTRACE=1
 # demonstrate livelock under contention rather than produce a comparable
 # throughput number, and its own timeout needs are much tighter than the
 # rest of this grid's. Run it separately (own --job-timeout-secs) if wanted.
+#
+# --batch-sizes: 131072 and 262144 were added on top of the existing sweep
+#   specifically to reach into massive-batch territory. Both substantially
+#   exceed the effective page capacity, so each push_batch crosses many block
+#   boundaries.
 srun \
   --ntasks=1 \
   --cpus-per-task="$SLURM_CPUS_PER_TASK" \
@@ -72,10 +79,10 @@ srun \
     --runs-dir "$runs_root" \
     --parallelism "$SLURM_CPUS_PER_TASK" \
     --scenarios "$scenario" \
-    --queues ubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq,mutex-vecdeque,ms-queue,moodycamel-cq \
+    --queues "$queue_set" \
     --modes throughput \
     --repeats 3 \
-    --batch-sizes 2,8,16,64,256,1024,4096 \
+    --batch-sizes 2,8,16,64,256,1024,4096,16384,65536,131072,262144 \
     --fastfifo-block-sizes 64,256,1024,4096 \
     --fastfifo-capacities 1048576 \
     --lfqueue-segment-sizes 32,256,1024 \

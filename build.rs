@@ -1,13 +1,6 @@
 use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
 
-// The public label retains a fixed `1` in the former pool position for
-// compatibility with existing result-processing tools. UBQ now owns its
-// single-block recycle slot internally.
-const PRESET_INFO: &[(&str, &[u8])] = &[("balanced", &[1])];
-
-const BLOCK_INFO: &[u16] = &[31, 63, 127, 255, 511, 1023, 2047, 4095];
-
 const BACKOFF_INFO: &[(&str, &str)] = &[
     ("crossbeam", "backoff::Crossbeam"),
     ("yield", "backoff::Yield"),
@@ -43,7 +36,11 @@ fn main() {
              \x20\x20\x20\x20_mode: Mode,\n\
              \x20\x20\x20\x20_items_per_producer: u64,\n\
              \x20\x20\x20\x20_batch_size: Option<usize>,\n\
-             ) -> Option<JobFactory> { None }\n",
+             ) -> Option<JobFactory> { None }\n\
+             fn lookup_ubq_handoff_profile(\n\
+             \x20\x20\x20\x20_label: &str,\n\
+             \x20\x20\x20\x20_config: &HandoffProfileConfig,\n\
+             ) -> Option<Result<HandoffProfileResult, String>> { None }\n",
         )
         .expect("failed to write bench_registry.rs stub");
         return;
@@ -61,22 +58,37 @@ fn main() {
     writeln!(code, ") -> Option<JobFactory> {{").unwrap();
     writeln!(code, "    match label {{").unwrap();
 
-    for &(preset, pool_values) in PRESET_INFO {
-        for &pool in pool_values {
-            for &block in BLOCK_INFO {
-                for &(backoff_name, backoff_ty) in BACKOFF_INFO {
-                    let label_str = format!("{},{},{},{}", preset, pool, block, backoff_name);
-                    let value_type_expr = format!("UBQ<u64, {block}, {backoff_ty}>");
-                    let log_type_expr = format!("UBQ<LogRecord, {block}, {backoff_ty}>");
-                    writeln!(
-                        code,
-                        "        {:?} => Some(make_ubq_job_factory::<{value_type_expr}, {log_type_expr}>(label, scenario, repeat_index, mode, items_per_producer, batch_size)),",
-                        label_str,
-                    )
-                    .unwrap();
-                }
-            }
-        }
+    for &(backoff_name, backoff_ty) in BACKOFF_INFO {
+        let label_str = format!("balanced,1,page,{backoff_name}");
+        let value_type_expr = format!("UBQ<u64, {backoff_ty}>");
+        let log_type_expr = format!("UBQ<LogRecord, {backoff_ty}>");
+        writeln!(
+            code,
+            "        {:?} => Some(make_ubq_job_factory::<{value_type_expr}, {log_type_expr}>(label, scenario, repeat_index, mode, items_per_producer, batch_size)),",
+            label_str,
+        )
+        .unwrap();
+    }
+
+    writeln!(code, "        _ => None,").unwrap();
+    writeln!(code, "    }}").unwrap();
+    writeln!(code, "}}").unwrap();
+
+    writeln!(code, "fn lookup_ubq_handoff_profile(").unwrap();
+    writeln!(code, "    label: &str,").unwrap();
+    writeln!(code, "    config: &HandoffProfileConfig,").unwrap();
+    writeln!(code, ") -> Option<Result<HandoffProfileResult, String>> {{").unwrap();
+    writeln!(code, "    match label {{").unwrap();
+
+    for &(backoff_name, backoff_ty) in BACKOFF_INFO {
+        let label_str = format!("balanced,1,page,{backoff_name}");
+        let value_type_expr = format!("UBQ<u64, {backoff_ty}>");
+        writeln!(
+            code,
+            "        {:?} => Some(profile_handoff_for::<{value_type_expr}>(\"ubq\", Some(label), config)),",
+            label_str,
+        )
+        .unwrap();
     }
 
     writeln!(code, "        _ => None,").unwrap();

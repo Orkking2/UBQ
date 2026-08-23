@@ -21,13 +21,15 @@ use ubq::{UBQ, backoff};
 const DEFAULT_QUEUES: &str = "io-uring,bbq,ubq";
 const DEFAULT_SQ_SIZES: &str = "32,1024";
 const DEFAULT_BATCH_MODES: &str = "fixed1,random1to32";
-const DEFAULT_UBQ_LABEL: &str = "balanced,1,2047,crossbeam";
+const DEFAULT_UBQ_LABEL: &str = "balanced,1,page,crossbeam";
 const DEFAULT_REQUESTS: u64 = 1_000_000;
 const DEFAULT_REPEATS: usize = 10;
 const DEFAULT_BBQ_BLOCK_SIZE: usize = 64;
 const DEFAULT_CQ_MULTIPLIER: usize = 2;
 
-const UBQ_BLOCK_VALUES: [u16; 8] = [31, 63, 127, 255, 511, 1023, 2047, 4095];
+const LEGACY_UBQ_BLOCK_VALUES: [u16; 12] = [
+    31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65535,
+];
 const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
 
 #[derive(Parser, Debug)]
@@ -55,6 +57,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_BBQ_BLOCK_SIZE)]
     bbq_block_size: usize,
 
+    /// UBQ backoff selection; numeric legacy block labels normalize to `page`.
     #[arg(long, default_value = DEFAULT_UBQ_LABEL)]
     ubq_label: String,
 
@@ -128,7 +131,6 @@ impl BatchMode {
 #[derive(Clone, Debug)]
 struct UbqLabel {
     normalized: String,
-    block: u16,
     backoff: String,
 }
 
@@ -340,7 +342,7 @@ struct BoundedUbq<Q> {
     len: CachePadded<AtomicUsize>,
 }
 
-impl<B, const BLOCK: usize> BenchQueue for BoundedUbq<UBQ<u64, BLOCK, B>>
+impl<B> BenchQueue for BoundedUbq<UBQ<u64, B>>
 where
     B: backoff::BackoffPolicy + 'static,
 {
@@ -531,20 +533,20 @@ fn parse_ubq_label(raw: &str) -> Result<UbqLabel, String> {
     let pool = parts[1]
         .parse::<usize>()
         .map_err(|_| format!("invalid UBQ label '{raw}'"))?;
-    let block = parts[2]
-        .parse::<u16>()
-        .map_err(|_| format!("invalid UBQ label '{raw}'"))?;
+    let block_is_valid = parts[2] == "page"
+        || parts[2]
+            .parse::<u16>()
+            .is_ok_and(|block| LEGACY_UBQ_BLOCK_VALUES.contains(&block));
     let backoff = parts[3].to_string();
     if parts[0] != "balanced"
         || pool != 1
-        || !UBQ_BLOCK_VALUES.contains(&block)
+        || !block_is_valid
         || !UBQ_BACKOFF_VALUES.contains(&backoff.as_str())
     {
         return Err(format!("invalid UBQ label '{raw}'"));
     }
     Ok(UbqLabel {
-        normalized: format!("balanced,{pool},{block},{backoff}"),
-        block,
+        normalized: format!("balanced,{pool},page,{backoff}"),
         backoff,
     })
 }
@@ -832,28 +834,12 @@ fn run_backend<Q: BenchQueue>(queue_label: &str, ctx: &RunContext) -> Result<Vec
     Ok(samples)
 }
 
-macro_rules! dispatch_ubq_block {
-    ($block:expr, $backoff_ty:ty, $queue_label:expr, $ctx:expr) => {
-        match $block {
-            31 => run_backend::<BoundedUbq<UBQ<u64, 31, $backoff_ty>>>($queue_label, $ctx),
-            63 => run_backend::<BoundedUbq<UBQ<u64, 63, $backoff_ty>>>($queue_label, $ctx),
-            127 => run_backend::<BoundedUbq<UBQ<u64, 127, $backoff_ty>>>($queue_label, $ctx),
-            255 => run_backend::<BoundedUbq<UBQ<u64, 255, $backoff_ty>>>($queue_label, $ctx),
-            511 => run_backend::<BoundedUbq<UBQ<u64, 511, $backoff_ty>>>($queue_label, $ctx),
-            1023 => run_backend::<BoundedUbq<UBQ<u64, 1023, $backoff_ty>>>($queue_label, $ctx),
-            2047 => run_backend::<BoundedUbq<UBQ<u64, 2047, $backoff_ty>>>($queue_label, $ctx),
-            4095 => run_backend::<BoundedUbq<UBQ<u64, 4095, $backoff_ty>>>($queue_label, $ctx),
-            _ => Err(format!("unsupported UBQ block size {}", $block)),
-        }
-    };
-}
-
 fn run_ubq(label: &str, ctx: &RunContext) -> Result<Vec<Sample>, String> {
     let label = parse_ubq_label(label)?;
     let queue_label = format!("ubq_{}", label.normalized);
     match label.backoff.as_str() {
-        "crossbeam" => dispatch_ubq_block!(label.block, backoff::Crossbeam, &queue_label, ctx),
-        "yield" => dispatch_ubq_block!(label.block, backoff::Yield, &queue_label, ctx),
+        "crossbeam" => run_backend::<BoundedUbq<UBQ<u64, backoff::Crossbeam>>>(&queue_label, ctx),
+        "yield" => run_backend::<BoundedUbq<UBQ<u64, backoff::Yield>>>(&queue_label, ctx),
         _ => Err(format!("unsupported UBQ backoff {}", label.backoff)),
     }
 }

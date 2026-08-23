@@ -33,8 +33,8 @@ const ITEMS_PER_PRODUCER: u64 = 500;
 /// Drains through `handle` until `producers_done` is set and the queue
 /// reports empty — the same pattern `bench_harness::mod`'s consumer loops
 /// use, not a sentinel value (see module doc comment for why that's unsound
-/// here). `handle` is one thread's own `ProducerToken`/`ConsumerToken` pair
-/// (see `baselines::moodycamel_cq`), never shared with another thread.
+/// here). `handle` owns one thread's `ConsumerToken` and is never shared with
+/// another thread.
 fn drain_until_done(
     handle: &impl BenchQueueThreadOps,
     producers_done: &AtomicBool,
@@ -73,7 +73,7 @@ fn run_throughput_integrity(producers: usize, consumers: usize) {
     let mut handles = Vec::with_capacity(total_threads);
 
     for pid in 0..producers {
-        let handle = q.thread_handle();
+        let handle = q.producer_thread_handle();
         let ready = ready.clone();
         let start = start.clone();
         handles.push(thread::spawn(move || {
@@ -87,7 +87,7 @@ fn run_throughput_integrity(producers: usize, consumers: usize) {
     }
 
     for _ in 0..consumers {
-        let handle = q.thread_handle();
+        let handle = q.consumer_thread_handle();
         let ready = ready.clone();
         let start = start.clone();
         let seen = seen.clone();
@@ -157,7 +157,7 @@ fn run_fill_drain_integrity(producers: usize, consumers: usize) {
         let barrier = Arc::new(Barrier::new(producers + 1));
         let mut handles = Vec::with_capacity(producers);
         for pid in 0..producers {
-            let handle = q.thread_handle();
+            let handle = q.producer_thread_handle();
             let barrier = barrier.clone();
             handles.push(thread::spawn(move || {
                 barrier.wait();
@@ -182,7 +182,7 @@ fn run_fill_drain_integrity(producers: usize, consumers: usize) {
         let barrier = Arc::new(Barrier::new(consumers + 1));
         let mut handles = Vec::with_capacity(consumers);
         for _ in 0..consumers {
-            let handle = q.thread_handle();
+            let handle = q.consumer_thread_handle();
             let barrier = barrier.clone();
             let seen = seen.clone();
             let consumed = consumed.clone();
@@ -238,30 +238,39 @@ fn moodycamel_batch_round_trip() {
     const BATCH_SIZE: usize = 128;
     let total = BATCHES * BATCH_SIZE as u64;
 
-    let handle = MoodycamelQueue::new_handle().thread_handle();
+    let queue = MoodycamelQueue::new_handle();
+    let producer = queue.producer_thread_handle();
+    let consumer = queue.consumer_thread_handle();
     for batch in 0..BATCHES {
-        handle.send_batch(batch * BATCH_SIZE as u64, 0..BATCH_SIZE);
+        producer.send_batch(batch * BATCH_SIZE as u64, 0..BATCH_SIZE);
     }
 
-    let seen: Vec<AtomicBool> = (0..total as usize).map(|_| AtomicBool::new(false)).collect();
+    let seen: Vec<AtomicBool> = (0..total as usize)
+        .map(|_| AtomicBool::new(false))
+        .collect();
     let mut received = 0_usize;
     while received < total as usize {
         let request = BATCH_SIZE.min(total as usize - received);
-        let got = handle.try_recv_batch(request);
-        assert!(got > 0, "try_recv_batch made no progress with items still enqueued");
+        let got = consumer.try_recv_batch(request);
+        assert!(
+            got > 0,
+            "try_recv_batch made no progress with items still enqueued"
+        );
         received += got;
     }
 
     // Re-drain scalar-style to identify exactly which values came back,
     // since try_recv_batch above only reports a count. Re-run the whole
     // scenario scalar-side to check for duplicates/omissions precisely.
-    let handle = MoodycamelQueue::new_handle().thread_handle();
+    let queue = MoodycamelQueue::new_handle();
+    let producer = queue.producer_thread_handle();
+    let consumer = queue.consumer_thread_handle();
     for batch in 0..BATCHES {
-        handle.send_batch(batch * BATCH_SIZE as u64, 0..BATCH_SIZE);
+        producer.send_batch(batch * BATCH_SIZE as u64, 0..BATCH_SIZE);
     }
     let mut drained = Vec::with_capacity(total as usize);
     while (drained.len() as u64) < total {
-        if let Some(v) = handle.try_recv_value() {
+        if let Some(v) = consumer.try_recv_value() {
             drained.push(v);
         }
     }
@@ -275,7 +284,10 @@ fn moodycamel_batch_round_trip() {
         .filter(|(_, seen)| !seen.load(Ordering::Acquire))
         .map(|(idx, _)| idx)
         .collect();
-    assert!(missing.is_empty(), "missing values in batch round trip: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "missing values in batch round trip: {missing:?}"
+    );
 }
 
 macro_rules! moodycamel_throughput_test {

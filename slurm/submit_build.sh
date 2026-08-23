@@ -5,8 +5,8 @@ usage() {
     cat <<'EOF'
 Usage: slurm/submit_build.sh {mn5|grace}
 
-Submit slurm/build.sbatch on the given BSC cluster: compiles bench_grid into
-$UBQ/artifacts/<cluster>/bench_grid. Prints the submitted job id (--parsable)
+Submit slurm/build.sbatch on the given BSC cluster: compiles bench_grid and a
+symbolized/frame-pointer bench_profile into $UBQ/artifacts/<cluster>/. Prints the submitted job id (--parsable)
 so it can be chained into submit_bench_grid.sh via --after.
 
 Env overrides:
@@ -64,5 +64,5 @@ sbatch --parsable \
     --output="$UBQ/logs/build-$cluster-%j.out" \
     --error="$UBQ/logs/build-$cluster-%j.err" \
     "$UBQ/slurm/build.sbatch" \
-    "$UBQ/src" \
+    "$UBQ" \
     "$UBQ/artifacts/$cluster"
