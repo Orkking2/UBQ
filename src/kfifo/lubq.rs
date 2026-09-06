@@ -199,7 +199,7 @@ impl<T, B: BackoffPolicy> Core<T, B> {
 
     fn add_sender(&self) {
         self.senders
-            .fetch_update(Relaxed, Relaxed, |count| count.checked_add(1))
+            .try_update(Relaxed, Relaxed, |count| count.checked_add(1))
             .expect("linked UBQ sender count overflowed");
     }
 }

@@ -1,6 +1,7 @@
 #![allow(missing_docs)]
 
 pub mod baselines;
+pub mod hardware;
 
 use crate::{UBQ, backoff};
 #[cfg(feature = "bench_moodycamel")]
@@ -131,6 +132,11 @@ fn default_schedule_seed() -> u64 {
 
 fn default_fastfifo_capacities() -> Vec<usize> {
     vec![DEFAULT_FASTFIFO_CAPACITY]
+}
+/// Deserialization fallback for plans saved before `lubq_backoffs` existed.
+/// Matches their only actual behavior: the crossbeam backoff policy.
+fn default_lubq_backoffs() -> Vec<LubqBackoff> {
+    vec![LubqBackoff::Crossbeam]
 }
 const UBQ_BACKOFF_VALUES: [&str; 2] = ["crossbeam", "yield"];
 const LEGACY_UBQ_BLOCK_VALUES: [u16; 12] = [
@@ -276,6 +282,17 @@ pub trait LogQueue: LogQueueOps {
 }
 
 pub trait BenchQueueOps: Send + Sync + 'static {
+    /// Diagnostic value visitor. Native batch implementations override this
+    /// so exact-once checks exercise the same reservations as measurements.
+    fn visit_recv_batch(&self, size: usize, visit: &mut dyn FnMut(u64)) -> usize {
+        let mut count = 0;
+        for _ in 0..size {
+            let Some(value) = self.try_recv_value() else { break };
+            visit(value);
+            count += 1;
+        }
+        count
+    }
     fn try_send_value(&self, value: u64) -> bool;
     fn send_value(&self, value: u64) {
         let backoff = Backoff::new();
@@ -315,6 +332,15 @@ pub trait BenchQueueOps: Send + Sync + 'static {
 }
 
 pub trait BenchQueueThreadOps: Send + 'static {
+    fn visit_recv_batch(&self, size: usize, visit: &mut dyn FnMut(u64)) -> usize {
+        let mut count = 0;
+        for _ in 0..size {
+            let Some(value) = self.try_recv_value() else { break };
+            visit(value);
+            count += 1;
+        }
+        count
+    }
     fn try_send_value(&self, value: u64) -> bool;
     fn send_value(&self, value: u64) {
         let backoff = Backoff::new();
@@ -347,6 +373,9 @@ pub trait BenchQueueThreadOps: Send + 'static {
 }
 
 impl<Q: BenchQueueOps> BenchQueueThreadOps for Arc<Q> {
+    fn visit_recv_batch(&self, size: usize, visit: &mut dyn FnMut(u64)) -> usize {
+        (**self).visit_recv_batch(size, visit)
+    }
     fn try_send_value(&self, value: u64) -> bool {
         (**self).try_send_value(value)
     }
@@ -404,6 +433,9 @@ impl<B> BenchQueueOps for UBQ<u64, B>
 where
     B: backoff::BackoffPolicy + 'static,
 {
+    fn visit_recv_batch(&self, size: usize, visit: &mut dyn FnMut(u64)) -> usize {
+        self.pop_batch(size).inspect(|value| visit(*value)).count()
+    }
     fn try_send_value(&self, value: u64) -> bool {
         self.push(value);
         true
@@ -444,21 +476,21 @@ where
     }
 }
 
-struct LubqHandlePool<T> {
-    senders: Mutex<Vec<crate::kfifo::Sender<T>>>,
-    receivers: Mutex<Vec<crate::kfifo::Receiver<T>>>,
+struct LubqHandlePool<T, B: backoff::BackoffPolicy = backoff::Crossbeam> {
+    senders: Mutex<Vec<crate::kfifo::Sender<T, B>>>,
+    receivers: Mutex<Vec<crate::kfifo::Receiver<T, B>>>,
 }
 
-struct LubqBenchQueue<T> {
-    pool: Arc<LubqHandlePool<T>>,
+struct LubqBenchQueue<T, B: backoff::BackoffPolicy = backoff::Crossbeam> {
+    pool: Arc<LubqHandlePool<T, B>>,
 }
 
-impl<T> LubqBenchQueue<T> {
+impl<T, B: backoff::BackoffPolicy> LubqBenchQueue<T, B> {
     fn new(producers: usize, consumers: usize) -> Arc<Self> {
         assert!(producers > 0, "LUBQ requires at least one producer");
         assert!(consumers > 0, "LUBQ requires at least one consumer");
 
-        let (first_sender, first_receiver) = crate::kfifo::channel();
+        let (first_sender, first_receiver) = crate::kfifo::channel_with::<T, B>();
         let mut senders = Vec::with_capacity(producers);
         senders.push(first_sender);
         while senders.len() < producers {
@@ -479,28 +511,28 @@ impl<T> LubqBenchQueue<T> {
     }
 }
 
-enum LubqThreadRole<T> {
-    Producer(crate::kfifo::Sender<T>),
+enum LubqThreadRole<T, B: backoff::BackoffPolicy = backoff::Crossbeam> {
+    Producer(crate::kfifo::Sender<T, B>),
     Consumer {
-        receiver: crate::kfifo::Receiver<T>,
+        receiver: crate::kfifo::Receiver<T, B>,
         batch: Vec<T>,
     },
 }
 
-struct LubqThreadHandle<T> {
-    role: UnsafeCell<Option<LubqThreadRole<T>>>,
-    pool: Arc<LubqHandlePool<T>>,
+struct LubqThreadHandle<T, B: backoff::BackoffPolicy = backoff::Crossbeam> {
+    role: UnsafeCell<Option<LubqThreadRole<T, B>>>,
+    pool: Arc<LubqHandlePool<T, B>>,
 }
 
-impl<T> LubqThreadHandle<T> {
-    fn producer(sender: crate::kfifo::Sender<T>, pool: Arc<LubqHandlePool<T>>) -> Self {
+impl<T, B: backoff::BackoffPolicy> LubqThreadHandle<T, B> {
+    fn producer(sender: crate::kfifo::Sender<T, B>, pool: Arc<LubqHandlePool<T, B>>) -> Self {
         Self {
             role: UnsafeCell::new(Some(LubqThreadRole::Producer(sender))),
             pool,
         }
     }
 
-    fn consumer(receiver: crate::kfifo::Receiver<T>, pool: Arc<LubqHandlePool<T>>) -> Self {
+    fn consumer(receiver: crate::kfifo::Receiver<T, B>, pool: Arc<LubqHandlePool<T, B>>) -> Self {
         Self {
             role: UnsafeCell::new(Some(LubqThreadRole::Consumer {
                 receiver,
@@ -510,7 +542,7 @@ impl<T> LubqThreadHandle<T> {
         }
     }
 
-    fn role_mut(&self) -> &mut LubqThreadRole<T> {
+    fn role_mut(&self) -> &mut LubqThreadRole<T, B> {
         // SAFETY: a benchmark thread handle is Send but deliberately not Sync
         // (because it contains UnsafeCell). The harness moves each handle into
         // exactly one worker and never overlaps operations on that handle.
@@ -518,7 +550,7 @@ impl<T> LubqThreadHandle<T> {
     }
 }
 
-impl<T> Drop for LubqThreadHandle<T> {
+impl<T, B: backoff::BackoffPolicy> Drop for LubqThreadHandle<T, B> {
     fn drop(&mut self) {
         let Some(role) = self.role.get_mut().take() else {
             return;
@@ -540,11 +572,12 @@ impl<T> Drop for LubqThreadHandle<T> {
     }
 }
 
-impl<T: Send + 'static> BenchQueueHandleFactory for LubqBenchQueue<T>
+impl<T: Send + 'static, B: backoff::BackoffPolicy + 'static> BenchQueueHandleFactory
+    for LubqBenchQueue<T, B>
 where
-    LubqThreadHandle<T>: BenchQueueThreadOps,
+    LubqThreadHandle<T, B>: BenchQueueThreadOps,
 {
-    type ThreadHandle = LubqThreadHandle<T>;
+    type ThreadHandle = LubqThreadHandle<T, B>;
 
     fn thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
         panic!("LUBQ benchmark handles must be requested for a producer or consumer role")
@@ -573,7 +606,16 @@ where
     }
 }
 
-impl BenchQueueThreadOps for LubqThreadHandle<u64> {
+impl<B: backoff::BackoffPolicy + 'static> BenchQueueThreadOps for LubqThreadHandle<u64, B> {
+    fn visit_recv_batch(&self, size: usize, visit: &mut dyn FnMut(u64)) -> usize {
+        let LubqThreadRole::Consumer { receiver, batch } = self.role_mut() else {
+            panic!("attempted to receive through a LUBQ producer handle");
+        };
+        batch.clear();
+        let count = receiver.pop_batch_into(batch, size);
+        batch.iter().for_each(|value| visit(*value));
+        count
+    }
     fn try_send_value(&self, value: u64) -> bool {
         let LubqThreadRole::Producer(sender) = self.role_mut() else {
             panic!("attempted to send through a LUBQ consumer handle");
@@ -605,8 +647,8 @@ impl BenchQueueThreadOps for LubqThreadHandle<u64> {
     }
 }
 
-impl LogQueueHandleFactory for LubqBenchQueue<LogRecord> {
-    type ThreadHandle = LubqThreadHandle<LogRecord>;
+impl<B: backoff::BackoffPolicy + 'static> LogQueueHandleFactory for LubqBenchQueue<LogRecord, B> {
+    type ThreadHandle = LubqThreadHandle<LogRecord, B>;
 
     fn log_thread_handle(self: &Arc<Self>) -> Self::ThreadHandle {
         panic!("LUBQ log handles must be requested for a producer or consumer role")
@@ -635,7 +677,7 @@ impl LogQueueHandleFactory for LubqBenchQueue<LogRecord> {
     }
 }
 
-impl LogQueueThreadOps for LubqThreadHandle<LogRecord> {
+impl<B: backoff::BackoffPolicy + 'static> LogQueueThreadOps for LubqThreadHandle<LogRecord, B> {
     fn send_log(&self, record: LogRecord) {
         let LubqThreadRole::Producer(sender) = self.role_mut() else {
             panic!("attempted to send a log record through a LUBQ consumer handle");
@@ -678,6 +720,9 @@ impl BenchQueue for SegQueue<u64> {
 }
 
 impl BenchQueueOps for BatchQueue<u64> {
+    fn visit_recv_batch(&self, size: usize, visit: &mut dyn FnMut(u64)) -> usize {
+        self.pop(size).inspect(|value| visit(*value)).count()
+    }
     fn try_send_value(&self, value: u64) -> bool {
         self.push(core::iter::once(value));
         true
@@ -1242,6 +1287,8 @@ pub struct JobSpec {
     pub lfqueue_segment_size: Option<usize>,
     #[serde(default)]
     pub wcq_capacity: Option<usize>,
+    #[serde(default)]
+    pub lubq_backoff: Option<LubqBackoff>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1283,15 +1330,19 @@ impl JobSpec {
             self.fastfifo_capacity,
             self.lfqueue_segment_size,
             self.wcq_capacity,
+            self.lubq_backoff,
         ) {
-            (QueueKind::Ubq, Some(label), _, _, _, _) => format!("ubq_{label}"),
-            (QueueKind::FastFifo, _, Some(block_size), Some(capacity), _, _) => {
+            (QueueKind::Ubq, Some(label), _, _, _, _, _) => format!("ubq_{label}"),
+            (QueueKind::FastFifo, _, Some(block_size), Some(capacity), _, _, _) => {
                 fastfifo_queue_label(block_size, capacity)
             }
-            (QueueKind::LfQueue, _, _, _, Some(segment_size), _) => {
+            (QueueKind::LfQueue, _, _, _, Some(segment_size), _, _) => {
                 lfqueue_queue_label(segment_size)
             }
-            (QueueKind::Wcq, _, _, _, _, Some(capacity)) => wcq_queue_label(capacity),
+            (QueueKind::Wcq, _, _, _, _, Some(capacity), _) => wcq_queue_label(capacity),
+            (QueueKind::Lubq, _, _, _, _, _, Some(backoff)) => {
+                backoff.queue_implementation_name().to_string()
+            }
             _ => self.queue.name().to_string(),
         }
     }
@@ -1386,6 +1437,8 @@ pub struct MatrixPlan {
     pub lfqueue_segment_sizes: Vec<usize>,
     #[serde(default)]
     pub wcq_capacities: Vec<usize>,
+    #[serde(default = "default_lubq_backoffs")]
+    pub lubq_backoffs: Vec<LubqBackoff>,
     #[serde(default)]
     pub ubq_grid: Option<UbqGrid>,
     #[serde(default)]
@@ -2664,6 +2717,7 @@ pub fn build_direct_matrix_plan(
         fastfifo_capacities: default_fastfifo_capacities(),
         lfqueue_segment_sizes: normalized_lfqueue_segment_sizes,
         wcq_capacities: normalized_wcq_capacities,
+        lubq_backoffs: vec![LubqBackoff::Crossbeam, LubqBackoff::Yield],
         ubq_grid: None,
         ubq_batch_sizes: Vec::new(),
         planned_repeats: repeats,
@@ -2977,7 +3031,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                 if bundle.ubq_label.is_none() {
                     for &baseline_queue in &plan.baseline_queues {
                         match baseline_queue {
-                            QueueKind::SegQueue | QueueKind::Lubq => {
+                            QueueKind::SegQueue => {
                                 let spec = JobSpec {
                                     scenario: bundle.scenario.clone(),
                                     repeat_index: bundle.repeat_index,
@@ -2990,6 +3044,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                     fastfifo_capacity: None,
                                     lfqueue_segment_size: None,
                                     wcq_capacity: None,
+                                    lubq_backoff: None,
                                 };
                                 out.insert(spec.clone());
                                 if *mode == Mode::Throughput {
@@ -2998,6 +3053,33 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                             batch_size: Some(batch_size),
                                             ..spec.clone()
                                         });
+                                    }
+                                }
+                            }
+                            QueueKind::Lubq => {
+                                for &backoff in &plan.lubq_backoffs {
+                                    let spec = JobSpec {
+                                        scenario: bundle.scenario.clone(),
+                                        repeat_index: bundle.repeat_index,
+                                        mode: *mode,
+                                        items_per_producer,
+                                        queue: baseline_queue,
+                                        ubq_label: None,
+                                        batch_size: None,
+                                        fastfifo_block_size: None,
+                                        fastfifo_capacity: None,
+                                        lfqueue_segment_size: None,
+                                        wcq_capacity: None,
+                                        lubq_backoff: Some(backoff),
+                                    };
+                                    out.insert(spec.clone());
+                                    if *mode == Mode::Throughput {
+                                        for &batch_size in &plan.ubq_batch_sizes {
+                                            out.insert(JobSpec {
+                                                batch_size: Some(batch_size),
+                                                ..spec.clone()
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -3014,6 +3096,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                     fastfifo_capacity: None,
                                     lfqueue_segment_size: None,
                                     wcq_capacity: None,
+                                    lubq_backoff: None,
                                 };
                                 out.insert(spec.clone());
                                 if *mode == Mode::Throughput {
@@ -3040,6 +3123,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                             fastfifo_capacity: Some(capacity),
                                             lfqueue_segment_size: None,
                                             wcq_capacity: None,
+                                            lubq_backoff: None,
                                         });
                                     }
                                 }
@@ -3058,6 +3142,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                         fastfifo_capacity: None,
                                         lfqueue_segment_size: Some(segment_size),
                                         wcq_capacity: None,
+                                        lubq_backoff: None,
                                     });
                                 }
                             }
@@ -3081,6 +3166,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                             fastfifo_capacity: None,
                                             lfqueue_segment_size: None,
                                             wcq_capacity: Some(capacity),
+                                            lubq_backoff: None,
                                         });
                                     }
                                 }
@@ -3098,6 +3184,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                     fastfifo_capacity: None,
                                     lfqueue_segment_size: None,
                                     wcq_capacity: None,
+                                    lubq_backoff: None,
                                 };
                                 out.insert(spec.clone());
                                 if *mode == Mode::Throughput {
@@ -3122,6 +3209,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                     fastfifo_capacity: None,
                                     lfqueue_segment_size: None,
                                     wcq_capacity: None,
+                                    lubq_backoff: None,
                                 });
                             }
                         }
@@ -3140,6 +3228,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                         fastfifo_capacity: None,
                         lfqueue_segment_size: None,
                         wcq_capacity: None,
+                        lubq_backoff: None,
                     });
                     if *mode == Mode::Throughput {
                         for &batch_size in &plan.ubq_batch_sizes {
@@ -3155,6 +3244,7 @@ fn required_job_specs(plan: &MatrixPlan) -> BTreeSet<JobSpec> {
                                 fastfifo_capacity: None,
                                 lfqueue_segment_size: None,
                                 wcq_capacity: None,
+                                lubq_backoff: None,
                             });
                         }
                     }
@@ -3188,6 +3278,7 @@ pub fn make_ubq_job_factory<Q: BenchQueue, L: LogQueue>(
         fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
+        lubq_backoff: None,
     };
     let queue_name = "ubq".to_string();
     let run_scenario = scenario.clone();
@@ -3276,6 +3367,7 @@ pub fn make_segqueue_job_factory_variant(
         fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
+        lubq_backoff: None,
     };
     let queue_name = QueueKind::SegQueue.name().to_string();
     let run_scenario = scenario.clone();
@@ -3341,12 +3433,88 @@ pub fn make_segqueue_job_factory_variant(
     JobFactory { spec, run }
 }
 
+/// Runs one LUBQ job's mode dispatch, monomorphized per shard reservation
+/// backoff policy. Factored out of [`make_lubq_job_factory`] so both
+/// [`LubqBackoff`] variants share one written-once match instead of a
+/// hand-duplicated copy per policy.
+fn run_lubq_mode<B: backoff::BackoffPolicy + 'static>(
+    mode: Mode,
+    run_scenario: &ScenarioConfig,
+    items_per_producer: u64,
+    batch_size: Option<usize>,
+    core_offset: usize,
+    queue_name: &str,
+) -> BenchRecord {
+    match mode {
+        Mode::Throughput => bench_throughput_with_queue_variant(
+            LubqBenchQueue::<u64, B>::new(run_scenario.producers, run_scenario.consumers),
+            queue_name,
+            run_scenario,
+            items_per_producer,
+            batch_size,
+            core_offset,
+        ),
+        Mode::ComplexThroughput => bench_complex_throughput_with_queue(
+            LubqBenchQueue::<u64, B>::new(run_scenario.producers, run_scenario.consumers),
+            queue_name,
+            run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::DataLatency => bench_data_latency_with_queue(
+            LubqBenchQueue::<u64, B>::new(run_scenario.producers, run_scenario.consumers),
+            queue_name,
+            run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::Fairness => bench_fairness_with_queue(
+            LubqBenchQueue::<u64, B>::new(run_scenario.producers, run_scenario.consumers),
+            queue_name,
+            run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppLogFanIn => bench_app_log_fan_in_with_queue(
+            LubqBenchQueue::<u64, B>::new(run_scenario.producers, run_scenario.consumers),
+            queue_name,
+            run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppPipeline => bench_app_pipeline_with_queues(
+            LubqBenchQueue::<u64, B>::new(run_scenario.producers, run_scenario.consumers),
+            LubqBenchQueue::<u64, B>::new(run_scenario.consumers, 1),
+            queue_name,
+            run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppTaskRoundtrip => bench_app_task_roundtrip_with_queues(
+            LubqBenchQueue::<u64, B>::new(run_scenario.producers, run_scenario.consumers),
+            LubqBenchQueue::<u64, B>::new(run_scenario.consumers, run_scenario.producers),
+            queue_name,
+            run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+        Mode::AppLogMpscFile => bench_app_log_mpsc_file_with_queue(
+            LubqBenchQueue::<LogRecord, B>::new(run_scenario.producers, 1),
+            queue_name,
+            run_scenario,
+            items_per_producer,
+            core_offset,
+        ),
+    }
+}
+
 pub fn make_lubq_job_factory(
     scenario: ScenarioConfig,
     repeat_index: usize,
     mode: Mode,
     items_per_producer: u64,
     batch_size: Option<usize>,
+    backoff: LubqBackoff,
 ) -> JobFactory {
     assert!(
         batch_size.is_none() || mode == Mode::Throughput,
@@ -3364,68 +3532,26 @@ pub fn make_lubq_job_factory(
         fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
+        lubq_backoff: Some(backoff),
     };
-    let queue_name = QueueKind::Lubq.name().to_string();
+    let queue_name = backoff.queue_implementation_name().to_string();
     let run_scenario = scenario.clone();
-    let run = Arc::new(move |core_offset: usize| match mode {
-        Mode::Throughput => bench_throughput_with_queue_variant(
-            LubqBenchQueue::new(run_scenario.producers, run_scenario.consumers),
-            &queue_name,
+    let run = Arc::new(move |core_offset: usize| match backoff {
+        LubqBackoff::Crossbeam => run_lubq_mode::<backoff::Crossbeam>(
+            mode,
             &run_scenario,
             items_per_producer,
             batch_size,
             core_offset,
-        ),
-        Mode::ComplexThroughput => bench_complex_throughput_with_queue(
-            LubqBenchQueue::new(run_scenario.producers, run_scenario.consumers),
             &queue_name,
+        ),
+        LubqBackoff::Yield => run_lubq_mode::<backoff::Yield>(
+            mode,
             &run_scenario,
             items_per_producer,
+            batch_size,
             core_offset,
-        ),
-        Mode::DataLatency => bench_data_latency_with_queue(
-            LubqBenchQueue::new(run_scenario.producers, run_scenario.consumers),
             &queue_name,
-            &run_scenario,
-            items_per_producer,
-            core_offset,
-        ),
-        Mode::Fairness => bench_fairness_with_queue(
-            LubqBenchQueue::new(run_scenario.producers, run_scenario.consumers),
-            &queue_name,
-            &run_scenario,
-            items_per_producer,
-            core_offset,
-        ),
-        Mode::AppLogFanIn => bench_app_log_fan_in_with_queue(
-            LubqBenchQueue::new(run_scenario.producers, run_scenario.consumers),
-            &queue_name,
-            &run_scenario,
-            items_per_producer,
-            core_offset,
-        ),
-        Mode::AppPipeline => bench_app_pipeline_with_queues(
-            LubqBenchQueue::new(run_scenario.producers, run_scenario.consumers),
-            LubqBenchQueue::new(run_scenario.consumers, 1),
-            &queue_name,
-            &run_scenario,
-            items_per_producer,
-            core_offset,
-        ),
-        Mode::AppTaskRoundtrip => bench_app_task_roundtrip_with_queues(
-            LubqBenchQueue::new(run_scenario.producers, run_scenario.consumers),
-            LubqBenchQueue::new(run_scenario.consumers, run_scenario.producers),
-            &queue_name,
-            &run_scenario,
-            items_per_producer,
-            core_offset,
-        ),
-        Mode::AppLogMpscFile => bench_app_log_mpsc_file_with_queue(
-            LubqBenchQueue::new(run_scenario.producers, 1),
-            &queue_name,
-            &run_scenario,
-            items_per_producer,
-            core_offset,
         ),
     });
     JobFactory { spec, run }
@@ -3449,6 +3575,7 @@ pub fn make_concurrent_queue_job_factory(
         fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
+        lubq_backoff: None,
     };
     let queue_name = QueueKind::ConcurrentQueue.name().to_string();
     let run_scenario = scenario.clone();
@@ -3528,6 +3655,7 @@ pub fn make_mutex_vecdeque_job_factory(
         fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
+        lubq_backoff: None,
     };
     let queue_name = QueueKind::MutexVecDeque.name().to_string();
     let run_scenario = scenario.clone();
@@ -3617,6 +3745,7 @@ pub fn make_moodycamel_job_factory(
         fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
+        lubq_backoff: None,
     };
     let queue_name = QueueKind::MoodycamelConcurrentQueue.name().to_string();
     let run_scenario = scenario.clone();
@@ -3719,6 +3848,7 @@ pub fn make_ms_queue_job_factory(
         fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
+        lubq_backoff: None,
     };
     let queue_name = QueueKind::MsQueue.name().to_string();
     let run_scenario = scenario.clone();
@@ -3793,6 +3923,7 @@ pub fn make_naive_faa_queue_job_factory(
         fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: None,
+        lubq_backoff: None,
     };
     let queue_name = QueueKind::NaiveFaaQueue.name().to_string();
     let run_scenario = scenario.clone();
@@ -3870,6 +4001,7 @@ pub fn make_lfqueue_job_factory(
         fastfifo_capacity: None,
         lfqueue_segment_size: Some(segment_size),
         wcq_capacity: None,
+        lubq_backoff: None,
     };
     let queue_name = lfqueue_queue_label(segment_size);
     let run_scenario = scenario.clone();
@@ -3958,6 +4090,7 @@ fn make_wcq_job_factory_typed<const CAPACITY: usize>(
         fastfifo_capacity: None,
         lfqueue_segment_size: None,
         wcq_capacity: Some(CAPACITY),
+        lubq_backoff: None,
     };
     let queue_name = wcq_queue_label(CAPACITY);
     let run_scenario = scenario.clone();
@@ -4112,6 +4245,7 @@ pub fn make_fastfifo_job_factory(
         fastfifo_capacity: Some(capacity),
         lfqueue_segment_size: None,
         wcq_capacity: None,
+        lubq_backoff: None,
     };
     let queue_name = fastfifo_queue_label(block_size, capacity);
     let run_scenario = scenario.clone();
@@ -4886,7 +5020,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
             };
             for baseline_queue in baseline_queues {
                 match baseline_queue {
-                    QueueKind::SegQueue | QueueKind::Lubq => {
+                    QueueKind::SegQueue => {
                         let spec = JobSpec {
                             scenario: bundle.scenario.clone(),
                             repeat_index: bundle.repeat_index,
@@ -4899,6 +5033,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                             fastfifo_capacity: None,
                             lfqueue_segment_size: None,
                             wcq_capacity: None,
+                            lubq_backoff: None,
                         };
                         keys.push(SampleKey::from_job(&spec));
                         if *mode == Mode::Throughput {
@@ -4908,6 +5043,34 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                                     ..spec.clone()
                                 };
                                 keys.push(SampleKey::from_job(&spec));
+                            }
+                        }
+                    }
+                    QueueKind::Lubq => {
+                        for &backoff in &plan.lubq_backoffs {
+                            let spec = JobSpec {
+                                scenario: bundle.scenario.clone(),
+                                repeat_index: bundle.repeat_index,
+                                mode: *mode,
+                                items_per_producer,
+                                queue: *baseline_queue,
+                                ubq_label: None,
+                                batch_size: None,
+                                fastfifo_block_size: None,
+                                fastfifo_capacity: None,
+                                lfqueue_segment_size: None,
+                                wcq_capacity: None,
+                                lubq_backoff: Some(backoff),
+                            };
+                            keys.push(SampleKey::from_job(&spec));
+                            if *mode == Mode::Throughput {
+                                for &batch_size in &plan.ubq_batch_sizes {
+                                    let spec = JobSpec {
+                                        batch_size: Some(batch_size),
+                                        ..spec.clone()
+                                    };
+                                    keys.push(SampleKey::from_job(&spec));
+                                }
                             }
                         }
                     }
@@ -4924,6 +5087,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                             fastfifo_capacity: None,
                             lfqueue_segment_size: None,
                             wcq_capacity: None,
+                            lubq_backoff: None,
                         };
                         keys.push(SampleKey::from_job(&spec));
                         if *mode == Mode::Throughput {
@@ -4951,6 +5115,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                                     fastfifo_capacity: Some(capacity),
                                     lfqueue_segment_size: None,
                                     wcq_capacity: None,
+                                    lubq_backoff: None,
                                 };
                                 keys.push(SampleKey::from_job(&spec));
                             }
@@ -4970,6 +5135,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                                 fastfifo_capacity: None,
                                 lfqueue_segment_size: Some(segment_size),
                                 wcq_capacity: None,
+                                lubq_backoff: None,
                             };
                             keys.push(SampleKey::from_job(&spec));
                         }
@@ -4994,6 +5160,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                                     fastfifo_capacity: None,
                                     lfqueue_segment_size: None,
                                     wcq_capacity: Some(capacity),
+                                    lubq_backoff: None,
                                 };
                                 keys.push(SampleKey::from_job(&spec));
                             }
@@ -5012,6 +5179,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                             fastfifo_capacity: None,
                             lfqueue_segment_size: None,
                             wcq_capacity: None,
+                            lubq_backoff: None,
                         };
                         keys.push(SampleKey::from_job(&spec));
                         if *mode == Mode::Throughput {
@@ -5037,6 +5205,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                             fastfifo_capacity: None,
                             lfqueue_segment_size: None,
                             wcq_capacity: None,
+                            lubq_backoff: None,
                         };
                         keys.push(SampleKey::from_job(&spec));
                     }
@@ -5055,6 +5224,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                     fastfifo_capacity: None,
                     lfqueue_segment_size: None,
                     wcq_capacity: None,
+                    lubq_backoff: None,
                 };
                 keys.push(SampleKey::from_job(&spec));
                 if *mode == Mode::Throughput {
@@ -5071,6 +5241,7 @@ fn expected_keys_for_bundle(plan: &MatrixPlan, bundle: &PlanBundle) -> Vec<Sampl
                             fastfifo_capacity: None,
                             lfqueue_segment_size: None,
                             wcq_capacity: None,
+                            lubq_backoff: None,
                         };
                         keys.push(SampleKey::from_job(&spec));
                     }
@@ -5578,34 +5749,130 @@ struct TimedRound {
     producer_elapsed: Duration,
     items: u64,
     affinity_ok: bool,
+    probe_metrics: Option<ProfileProbeMetrics>,
+    os_metrics: Option<ProfileOsMetrics>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProfileProbeMetrics {
+    pub alloc_calls: u64,
+    pub alloc_zeroed_calls: u64,
+    pub dealloc_calls: u64,
+    pub realloc_calls: u64,
+    pub allocated_bytes: u64,
+    pub deallocated_bytes: u64,
+    pub live_bytes_delta: i64,
+    pub peak_additional_live_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProfileMeasurementProbe {
+    pub start: fn(),
+    pub finish: fn() -> ProfileProbeMetrics,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct ProfileOsMetrics {
+    user_cpu_ns: u64,
+    system_cpu_ns: u64,
+    minor_faults: u64,
+    major_faults: u64,
+    voluntary_context_switches: u64,
+    involuntary_context_switches: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProfileMetric {
+    pub metric_id: String,
+    pub raw_name: String,
+    pub value: f64,
+    pub unit: String,
+    pub kind: String,
+    pub source: String,
+    pub phase: String,
+    pub scope: String,
+}
+
+/// Reservation backoff policy used by a LUBQ shard's CAS retry loop.
+///
+/// This exists to A/B the retry policy on the shared `chead` reservation
+/// against focused-contention evidence (see `bench_atomic_updates`) without
+/// touching the default, correctness-relevant `Crossbeam` policy used
+/// everywhere else in the crate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum LubqBackoff {
+    /// The crate default: `crossbeam_utils::Backoff`, escalating spin then yield.
+    Crossbeam,
+    /// No spin on CAS failure; retries immediately. Yields on genuine waits.
+    Yield,
+}
+
+impl LubqBackoff {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "crossbeam" => Some(Self::Crossbeam),
+            "yield" => Some(Self::Yield),
+            _ => None,
+        }
+    }
+
+    fn queue_implementation_name(self) -> &'static str {
+        match self {
+            Self::Crossbeam => "lubq",
+            Self::Yield => "lubq-yield",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct HandoffProfileConfig {
     pub queue: QueueKind,
     pub ubq_label: Option<String>,
+    /// Only meaningful when `queue` is [`QueueKind::Lubq`]. `None` behaves as
+    /// [`LubqBackoff::Crossbeam`], the crate default.
+    pub lubq_backoff: Option<LubqBackoff>,
+    /// RBBQ block size and requested capacity, when profiling RBBQ/BBQ.
+    pub fastfifo_block_size: Option<usize>,
+    pub fastfifo_capacity: Option<usize>,
+    /// LSCQ segment size, when profiling the `lfqueue` adapter.
+    pub lfqueue_segment_size: Option<usize>,
     pub scenario: ScenarioConfig,
     pub batch_size: Option<usize>,
     pub warmup: Duration,
     pub duration: Duration,
+    pub items_per_producer: Option<u64>,
+    pub prewarm_items_per_producer: Option<u64>,
     pub core_offset: usize,
     pub allow_unpinned: bool,
+    pub measurement_probe: Option<ProfileMeasurementProbe>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct HandoffProfileResult {
+    pub benchmark: &'static str,
+    pub schema_version: u32,
     pub queue: String,
+    pub queue_implementation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ubq_label: Option<String>,
     pub scenario: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_size: Option<usize>,
     pub warmup_ms: u64,
+    pub warmup_elapsed_ns: u64,
+    pub calibration_elapsed_ns: u64,
+    pub calibration_items: u64,
     pub requested_duration_ms: u64,
+    pub actual_to_requested_duration: f64,
     pub elapsed_ns: u64,
+    pub producer_elapsed_ns: u64,
+    pub items_per_producer: u64,
     pub items: u64,
     pub ops_per_sec: f64,
     pub affinity_ok: bool,
+    pub fixed_work: bool,
+    pub prewarm_items_per_producer: u64,
+    pub metrics: Vec<ProfileMetric>,
 }
 
 pub fn run_handoff_profile(config: &HandoffProfileConfig) -> Result<HandoffProfileResult, String> {
@@ -5617,6 +5884,12 @@ pub fn run_handoff_profile(config: &HandoffProfileConfig) -> Result<HandoffProfi
     }
     if config.batch_size == Some(0) {
         return Err("profile batch size must be greater than zero".to_string());
+    }
+    if config.items_per_producer == Some(0) {
+        return Err("profile items per producer must be greater than zero".to_string());
+    }
+    if config.prewarm_items_per_producer == Some(0) {
+        return Err("profile prewarm items per producer must be greater than zero".to_string());
     }
     let required_cores = config
         .core_offset
@@ -5644,21 +5917,124 @@ pub fn run_handoff_profile(config: &HandoffProfileConfig) -> Result<HandoffProfi
                 )
             })?
         }
-        QueueKind::Lubq => profile_handoff_with_queue(
-            LubqBenchQueue::new(config.scenario.producers, config.scenario.consumers),
-            QueueKind::Lubq.name(),
-            None,
-            config,
-        ),
+        QueueKind::Lubq => {
+            let backoff_policy = config.lubq_backoff.unwrap_or(LubqBackoff::Crossbeam);
+            let queue_name = backoff_policy.queue_implementation_name();
+            match backoff_policy {
+                LubqBackoff::Crossbeam => profile_handoff_with_queue(
+                    LubqBenchQueue::<u64, backoff::Crossbeam>::new(
+                        config.scenario.producers,
+                        config.scenario.consumers,
+                    ),
+                    queue_name,
+                    None,
+                    config,
+                ),
+                LubqBackoff::Yield => profile_handoff_with_queue(
+                    LubqBenchQueue::<u64, backoff::Yield>::new(
+                        config.scenario.producers,
+                        config.scenario.consumers,
+                    ),
+                    queue_name,
+                    None,
+                    config,
+                ),
+            }
+        }
         QueueKind::SegQueue => match config.batch_size {
             Some(_) => {
                 profile_handoff_for::<BatchQueue<u64>>(QueueKind::SegQueue.name(), None, config)
             }
             None => profile_handoff_for::<SegQueue<u64>>(QueueKind::SegQueue.name(), None, config),
         },
+        QueueKind::ConcurrentQueue => {
+            if config.batch_size.is_some() {
+                return Err("concurrent-queue has no native batch operation".to_string());
+            }
+            profile_handoff_for::<ConcurrentQueue<u64>>(
+                QueueKind::ConcurrentQueue.name(),
+                None,
+                config,
+            )
+        }
+        QueueKind::MutexVecDeque => {
+            profile_handoff_for::<MutexQueue<u64>>(QueueKind::MutexVecDeque.name(), None, config)
+        }
+        QueueKind::MsQueue => {
+            if config.batch_size.is_some() {
+                return Err("ms-queue has no native batch operation".to_string());
+            }
+            profile_handoff_for::<MsQueue<u64>>(QueueKind::MsQueue.name(), None, config)
+        }
+        QueueKind::MoodycamelConcurrentQueue => {
+            #[cfg(feature = "bench_moodycamel")]
+            {
+                profile_handoff_with_queue(
+                    MoodycamelQueue::new_handle(),
+                    QueueKind::MoodycamelConcurrentQueue.name(),
+                    None,
+                    config,
+                )
+            }
+            #[cfg(not(feature = "bench_moodycamel"))]
+            {
+                Err(
+                    "moodycamel-cq profiling requires --features bench_registry,bench_moodycamel"
+                        .to_string(),
+                )
+            }
+        }
+        QueueKind::FastFifo => {
+            let block_size = config
+                .fastfifo_block_size
+                .ok_or_else(|| "RBBQ profile is missing its block size".to_string())?;
+            let capacity = config
+                .fastfifo_capacity
+                .ok_or_else(|| "RBBQ profile is missing its requested capacity".to_string())?;
+            if config.batch_size.is_some() {
+                return Err("RBBQ has no native batch operation in this harness".to_string());
+            }
+            #[cfg(feature = "bench_fastfifo")]
+            {
+                profile_handoff_with_queue(
+                    RbbqBenchQueue::new(block_size, capacity),
+                    &fastfifo_queue_label(block_size, capacity),
+                    None,
+                    config,
+                )
+            }
+            #[cfg(not(feature = "bench_fastfifo"))]
+            {
+                let _ = (block_size, capacity);
+                Err("RBBQ profiling requires --features bench_registry,bench_rbbq".to_string())
+            }
+        }
+        QueueKind::LfQueue => {
+            let segment_size = config
+                .lfqueue_segment_size
+                .ok_or_else(|| "LSCQ profile is missing its segment size".to_string())?;
+            if config.batch_size.is_some() {
+                return Err("LSCQ has no native batch operation in this harness".to_string());
+            }
+            #[cfg(feature = "bench_lfqueue")]
+            {
+                profile_handoff_with_queue(
+                    LfQueueBenchQueue::new(segment_size),
+                    &lfqueue_queue_label(segment_size),
+                    None,
+                    config,
+                )
+            }
+            #[cfg(not(feature = "bench_lfqueue"))]
+            {
+                let _ = segment_size;
+                Err("LSCQ profiling requires --features bench_registry,bench_lfqueue".to_string())
+            }
+        }
         _ => Err(format!(
-            "queue '{}' is not supported by bench_profile; supported queues are ubq, lubq, and \
-             segqueue",
+            "queue '{}' is not supported by bench_profile; supported queues are ubq, lubq, \
+             segqueue, concurrent-queue, mutex-vecdeque, ms-queue, rbbq, lfqueue, and \
+             moodycamel-cq",
             config.queue.name()
         )),
     }
@@ -5688,63 +6064,108 @@ fn profile_handoff_with_queue<Q: BenchQueueHandleFactory>(
             .min((max_per_producer / batch) * batch)
     };
 
-    // Calibrate with complete, drained handoff rounds so the measured round
-    // lasts approximately the requested time without building an artificial
-    // producer-side backlog that is drained after the sampling window.
-    let mut pilot_items = normalize(INITIAL_THROUGHPUT_PILOT_ITEMS_PER_PRODUCER);
     let mut calibration_elapsed = Duration::ZERO;
     let mut calibration_items = 0_u64;
+    let mut warmup_elapsed = Duration::ZERO;
     let mut affinity_ok = true;
-    loop {
-        let round = run_handoff_round(
+    let (target_per_producer, measured) = if let Some(exact_items) = config.items_per_producer {
+        let target = normalize(exact_items);
+        if target != exact_items {
+            return Err(format!(
+                "--items-per-producer={exact_items} is not representable with batch size {batch}"
+            ));
+        }
+        if let Some(prewarm_items) = config.prewarm_items_per_producer {
+            let normalized_prewarm = normalize(prewarm_items);
+            if normalized_prewarm != prewarm_items {
+                return Err(format!(
+                    "--prewarm-items-per-producer={prewarm_items} is not representable with \
+                     batch size {batch}"
+                ));
+            }
+            let prewarm = run_handoff_round(
+                &queue_handle,
+                &config.scenario,
+                normalized_prewarm,
+                config.batch_size,
+                config.core_offset,
+                None,
+            )?;
+            warmup_elapsed = prewarm.elapsed;
+            affinity_ok &= prewarm.affinity_ok;
+        }
+        let measured = run_handoff_round(
             &queue_handle,
             &config.scenario,
-            pilot_items,
+            target,
             config.batch_size,
             config.core_offset,
+            config.measurement_probe,
         )?;
-        calibration_elapsed += round.elapsed.max(Duration::from_nanos(1));
-        calibration_items = calibration_items
-            .checked_add(round.items)
-            .ok_or_else(|| "profile calibration item count overflow".to_string())?;
-        affinity_ok &= round.affinity_ok;
-        if round.elapsed >= Duration::from_millis(DEFAULT_THROUGHPUT_PILOT_MS) {
-            break;
+        (target, measured)
+    } else {
+        // Calibrate with complete, drained handoff rounds so the measured
+        // round lasts approximately the requested time. This path is used by
+        // the unprofiled shadow process; collectors receive an exact item
+        // count through the fixed-work path above.
+        let mut pilot_items = normalize(INITIAL_THROUGHPUT_PILOT_ITEMS_PER_PRODUCER);
+        loop {
+            let round = run_handoff_round(
+                &queue_handle,
+                &config.scenario,
+                pilot_items,
+                config.batch_size,
+                config.core_offset,
+                None,
+            )?;
+            calibration_elapsed += round.elapsed.max(Duration::from_nanos(1));
+            calibration_items = calibration_items
+                .checked_add(round.items)
+                .ok_or_else(|| "profile calibration item count overflow".to_string())?;
+            affinity_ok &= round.affinity_ok;
+            if round.elapsed >= Duration::from_millis(DEFAULT_THROUGHPUT_PILOT_MS) {
+                break;
+            }
+            let next = normalize(pilot_items.saturating_mul(2));
+            if next == pilot_items {
+                break;
+            }
+            pilot_items = next;
         }
-        let next = normalize(pilot_items.saturating_mul(2));
-        if next == pilot_items {
-            break;
-        }
-        pilot_items = next;
-    }
 
-    while calibration_elapsed < config.warmup {
-        let round = run_handoff_round(
+        while warmup_elapsed < config.warmup {
+            let round = run_handoff_round(
+                &queue_handle,
+                &config.scenario,
+                pilot_items,
+                config.batch_size,
+                config.core_offset,
+                None,
+            )?;
+            let elapsed = round.elapsed.max(Duration::from_nanos(1));
+            warmup_elapsed += elapsed;
+            calibration_elapsed += elapsed;
+            calibration_items = calibration_items
+                .checked_add(round.items)
+                .ok_or_else(|| "profile warmup item count overflow".to_string())?;
+            affinity_ok &= round.affinity_ok;
+        }
+
+        let calibrated_rate = calibration_items as f64 / calibration_elapsed.as_secs_f64();
+        let target_total = (calibrated_rate * config.duration.as_secs_f64())
+            .ceil()
+            .clamp(1.0, u64::MAX as f64) as u64;
+        let target = normalize(target_total.div_ceil(config.scenario.producers as u64));
+        let measured = run_handoff_round(
             &queue_handle,
             &config.scenario,
-            pilot_items,
+            target,
             config.batch_size,
             config.core_offset,
+            config.measurement_probe,
         )?;
-        calibration_elapsed += round.elapsed.max(Duration::from_nanos(1));
-        calibration_items = calibration_items
-            .checked_add(round.items)
-            .ok_or_else(|| "profile warmup item count overflow".to_string())?;
-        affinity_ok &= round.affinity_ok;
-    }
-
-    let calibrated_rate = calibration_items as f64 / calibration_elapsed.as_secs_f64();
-    let target_total = (calibrated_rate * config.duration.as_secs_f64())
-        .ceil()
-        .clamp(1.0, u64::MAX as f64) as u64;
-    let target_per_producer = normalize(target_total.div_ceil(config.scenario.producers as u64));
-    let measured = run_handoff_round(
-        &queue_handle,
-        &config.scenario,
-        target_per_producer,
-        config.batch_size,
-        config.core_offset,
-    )?;
+        (target, measured)
+    };
     affinity_ok &= measured.affinity_ok;
     if !affinity_ok && !config.allow_unpinned {
         return Err(
@@ -5752,19 +6173,210 @@ fn profile_handoff_with_queue<Q: BenchQueueHandleFactory>(
         );
     }
     let elapsed_ns = measured.elapsed.as_nanos().min(u64::MAX as u128) as u64;
+    let producer_elapsed_ns = measured.producer_elapsed.as_nanos().min(u64::MAX as u128) as u64;
     let ops_per_sec = throughput_ops(measured.items, elapsed_ns).unwrap_or(0.0);
+    let requested_duration_ns = config.duration.as_nanos() as f64;
+    let actual_to_requested_duration = if requested_duration_ns > 0.0 {
+        elapsed_ns as f64 / requested_duration_ns
+    } else {
+        0.0
+    };
+    let queue_implementation = match config.queue {
+        QueueKind::SegQueue if config.batch_size.is_some() => "crossbeam-batchqueue",
+        QueueKind::SegQueue => "crossbeam-segqueue",
+        QueueKind::MutexVecDeque => "mutex-vecdeque",
+        QueueKind::MsQueue => "michael-scott",
+        QueueKind::ConcurrentQueue => "concurrent-queue",
+        QueueKind::Lubq => config
+            .lubq_backoff
+            .unwrap_or(LubqBackoff::Crossbeam)
+            .queue_implementation_name(),
+        QueueKind::Ubq => "ubq",
+        _ => queue_name,
+    };
+    let metrics = profile_round_metrics(&measured);
     Ok(HandoffProfileResult {
+        benchmark: "queue_handoff_profile",
+        schema_version: 1,
         queue: queue_name.to_string(),
+        queue_implementation: queue_implementation.to_string(),
         ubq_label: ubq_label.map(str::to_string),
         scenario: config.scenario.name.clone(),
         batch_size: config.batch_size,
         warmup_ms: config.warmup.as_millis().min(u64::MAX as u128) as u64,
+        warmup_elapsed_ns: warmup_elapsed.as_nanos().min(u64::MAX as u128) as u64,
+        calibration_elapsed_ns: calibration_elapsed.as_nanos().min(u64::MAX as u128) as u64,
+        calibration_items,
         requested_duration_ms: config.duration.as_millis().min(u64::MAX as u128) as u64,
+        actual_to_requested_duration,
         elapsed_ns,
+        producer_elapsed_ns,
+        items_per_producer: target_per_producer,
         items: measured.items,
         ops_per_sec,
         affinity_ok,
+        fixed_work: config.items_per_producer.is_some(),
+        prewarm_items_per_producer: config.prewarm_items_per_producer.unwrap_or(0),
+        metrics,
     })
+}
+
+fn profile_round_metrics(round: &TimedRound) -> Vec<ProfileMetric> {
+    let mut metrics = Vec::new();
+    let mut push =
+        |metric_id: &str, raw_name: &str, value: f64, unit: &str, kind: &str, source: &str| {
+            metrics.push(ProfileMetric {
+                metric_id: metric_id.to_string(),
+                raw_name: raw_name.to_string(),
+                value,
+                unit: unit.to_string(),
+                kind: kind.to_string(),
+                source: source.to_string(),
+                phase: "measure".to_string(),
+                scope: "process".to_string(),
+            });
+        };
+    if let Some(probe) = round.probe_metrics {
+        for (id, raw, value, unit, kind) in [
+            (
+                "allocator.alloc_calls",
+                "allocation calls",
+                probe.alloc_calls as f64,
+                "count",
+                "counter",
+            ),
+            (
+                "allocator.alloc_zeroed_calls",
+                "zeroed allocation calls",
+                probe.alloc_zeroed_calls as f64,
+                "count",
+                "counter",
+            ),
+            (
+                "allocator.dealloc_calls",
+                "deallocation calls",
+                probe.dealloc_calls as f64,
+                "count",
+                "counter",
+            ),
+            (
+                "allocator.realloc_calls",
+                "reallocation calls",
+                probe.realloc_calls as f64,
+                "count",
+                "counter",
+            ),
+            (
+                "allocator.allocated_bytes",
+                "allocated bytes",
+                probe.allocated_bytes as f64,
+                "bytes",
+                "counter",
+            ),
+            (
+                "allocator.deallocated_bytes",
+                "deallocated bytes",
+                probe.deallocated_bytes as f64,
+                "bytes",
+                "counter",
+            ),
+            (
+                "allocator.live_bytes_delta",
+                "live bytes delta",
+                probe.live_bytes_delta as f64,
+                "bytes",
+                "gauge",
+            ),
+            (
+                "allocator.peak_additional_live_bytes",
+                "peak additional live bytes",
+                probe.peak_additional_live_bytes as f64,
+                "bytes",
+                "gauge",
+            ),
+        ] {
+            push(id, raw, value, unit, kind, "allocator_probe");
+        }
+        if round.items > 0 {
+            push(
+                "allocator.allocated_bytes_per_item",
+                "allocated bytes per item",
+                probe.allocated_bytes as f64 / round.items as f64,
+                "bytes/item",
+                "gauge",
+                "allocator_probe",
+            );
+            push(
+                "allocator.alloc_calls_per_million_items",
+                "allocation calls per million items",
+                probe.alloc_calls as f64 * 1_000_000.0 / round.items as f64,
+                "count/Mitem",
+                "gauge",
+                "allocator_probe",
+            );
+        }
+    }
+    if let Some(os) = round.os_metrics {
+        for (id, raw, value, unit) in [
+            (
+                "os.user_cpu_ns",
+                "user CPU time",
+                os.user_cpu_ns as f64,
+                "ns",
+            ),
+            (
+                "os.system_cpu_ns",
+                "system CPU time",
+                os.system_cpu_ns as f64,
+                "ns",
+            ),
+            (
+                "os.minor_faults",
+                "minor page faults",
+                os.minor_faults as f64,
+                "count",
+            ),
+            (
+                "os.major_faults",
+                "major page faults",
+                os.major_faults as f64,
+                "count",
+            ),
+            (
+                "os.voluntary_context_switches",
+                "voluntary context switches",
+                os.voluntary_context_switches as f64,
+                "count",
+            ),
+            (
+                "os.involuntary_context_switches",
+                "involuntary context switches",
+                os.involuntary_context_switches as f64,
+                "count",
+            ),
+        ] {
+            push(id, raw, value, unit, "counter", "getrusage");
+        }
+        if round.items > 0 {
+            push(
+                "os.cpu_time_per_item_ns",
+                "CPU time per item",
+                os.user_cpu_ns.saturating_add(os.system_cpu_ns) as f64 / round.items as f64,
+                "ns/item",
+                "gauge",
+                "getrusage",
+            );
+            push(
+                "os.minor_faults_per_million_items",
+                "minor page faults per million items",
+                os.minor_faults as f64 * 1_000_000.0 / round.items as f64,
+                "count/Mitem",
+                "gauge",
+                "getrusage",
+            );
+        }
+    }
+    metrics
 }
 
 fn runtime_throughput_policy() -> ThroughputPolicy {
@@ -5890,12 +6502,63 @@ fn receive_consumer_items<T: BenchQueueThreadOps>(
     (last_data, consumed)
 }
 
+#[cfg(unix)]
+fn profile_rusage_snapshot() -> Option<ProfileOsMetrics> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage initializes the pointed-to rusage object on success.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful getrusage call above initialized every field.
+    let usage = unsafe { usage.assume_init() };
+    let timeval_ns = |value: libc::timeval| {
+        let seconds = u64::try_from(value.tv_sec).unwrap_or(0);
+        let micros = u64::try_from(value.tv_usec).unwrap_or(0);
+        seconds
+            .saturating_mul(1_000_000_000)
+            .saturating_add(micros.saturating_mul(1_000))
+    };
+    Some(ProfileOsMetrics {
+        user_cpu_ns: timeval_ns(usage.ru_utime),
+        system_cpu_ns: timeval_ns(usage.ru_stime),
+        minor_faults: u64::try_from(usage.ru_minflt).unwrap_or(0),
+        major_faults: u64::try_from(usage.ru_majflt).unwrap_or(0),
+        voluntary_context_switches: u64::try_from(usage.ru_nvcsw).unwrap_or(0),
+        involuntary_context_switches: u64::try_from(usage.ru_nivcsw).unwrap_or(0),
+    })
+}
+
+#[cfg(not(unix))]
+fn profile_rusage_snapshot() -> Option<ProfileOsMetrics> {
+    None
+}
+
+fn profile_rusage_delta(
+    before: Option<ProfileOsMetrics>,
+    after: Option<ProfileOsMetrics>,
+) -> Option<ProfileOsMetrics> {
+    let (before, after) = (before?, after?);
+    Some(ProfileOsMetrics {
+        user_cpu_ns: after.user_cpu_ns.saturating_sub(before.user_cpu_ns),
+        system_cpu_ns: after.system_cpu_ns.saturating_sub(before.system_cpu_ns),
+        minor_faults: after.minor_faults.saturating_sub(before.minor_faults),
+        major_faults: after.major_faults.saturating_sub(before.major_faults),
+        voluntary_context_switches: after
+            .voluntary_context_switches
+            .saturating_sub(before.voluntary_context_switches),
+        involuntary_context_switches: after
+            .involuntary_context_switches
+            .saturating_sub(before.involuntary_context_switches),
+    })
+}
+
 fn run_handoff_round<Q: BenchQueueHandleFactory>(
     queue_handle: &Arc<Q>,
     scenario: &ScenarioConfig,
     items_per_producer: u64,
     batch_size: Option<usize>,
     core_offset: usize,
+    measurement_probe: Option<ProfileMeasurementProbe>,
 ) -> Result<TimedRound, String> {
     let expected = total_items(items_per_producer, scenario.producers);
     let ready = Arc::new(Barrier::new(scenario.total_threads() + 1));
@@ -5949,11 +6612,17 @@ fn run_handoff_round<Q: BenchQueueHandleFactory>(
     }
 
     ready.wait();
+    let rusage_before = profile_rusage_snapshot();
+    if let Some(probe) = measurement_probe {
+        (probe.start)();
+    }
     start.set(Instant::now()).ok();
     start_gate.wait();
     let producer_results = join_bench_threads(producers, "producer")?;
     producers_done.store(true, AtomicOrdering::Release);
     let consumer_results = join_bench_threads(consumers, "consumer")?;
+    let probe_metrics = measurement_probe.map(|probe| (probe.finish)());
+    let os_metrics = profile_rusage_delta(rusage_before, profile_rusage_snapshot());
     let consumed = consumer_results.iter().map(|(_, count, _)| *count).sum();
     if consumed != expected {
         return Err(format!(
@@ -5974,6 +6643,8 @@ fn run_handoff_round<Q: BenchQueueHandleFactory>(
         items: consumed,
         affinity_ok: producer_results.iter().all(|(_, pinned)| *pinned)
             && consumer_results.iter().all(|(_, _, pinned)| *pinned),
+        probe_metrics,
+        os_metrics,
     })
 }
 
@@ -6022,6 +6693,8 @@ fn run_enqueue_round<Q: BenchQueueHandleFactory>(
         producer_elapsed: elapsed,
         items: total_items(items_per_producer, scenario.producers),
         affinity_ok: results.iter().all(|(_, pinned)| *pinned),
+        probe_metrics: None,
+        os_metrics: None,
     })
 }
 
@@ -6079,6 +6752,8 @@ fn run_dequeue_round<Q: BenchQueueHandleFactory>(
         producer_elapsed: Duration::ZERO,
         items: consumed,
         affinity_ok: results.iter().all(|(_, _, pinned)| *pinned),
+        probe_metrics: None,
+        os_metrics: None,
     })
 }
 
@@ -6125,6 +6800,7 @@ fn adaptive_throughput<Q: BenchQueueHandleFactory>(
             pilot_items,
             batch_size,
             core_offset,
+            None,
         )
         .map_err(|reason| (reason, calibration_elapsed.as_nanos() as u64))?;
         calibration_elapsed += round.elapsed;
@@ -6145,6 +6821,7 @@ fn adaptive_throughput<Q: BenchQueueHandleFactory>(
             pilot_items,
             batch_size,
             core_offset,
+            None,
         )
         .map_err(|reason| (reason, warmup_elapsed.as_nanos() as u64))?;
         warmup_elapsed += round.elapsed.max(Duration::from_nanos(1));
@@ -6163,6 +6840,7 @@ fn adaptive_throughput<Q: BenchQueueHandleFactory>(
             pilot_items,
             batch_size,
             core_offset,
+            None,
         )
         .map_err(|reason| (reason, handoff_elapsed.as_nanos() as u64))?;
         handoff_elapsed += round.elapsed.max(Duration::from_nanos(1));
@@ -7913,6 +8591,7 @@ fn job_factory_for_spec(spec: &JobSpec) -> Result<JobFactory, String> {
             spec.mode,
             spec.items_per_producer,
             spec.batch_size,
+            spec.lubq_backoff.unwrap_or(LubqBackoff::Crossbeam),
         )),
         QueueKind::SegQueue => Ok(make_segqueue_job_factory_variant(
             spec.scenario.clone(),
@@ -8443,7 +9122,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(specs.len(), 17);
+        assert_eq!(specs.len(), 21);
         assert_eq!(
             specs
                 .iter()
@@ -8456,7 +9135,8 @@ mod tests {
                 .iter()
                 .filter(|spec| spec.queue == QueueKind::Lubq && spec.batch_size.is_none())
                 .count(),
-            1
+            2,
+            "one scalar spec per LubqBackoff variant"
         );
         assert_eq!(
             specs
@@ -8464,7 +9144,17 @@ mod tests {
                 .filter(|spec| spec.queue == QueueKind::Lubq && spec.batch_size.is_some())
                 .map(|spec| spec.batch_size.expect("batch size"))
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from(DEFAULT_UBQ_BATCH_SIZES)
+            BTreeSet::from(DEFAULT_UBQ_BATCH_SIZES),
+            "both backoff variants cover the same batch-size set"
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.queue == QueueKind::Lubq)
+                .map(|spec| spec.lubq_backoff.expect("lubq backoff"))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([LubqBackoff::Crossbeam, LubqBackoff::Yield]),
+            "the grid must cover both backoff variants"
         );
         assert_eq!(
             specs
@@ -8502,7 +9192,12 @@ mod tests {
             .iter()
             .find(|bundle| bundle.ubq_label.is_none())
             .expect("baseline bundle");
-        assert_eq!(expected_keys_for_bundle(&plan, baseline_bundle).len(), 9);
+        assert_eq!(
+            expected_keys_for_bundle(&plan, baseline_bundle).len(),
+            13,
+            "segqueue (1 scalar + 3 batch) + lubq (2 backoffs * (1 scalar + 3 batch)) + \
+             concurrent-queue (1 scalar)"
+        );
         let ubq_bundle = plan
             .bundles
             .iter()
@@ -8782,9 +9477,67 @@ mod tests {
             inner: SegQueue::new(),
             dropped: AtomicBool::new(false),
         });
-        let error = run_handoff_round(&queue, &ScenarioConfig::new(1, 1), 16, None, 0)
+        let error = run_handoff_round(&queue, &ScenarioConfig::new(1, 1), 16, None, 0, None)
             .expect_err("integrity failure");
         assert!(error.contains("integrity mismatch"));
+    }
+
+    #[test]
+    fn profile_fixed_work_skips_calibration_and_preserves_exact_count() {
+        let result = run_handoff_profile(&HandoffProfileConfig {
+            queue: QueueKind::SegQueue,
+            ubq_label: None,
+            lubq_backoff: None,
+            fastfifo_block_size: None,
+            fastfifo_capacity: None,
+            lfqueue_segment_size: None,
+            scenario: ScenarioConfig::new(1, 1),
+            batch_size: None,
+            warmup: Duration::ZERO,
+            duration: Duration::from_secs(1),
+            items_per_producer: Some(1_024),
+            prewarm_items_per_producer: None,
+            core_offset: 0,
+            allow_unpinned: true,
+            measurement_probe: None,
+        })
+        .expect("fixed-work profile");
+        assert!(result.fixed_work);
+        assert_eq!(result.items_per_producer, 1_024);
+        assert_eq!(result.items, 1_024);
+        assert_eq!(result.calibration_items, 0);
+        assert_eq!(result.calibration_elapsed_ns, 0);
+        assert_eq!(result.queue_implementation, "crossbeam-segqueue");
+    }
+
+    #[test]
+    fn profile_supports_scalar_comparison_baselines() {
+        for queue in [
+            QueueKind::ConcurrentQueue,
+            QueueKind::MutexVecDeque,
+            QueueKind::MsQueue,
+        ] {
+            let result = run_handoff_profile(&HandoffProfileConfig {
+                queue,
+                ubq_label: None,
+                lubq_backoff: None,
+                fastfifo_block_size: None,
+                fastfifo_capacity: None,
+                lfqueue_segment_size: None,
+                scenario: ScenarioConfig::new(1, 1),
+                batch_size: None,
+                warmup: Duration::ZERO,
+                duration: Duration::from_secs(1),
+                items_per_producer: Some(128),
+                prewarm_items_per_producer: None,
+                core_offset: 0,
+                allow_unpinned: true,
+                measurement_probe: None,
+            })
+            .unwrap_or_else(|error| panic!("{} profile failed: {error}", queue.name()));
+            assert_eq!(result.items, 128);
+            assert!(result.fixed_work);
+        }
     }
 
     struct RetryQueue {
@@ -8910,6 +9663,7 @@ mod tests {
                 Mode::Throughput,
                 64,
                 batch_size,
+                LubqBackoff::Crossbeam,
             );
             let record = (factory.run)(0);
             assert_eq!(record.status, BenchRecordStatus::Completed);
@@ -8928,15 +9682,46 @@ mod tests {
             Mode::AppPipeline,
             Mode::AppTaskRoundtrip,
         ] {
-            let factory = make_lubq_job_factory(ScenarioConfig::new(2, 2), 1, mode, 64, None);
+            let factory = make_lubq_job_factory(
+                ScenarioConfig::new(2, 2),
+                1,
+                mode,
+                64,
+                None,
+                LubqBackoff::Crossbeam,
+            );
             let record = (factory.run)(0);
             assert_eq!(record.status, BenchRecordStatus::Completed, "mode={mode:?}");
             assert_eq!(record.queue, "lubq");
         }
 
-        let factory =
-            make_lubq_job_factory(ScenarioConfig::new(2, 1), 1, Mode::AppLogMpscFile, 64, None);
+        let factory = make_lubq_job_factory(
+            ScenarioConfig::new(2, 1),
+            1,
+            Mode::AppLogMpscFile,
+            64,
+            None,
+            LubqBackoff::Crossbeam,
+        );
         assert_eq!((factory.run)(0).status, BenchRecordStatus::Completed);
+    }
+
+    #[test]
+    fn lubq_yield_backoff_runs_and_reports_a_distinct_queue_label() {
+        for batch_size in [None, Some(8)] {
+            let factory = make_lubq_job_factory(
+                ScenarioConfig::new(2, 2),
+                1,
+                Mode::Throughput,
+                64,
+                batch_size,
+                LubqBackoff::Yield,
+            );
+            let record = (factory.run)(0);
+            assert_eq!(record.status, BenchRecordStatus::Completed);
+            assert_eq!(record.queue, "lubq-yield");
+            assert_eq!(record.batch_size, batch_size);
+        }
     }
 
     #[cfg(feature = "bench_fastfifo")]
@@ -8985,6 +9770,7 @@ mod tests {
             fastfifo_capacity: None,
             lfqueue_segment_size: None,
             wcq_capacity: None,
+            lubq_backoff: None,
         };
         let batched = JobSpec {
             batch_size: Some(16),
@@ -9604,6 +10390,7 @@ mod tests {
             fastfifo_capacities: default_fastfifo_capacities(),
             lfqueue_segment_sizes: Vec::new(),
             wcq_capacities: Vec::new(),
+            lubq_backoffs: Vec::new(),
             ubq_grid: None,
             ubq_batch_sizes: Vec::new(),
             planned_repeats: 1,
@@ -9691,6 +10478,7 @@ mod tests {
                     fastfifo_capacity: None,
                     lfqueue_segment_size: None,
                     wcq_capacity: None,
+                    lubq_backoff: None,
                 },
             },
         };

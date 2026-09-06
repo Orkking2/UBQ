@@ -126,7 +126,7 @@ impl<T, B: BackoffPolicy> UBQ<T, B> {
         }
 
         let block_length = self.block_length();
-        let mut blocks = BlockChain::new();
+        let mut blocks = BlockChain::zero();
 
         let backoff = B::new();
         let mut phead = self.acquire_phead();
@@ -135,7 +135,7 @@ impl<T, B: BackoffPolicy> UBQ<T, B> {
             // Give us exactly one block to initialize the queue.
             blocks.grow_to_fit_with(1, &self.pool);
 
-            let (root, size) = blocks.take();
+            let (root, tail, size) = blocks.take();
 
             let new_phead = Head::from_ptr(root);
 
@@ -150,7 +150,7 @@ impl<T, B: BackoffPolicy> UBQ<T, B> {
                         .store(Head::from_ptr(root).to_usize(self.head_codec), Release);
                     phead = new_phead;
                 }
-                Err(_) => blocks.give_back(root, size),
+                Err(_) => blocks.give_back(root, tail, size),
             }
         }
 
@@ -194,7 +194,7 @@ impl<T, B: BackoffPolicy> UBQ<T, B> {
         }
 
         if new_phead.index == block_length {
-            let (mut root, size) = blocks.take();
+            let (mut root, tail, size) = blocks.take();
 
             let mut remaining = len;
 
@@ -234,7 +234,7 @@ impl<T, B: BackoffPolicy> UBQ<T, B> {
             }
 
             if !root.is_null() {
-                blocks.give_back(root, size);
+                blocks.give_back(root, tail, size);
             }
         }
 
@@ -432,6 +432,7 @@ impl<T, B: BackoffPolicy> UBQ<T, B> {
             block: chead.block,
             index: chead.index,
             len,
+            pending_consumed: 0,
         }
     }
 }
@@ -466,6 +467,11 @@ pub struct UBQIter<'a, T, B: BackoffPolicy> {
     index: usize,
     /// Length, in slots, until we are exhausted
     len: usize,
+    /// Slots completed in the current contiguous block segment.  A batch
+    /// reservation owns a contiguous range, so one release RMW per completed
+    /// segment is sufficient; publishing every slot separately only creates
+    /// avoidable contention on the block's shared `consumed` counter.
+    pending_consumed: usize,
 }
 
 impl<'a, T, B: BackoffPolicy> Drop for UBQIter<'a, T, B> {
@@ -482,6 +488,32 @@ impl<'a, T, B: BackoffPolicy> UBQIter<'a, T, B> {
             block: null_mut(),
             index: 0,
             len: 0,
+            pending_consumed: 0,
+        }
+    }
+
+    #[inline]
+    fn finish_block_segment(&mut self, block: *mut Block<T>, bref: &Block<T>) {
+        let quantity = core::mem::take(&mut self.pending_consumed);
+        debug_assert!(quantity > 0);
+
+        if bref.consume(quantity) {
+            if bref.is_standalone() {
+                Block::reset(block);
+
+                if self
+                    .queue
+                    .pool
+                    .compare_exchange(null_mut(), block, Release, Relaxed)
+                    .is_err()
+                {
+                    Block::free(block)
+                }
+            } else {
+                // A cached virtual page would pin its entire allocation.
+                // Release run members as soon as they are complete.
+                Block::free(block)
+            }
         }
     }
 }
@@ -504,23 +536,18 @@ impl<'a, T, B: BackoffPolicy> Iterator for UBQIter<'a, T, B> {
 
             self.index += 1;
             self.len -= 1;
+            self.pending_consumed += 1;
 
-            if self.index == block_length {
+            let finished_block = self.index == block_length;
+            if finished_block {
                 self.block = bref.next().load(Acquire);
                 self.index = 0;
             }
 
-            if bref.consume(1) {
-                Block::reset(block);
-
-                if self
-                    .queue
-                    .pool
-                    .compare_exchange(null_mut(), block, Release, Relaxed)
-                    .is_err()
-                {
-                    Block::free(block)
-                }
+            if cfg!(feature = "probe_item_completion") || finished_block || self.len == 0 {
+                // `self.block` has already advanced before the update can make
+                // `block` recyclable.  Do not touch `bref` after this call.
+                self.finish_block_segment(block, bref);
             }
 
             if let val @ Some(_) = maybe {

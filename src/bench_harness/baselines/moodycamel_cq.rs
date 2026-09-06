@@ -193,6 +193,17 @@ impl LogQueueHandleFactory for MoodycamelQueue {
 }
 
 impl BenchQueueThreadOps for MoodycamelThreadHandle {
+    fn visit_recv_batch(&self, size: usize, visit: &mut dyn FnMut(u64)) -> usize {
+        let count = self.try_recv_batch(size);
+        let MoodycamelThreadRole::Consumer { batch, .. } = &self.role else {
+            panic!("attempted to receive through a producer handle");
+        };
+        // SAFETY: the single owning worker made the receive above and the FFI
+        // initialized exactly count slots of its private buffer.
+        let values = unsafe { &*batch.get() };
+        values[..count].iter().for_each(|value| visit(*value));
+        count
+    }
     fn try_send_value(&self, value: u64) -> bool {
         let MoodycamelThreadRole::Producer { token, .. } = &self.role else {
             panic!("attempted to send through a moodycamel consumer handle");

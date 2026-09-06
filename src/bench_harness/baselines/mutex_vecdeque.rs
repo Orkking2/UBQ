@@ -32,6 +32,12 @@ impl<T> Default for MutexQueue<T> {
 }
 
 impl BenchQueueOps for MutexQueue<u64> {
+    fn visit_recv_batch(&self, size: usize, visit: &mut dyn FnMut(u64)) -> usize {
+        let mut guard = self.inner.lock().expect("mutex poisoned");
+        let available = guard.len().min(size);
+        guard.drain(..available).for_each(visit);
+        available
+    }
     fn try_send_value(&self, value: u64) -> bool {
         self.inner.lock().expect("mutex poisoned").push_back(value);
         true

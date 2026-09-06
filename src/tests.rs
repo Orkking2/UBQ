@@ -83,6 +83,32 @@ fn refill_drain_recycled_blocks() {
 }
 
 #[test]
+fn dropping_partially_read_batch_finishes_every_reserved_block_segment() {
+    let q = UBQ::<usize>::new();
+    let block_length = q.block_length();
+    let reserved = block_length * 3 + 17;
+
+    q.push_batch(0..reserved);
+    {
+        let mut batch = q.pop_batch(reserved);
+        assert_eq!(batch.next(), Some(0));
+        assert_eq!(batch.next(), Some(1));
+        // Dropping the iterator drains its reservation.  This exercises a
+        // partial first segment, two complete blocks, and a partial tail.
+    }
+    assert_eq!(q.pop(), None);
+
+    // A second cross-block cycle checks that all completed blocks were made
+    // recyclable after the deferred, per-segment consumed updates.
+    q.push_batch(0..reserved);
+    assert_eq!(
+        q.pop_batch(reserved).collect::<Vec<_>>(),
+        (0..reserved).collect::<Vec<_>>()
+    );
+    assert_eq!(q.pop(), None);
+}
+
+#[test]
 // 8x2x10_000_001
 // Seg: 1.63769375s
 // UBQ: 5.440279166s

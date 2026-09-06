@@ -99,3 +99,8 @@ cargo build --release \
   --bin bench_atomic_updates \
   --bin bench_head_reload
 */
+
+// rsync -avhzc \
+//   --include '/logs/' \
+//   --exclude '/*/' \
+//   "$REMOTE_HOST:$REMOTE_UBQ/" "$LOCAL_UBQ/remote/"
