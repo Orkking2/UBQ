@@ -28,6 +28,21 @@ except ImportError:
         parse_ubq_queue_label,
     )
 
+try:
+    from scripts.plot_style import (
+        ACCESSIBLE_DIVERGING_CMAP,
+        family_color,
+        family_color_ramp,
+        family_marker,
+    )
+except ImportError:
+    from plot_style import (  # type: ignore
+        ACCESSIBLE_DIVERGING_CMAP,
+        family_color,
+        family_color_ramp,
+        family_marker,
+    )
+
 LEGACY_SCENARIO_MAP = {
     "spsc": "1p1c",
     "mpsc": "4p1c",
@@ -40,6 +55,7 @@ BASELINE_QUEUE_PRIORITY = {
     "concurrent-queue": 2,
 }
 LINE_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "*")
+BATCH_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "h")
 def _is_batched_plain_queue(label: str, queue: str) -> bool:
     parsed = parse_batched_plain_label(label)
     return parsed is not None and parsed[0] == queue
@@ -164,6 +180,21 @@ LUBQ_THROUGHPUT_SPEEDUP_BASELINES = (
         lambda label: _is_batched_plain_queue(label, "moodycamel-cq"),
     ),
 )
+
+# LUBQ's shard reservation backoff (crossbeam default vs. yield) is a tuning
+# knob within one architecture, not a separate one -- so unlike
+# LUBQ_THROUGHPUT_SPEEDUP_BASELINES above (external baselines LUBQ-the-
+# architecture is compared against), this suite compares LUBQ-yield against
+# nothing but LUBQ's own crossbeam default. Mirrors how UBQ's own label
+# variants are tuning knobs, not separate speedup suites.
+LUBQ_YIELD_THROUGHPUT_SPEEDUP_BASELINES = (
+    (
+        "lubq",
+        "LUBQ (crossbeam backoff)",
+        lambda label: label == "lubq",
+        lambda label: _is_batched_plain_queue(label, "lubq"),
+    ),
+)
 UBQ_BATCHED_PREFIX = "ubq_batched_"
 PUBLICATION_SERIES = (
     ("LUBQ", lambda label: label == "lubq"),
@@ -208,6 +239,7 @@ QUEUE_FAMILY_PRIORITY = {
 # changes beyond an optional display-name entry here.
 PLAIN_QUEUE_DISPLAY_NAMES = {
     "lubq": "LUBQ",
+    "lubq-yield": "LUBQ-yield",
     "segqueue": "SegQueue",
     "mutex-vecdeque": "Mutex+VecDeque",
     "ms-queue": "MS-Queue",
@@ -224,6 +256,19 @@ PLAIN_QUEUE_METADATA = {
     "lubq": {
         "family": "LUBQ",
         "publication": "this repository (linked per-producer UBQ shards)",
+        "capacity_model": "unbounded",
+        "ordering": "per-producer FIFO; round-robin shard consumption",
+    },
+    # Same architecture as "lubq", one tuning knob different: no spin-backoff
+    # on the shard's CAS reservation retry (see LubqBackoff::Yield). Kept in
+    # the same "LUBQ" family so family-level plots (scenario lines, best-of-
+    # family charts) pick whichever backoff policy actually wins, exactly
+    # like UBQ's own backoff/pool/block label variants already do. Grace
+    # focused-contention evidence (jobs 351649/351663) showed this is a real,
+    # not cosmetic, difference under 16-32+ concurrent consumers.
+    "lubq-yield": {
+        "family": "LUBQ",
+        "publication": "this repository (linked per-producer UBQ shards; no-spin CAS retry)",
         "capacity_model": "unbounded",
         "ordering": "per-producer FIFO; round-robin shard consumption",
     },
@@ -276,6 +321,21 @@ def collect_run_jsons(runs_dir: Path):
         return []
 
     return sorted(path for path in runs_dir.rglob("*.json") if path.is_file())
+
+
+def parse_machine_label_filters(raw_values):
+    """Normalize repeated and/or comma-separated machine-label filters."""
+    labels = []
+    seen = set()
+    for raw_value in raw_values or ():
+        for raw_label in raw_value.split(","):
+            label = raw_label.strip()
+            if not label:
+                raise ValueError("--machine-labels must not contain an empty label")
+            if label not in seen:
+                seen.add(label)
+                labels.append(label)
+    return tuple(labels)
 
 
 def preferred_plot_python():
@@ -443,6 +503,47 @@ def metric_axis_label(mode: str):
     return "Ops/sec"
 
 
+def metric_uses_compact_count_ticks(mode: str) -> bool:
+    return "ops_per_sec" in metric_column(mode)
+
+
+def format_compact_count(value: float) -> str:
+    """Format counts with at most two significant figures and K/M/B suffixes."""
+    if not math.isfinite(value):
+        return ""
+    magnitude = abs(value)
+    units = ((1, ""), (1_000, "K"), (1_000_000, "M"), (1_000_000_000, "B"))
+    unit_index = max(
+        index for index, (scale, _suffix) in enumerate(units) if magnitude >= scale
+    ) if magnitude >= 1 else 0
+
+    def rounded_value(scale):
+        scaled_value = value / scale
+        if scaled_value == 0:
+            return 0.0, 0
+        places = 1 - math.floor(math.log10(abs(scaled_value)))
+        return round(scaled_value, places), places
+
+    rounded, decimal_places = rounded_value(units[unit_index][0])
+    if abs(rounded) >= 1_000 and unit_index < len(units) - 1:
+        unit_index += 1
+        rounded, decimal_places = rounded_value(units[unit_index][0])
+
+    if rounded == 0:
+        return "0"
+    text = f"{rounded:.{max(0, decimal_places)}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return f"{text}{units[unit_index][1]}"
+
+
+def apply_compact_count_ticks(ax, mode: str) -> None:
+    if not metric_uses_compact_count_ticks(mode):
+        return
+    ax.yaxis.set_major_formatter(lambda value, _position: format_compact_count(value))
+    ax.yaxis.offsetText.set_visible(False)
+
+
 def publication_metric_axis_label(mode: str):
     if mode.endswith("_push_elapsed"):
         return "Elapsed time (ms)"
@@ -581,7 +682,13 @@ def label_sort_key(label: str):
         except ValueError:
             capacity = 2**31
         return (1, 4, capacity, label)
-    order = {"segqueue": 0, "lubq": 1, "concurrent-queue": 2}
+    # "lubq"/"lubq-yield" share lubq's original category (1) and sort by this
+    # sub-index instead, so concurrent-queue and the fastfifo_/lfqueue_/wcq_
+    # prefix categories below keep their existing numbers unchanged.
+    lubq_variant_order = {"lubq": 0, "lubq-yield": 1}
+    if label in lubq_variant_order:
+        return (1, 1, lubq_variant_order[label], label)
+    order = {"segqueue": 0, "concurrent-queue": 2}
     return (1, order.get(label, 99), 0, label)
 
 
@@ -837,6 +944,17 @@ def best_batched_lubq_throughput_entry(entries, _scenario=None):
     return best_throughput_entry(
         entries,
         lambda label: _is_batched_plain_queue(label, "lubq"),
+    )
+
+
+def best_lubq_yield_throughput_entry(entries, _scenario=None):
+    return best_throughput_entry(entries, lambda label: label == "lubq-yield")
+
+
+def best_batched_lubq_yield_throughput_entry(entries, _scenario=None):
+    return best_throughput_entry(
+        entries,
+        lambda label: _is_batched_plain_queue(label, "lubq-yield"),
     )
 
 
@@ -1242,6 +1360,8 @@ def clear_generated_outputs(out_root: Path):
         # batch-native queue) and the split scalar/batched speedup heatmap.
         "*_batchcomp.csv",
         "*_batchcomp.png",
+        "*_batchcomp_overlay.csv",
+        "*_batchcomp_overlay.png",
         "*_scalar.csv",
         "*_scalar.png",
         "*_batched.csv",
@@ -1265,7 +1385,7 @@ def clear_generated_outputs(out_root: Path):
         print(f"Removed {removed} stale plot artifact(s) under: {out_root}")
 
 
-def load_record_samples(path: Path):
+def load_record_samples(path: Path, machine_labels=None):
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1278,6 +1398,8 @@ def load_record_samples(path: Path):
 
     meta = data.get("meta", {})
     machine_label = str(meta.get("machine_label", "local")).strip() or "local"
+    if machine_labels is not None and machine_label not in machine_labels:
+        return
     scenario_meta = normalize_scenario(meta.get("scenario", ""))
 
     for rec in data.get("results", []):
@@ -1433,7 +1555,7 @@ def deduplicate_logical_samples(samples):
     return list(newest.values())
 
 
-def load_grid_coverage(path: Path):
+def load_grid_coverage(path: Path, machine_labels=None):
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1459,6 +1581,8 @@ def load_grid_coverage(path: Path):
         return
 
     machine = str(meta.get("machine_label", "local")).strip() or "local"
+    if machine_labels is not None and machine not in machine_labels:
+        return
     scenario = normalize_scenario(meta.get("scenario", ""))
     for record in data.get("results", []):
         queue = record.get("queue")
@@ -1511,7 +1635,7 @@ def merge_grid_coverage(target, machine, mode, scenario, specification, sample, 
     """
     key = (machine, mode, scenario)
     current = target.get(key)
-    rank = {"sparse": 0, "dense": 1}
+    rank = {"sparse": 0, "dense": 1, "page": 2}
     placement_rank = {"legacy_grouped": 0, "interleaved": 1}
     if current is None:
         current = dict(specification)
@@ -1996,15 +2120,20 @@ def batch_comparison_series_styles(
     family_label="",
     scalar_family: str = "UBQ",
     batched_family: str = "UBQ batched",
+    scalar_color="#111111",
 ):
     """Build coordinated styles around the contention-weighted winning batch.
 
     `cmap`/`family_label` let several families' batch-comparison series share
     one combined plot (see combined_batch_comparison_line_labels_and_styles):
     each family gets its own hue for the batch-size gradient and "best"
-    marker, with a family-name legend prefix, while the scalar-reference
-    styling stays a fixed neutral color across every family so it always
-    reads as "no batching" regardless of hue.
+    marker, with a family-name legend prefix. The optional scalar
+    color lets combined plots keep scalar and batched entries in the same
+    semantic family hue; standalone callers retain the neutral default.
+
+    Line style has one meaning across every family: only the selected best
+    batch is solid. Every other scalar or batch series is dashed; hue/lightness
+    and markers distinguish batch sizes.
 
     `scalar_family`/`batched_family` select which queue_metadata() family pair
     this call is styling.
@@ -2062,7 +2191,7 @@ def batch_comparison_series_styles(
         key=lambda item: item[1],
     )
 
-    cmap = cmap if cmap is not None else plt.get_cmap("coolwarm")
+    cmap = cmap if cmap is not None else plt.get_cmap(ACCESSIBLE_DIVERGING_CMAP)
     prefix = f"{family_label} " if family_label else ""
 
     # Legend text is deliberately terse (no pool/block/backoff dump): with
@@ -2076,8 +2205,9 @@ def batch_comparison_series_styles(
     if scalar_winner is not None:
         styles[scalar_winner] = {
             "label": f"{prefix}scalar",
-            "color": "#111111",
+            "color": scalar_color,
             "marker": "o",
+            "linestyle": "--",
             "linewidth": 2.8,
             "markersize": 6.5,
             "zorder": 6,
@@ -2101,6 +2231,7 @@ def batch_comparison_series_styles(
                 "label": f"{prefix}batch={batch_size}",
                 "color": cmap(fraction),
                 "marker": marker,
+                "linestyle": "--",
                 "linewidth": 1.8,
                 "markersize": 5.5,
                 "zorder": 3,
@@ -2116,6 +2247,7 @@ def batch_comparison_series_styles(
         "label": f"{prefix}batch={winning_batch_size} (best)",
         "color": cmap(1.0),
         "marker": "*",
+        "linestyle": "-",
         "linewidth": 3.2,
         "markersize": 10,
         "zorder": 7,
@@ -2164,26 +2296,36 @@ def plain_batch_comparison_line_labels(entries_by_scenario, mode: str, queue: st
     return labels
 
 
-def plain_batch_comparison_series_styles(plt, labels, queue: str, cmap=None, family_label=""):
+def plain_batch_comparison_series_styles(
+    plt,
+    labels,
+    queue: str,
+    cmap=None,
+    family_label="",
+    scalar_color="#111111",
+    entries_by_scenario=None,
+    mode="throughput",
+):
     """Coordinated gradient across batch sizes (low to high), with the scalar
-    reference as a fixed black line — the plain-queue counterpart of
-    batch_comparison_series_styles. There is no contention-weighted "winning
-    batch size" to center the gradient on here (see
-    plain_batch_comparison_line_labels), so the gradient just spans low to
-    high batch size directly.
+    reference as a dashed line — the plain-queue counterpart of
+    batch_comparison_series_styles. When scenario data is supplied, its
+    contention-weighted best batch is emphasized with a heavier line and
+    star. Every non-winning scalar or batch series is dashed and distinguished
+    by the color gradient plus markers.
 
     `cmap`/`family_label` mirror batch_comparison_series_styles: they let
     several queues' batch-comparison series share one combined plot, each
     with its own hue and a family-name legend prefix.
     """
-    cmap = cmap if cmap is not None else plt.get_cmap("coolwarm")
+    cmap = cmap if cmap is not None else plt.get_cmap(ACCESSIBLE_DIVERGING_CMAP)
     prefix = f"{family_label} " if family_label else ""
     styles = {}
     if queue in labels:
         styles[queue] = {
             "label": f"{prefix}scalar",
-            "color": "#111111",
+            "color": scalar_color,
             "marker": "o",
+            "linestyle": "--",
             "linewidth": 2.8,
             "markersize": 6.5,
             "zorder": 6,
@@ -2196,32 +2338,45 @@ def plain_batch_comparison_series_styles(plt, labels, queue: str, cmap=None, fam
         ),
         key=lambda item: item[1],
     )
+    batched_winner = None
+    if batched and entries_by_scenario:
+        batched_family = queue_metadata(batched[0][0])["family"]
+        batched_winner = next(
+            (
+                label
+                for label in aggregate_family_variation_labels(
+                    entries_by_scenario, mode
+                )
+                if queue_metadata(label)["family"] == batched_family
+            ),
+            None,
+        )
     count = len(batched)
     for idx, (label, batch_size) in enumerate(batched):
         fraction = 0.15 if count <= 1 else 0.15 + 0.70 * idx / (count - 1)
         styles[label] = {
             "label": f"{prefix}batch={batch_size}",
             "color": cmap(fraction),
-            "marker": LINE_MARKERS[idx % len(LINE_MARKERS)],
+            "marker": BATCH_MARKERS[idx % len(BATCH_MARKERS)],
+            "linestyle": "--",
             "linewidth": 1.8,
             "markersize": 5.5,
             "zorder": 3,
         }
+    if batched_winner in styles:
+        winning_batch_size = parse_batched_plain_label(batched_winner)[1]
+        styles[batched_winner].update(
+            {
+                "label": f"{prefix}batch={winning_batch_size} (best)",
+                "color": cmap(1.0),
+                "marker": "*",
+                "linestyle": "-",
+                "linewidth": 3.2,
+                "markersize": 10,
+                "zorder": 7,
+            }
+        )
     return styles
-
-
-# Sequential colormaps, one per queue family, cycled if more families ever
-# show up than colors listed here. UBQ always takes the first (Blues); plain
-# queues take the rest in plain_batch_family_queues' stable sorted order.
-BATCH_COMPARISON_FAMILY_COLORMAPS = (
-    "Blues",
-    "Oranges",
-    "Greens",
-    "Purples",
-    "Reds",
-    "YlOrBr",
-    "PuBuGn",
-)
 
 
 # UBQ-shaped families handled by batch_comparison_line_labels/_series_styles
@@ -2271,12 +2426,99 @@ def combined_batch_comparison_line_labels(entries_by_scenario, mode="throughput"
     ]
 
 
+def combined_best_batch_comparison_families(
+    entries_by_scenario, mode="throughput"
+):
+    """Reduce each queue to its scalar winner and contention-weighted best batch.
+
+    Selection is performed within each plotted queue so tuning variants that
+    share a metadata family (for example LUBQ backoff variants) do not suppress
+    one another's best batch in the overlaid comparison.
+    """
+    selected_families = []
+    for family, family_labels in combined_batch_comparison_families(
+        entries_by_scenario, mode
+    ):
+        family_label_set = set(family_labels)
+        family_entries = {
+            scenario: {
+                label: stats
+                for label, stats in entries.items()
+                if label in family_label_set
+            }
+            for scenario, entries in entries_by_scenario.items()
+        }
+        selected = set(aggregate_family_variation_labels(family_entries, mode))
+        labels = [label for label in family_labels if label in selected]
+        if labels:
+            selected_families.append((family, labels))
+    return selected_families
+
+
+def combined_best_batch_comparison_line_labels(
+    entries_by_scenario, mode="throughput"
+):
+    """Flat scalar-plus-best-batch label list for the overlaid comparison."""
+    return [
+        label
+        for _family, labels in combined_best_batch_comparison_families(
+            entries_by_scenario, mode
+        )
+        for label in labels
+    ]
+
+
+def combined_best_batch_comparison_series_styles(families):
+    """Queue-colored overlay styles with line shape encoding method kind."""
+    ubq_shaped_family_keys = {
+        family_key for family_key, _, _ in UBQ_SHAPED_BATCH_FAMILIES
+    }
+    styles = {}
+    for index, (family, labels) in enumerate(families):
+        display_family = (
+            FAMILY_DISPLAY_LABELS.get(family, family)
+            if family in ubq_shaped_family_keys
+            else plain_queue_display_name(family)
+        )
+        color = family_color(family, index)
+        marker = family_marker(family, index)
+        for label in labels:
+            if family in ubq_shaped_family_keys:
+                parsed_batch = parse_batched_ubq_label(label)
+                batch_size = parsed_batch[0] if parsed_batch is not None else None
+            else:
+                parsed_batch = parse_batched_plain_label(label)
+                batch_size = parsed_batch[1] if parsed_batch is not None else None
+
+            if batch_size is None:
+                styles[label] = {
+                    "label": f"{display_family} scalar",
+                    "color": color,
+                    "marker": marker,
+                    "linestyle": "--",
+                    "linewidth": 2.0,
+                    "markersize": 6,
+                    "zorder": 3,
+                }
+            else:
+                styles[label] = {
+                    "label": f"{display_family} batch={batch_size} (best)",
+                    "color": color,
+                    "marker": marker,
+                    "linestyle": "-",
+                    "linewidth": 2.8,
+                    "markersize": 7,
+                    "zorder": 4,
+                }
+    return styles
+
+
 def combined_batch_comparison_series_styles(plt, families, entries_by_scenario, mode="throughput"):
-    """Per-family-hued styles for combined_batch_comparison_families' output:
-    each family gets its own colormap (BATCH_COMPARISON_FAMILY_COLORMAPS) so
-    they stay visually distinguishable once overlaid on one plot, while the
-    gradient-by-batch-size/scalar-reference/"best" structure within each
-    family stays the same as the single-family plots this replaces.
+    """Accessible semantic styles for the combined batch-comparison output.
+
+    Each family gets a stable colorblind-safe base hue; lightness plus markers
+    encode batch size. Only each family's selected best is solid; every other
+    scalar or batch series is dashed.
     """
     ubq_shaped_families = {
         family_key: (scalar_family, batched_family)
@@ -2284,9 +2526,8 @@ def combined_batch_comparison_series_styles(plt, families, entries_by_scenario, 
     }
     styles = {}
     for idx, (family, family_labels) in enumerate(families):
-        cmap = plt.get_cmap(
-            BATCH_COMPARISON_FAMILY_COLORMAPS[idx % len(BATCH_COMPARISON_FAMILY_COLORMAPS)]
-        )
+        cmap = family_color_ramp(family, idx)
+        scalar_color = family_color(family, idx)
         if family in ubq_shaped_families:
             scalar_family, batched_family = ubq_shaped_families[family]
             styles.update(
@@ -2296,9 +2537,9 @@ def combined_batch_comparison_series_styles(plt, families, entries_by_scenario, 
                     entries_by_scenario,
                     mode,
                     cmap=cmap,
-                    family_label=FAMILY_DISPLAY_LABELS.get(family, family),
                     scalar_family=scalar_family,
                     batched_family=batched_family,
+                    scalar_color=scalar_color,
                 )
             )
         else:
@@ -2308,26 +2549,19 @@ def combined_batch_comparison_series_styles(plt, families, entries_by_scenario, 
                     family_labels,
                     family,
                     cmap=cmap,
-                    family_label=plain_queue_display_name(family),
+                    scalar_color=scalar_color,
+                    entries_by_scenario=entries_by_scenario,
+                    mode=mode,
                 )
             )
     return styles
 
 
 def combined_batch_comparison_color_key(families, styles):
-    """(row_labels, col_keys, cell_colors, best_cells) for a compact
-    family x batch-size color key, built directly from the same `styles`
-    dict actually used to draw the lines (combined_batch_comparison_series_
-    styles' output) — every cell's fill is the exact color its line is
-    plotted in, so the key can never drift out of sync with the plot.
-
-    Rows are queue families (their color says which queue), columns are
-    batch sizes plus a leading "scalar" column (the hue within a row says
-    which batch size). `cell_colors` maps `(row_index, col_key)` to an RGBA
-    color; `best_cells` is the set of `(row_index, col_key)` pairs to mark
-    as that family's best-performing batch size.
-    """
-    ubq_shaped_family_keys = {family_key for family_key, _, _ in UBQ_SHAPED_BATCH_FAMILIES}
+    """Build the family x batch-size shade grid used as the compact legend."""
+    ubq_shaped_family_keys = {
+        family_key for family_key, _, _ in UBQ_SHAPED_BATCH_FAMILIES
+    }
     row_labels = []
     cell_colors = {}
     best_cells = set()
@@ -2346,9 +2580,11 @@ def combined_batch_comparison_color_key(families, styles):
                 parsed = parse_batched_plain_label(label)
                 return None if parsed is None else parsed[1]
 
-        row_idx = len(row_labels)
+        row_index = len(row_labels)
         row_labels.append(
-            family_key if family_key in ubq_shaped_family_keys else plain_queue_display_name(family_key)
+            family_key
+            if family_key in ubq_shaped_family_keys
+            else plain_queue_display_name(family_key)
         )
         for label in family_labels:
             style = styles.get(label)
@@ -2356,68 +2592,58 @@ def combined_batch_comparison_color_key(families, styles):
                 continue
             batch_size = batch_size_of(label)
             if batch_size is None:
-                # First one wins: for UBQ this is the primary scalar
-                # reference (its own family_labels list puts that first),
-                # not the secondary "matched" scalar counterpart — the key
-                # stays to one swatch per row per column.
-                cell_colors.setdefault((row_idx, "scalar"), style["color"])
+                cell_colors.setdefault((row_index, "scalar"), style["color"])
                 has_scalar_column = True
-            else:
-                cell_colors[(row_idx, batch_size)] = style["color"]
-                batch_sizes.add(batch_size)
-                if style.get("marker") == "*":
-                    best_cells.add((row_idx, batch_size))
+                continue
+            cell_colors[(row_index, batch_size)] = style["color"]
+            batch_sizes.add(batch_size)
+            if style.get("marker") == "*":
+                best_cells.add((row_index, batch_size))
 
-    col_keys = (["scalar"] if has_scalar_column else []) + sorted(batch_sizes)
-    return row_labels, col_keys, cell_colors, best_cells
+    columns = (["scalar"] if has_scalar_column else []) + sorted(batch_sizes)
+    return row_labels, columns, cell_colors, best_cells
 
 
-def draw_batch_comparison_color_key(ax, row_labels, col_keys, cell_colors, best_cells):
-    """Render combined_batch_comparison_color_key's output as a compact
-    swatch grid, replacing one legend entry per plotted line with one entry
-    per (family, batch size) cell — the same imshow-grid-plus-white-gridlines
-    look as plot_throughput_speedup_grid, for a consistent visual language
-    with the rest of the plots.
-    """
+def draw_batch_comparison_color_key(
+    ax, row_labels, columns, cell_colors, best_cells
+):
+    """Render a compact shade grid instead of one legend item per line."""
     from matplotlib.colors import to_rgba
 
     blank = (0.93, 0.93, 0.93, 1.0)
-    # Cell colors come straight from series_styles, which mixes literal hex
-    # strings (the fixed scalar/matched-scalar colors) with RGBA tuples
-    # (everything from a colormap) — imshow needs one consistent shape, so
-    # normalize every cell to RGBA before building the grid.
     grid = [
-        [to_rgba(cell_colors.get((row_idx, col_key), blank)) for col_key in col_keys]
-        for row_idx in range(len(row_labels))
+        [
+            to_rgba(cell_colors.get((row_index, column), blank))
+            for column in columns
+        ]
+        for row_index in range(len(row_labels))
     ]
     ax.imshow(grid, aspect="auto", origin="upper")
     ax.set_xticks(
-        range(len(col_keys)),
-        ["scalar" if key == "scalar" else str(key) for key in col_keys],
-        rotation=45,
+        range(len(columns)),
+        ["scalar" if column == "scalar" else str(column) for column in columns],
+        rotation=40,
         ha="right",
         fontsize=7.5,
     )
     ax.set_yticks(range(len(row_labels)), row_labels, fontsize=8.5)
-    ax.set_xticks([idx - 0.5 for idx in range(1, len(col_keys))], minor=True)
-    ax.set_yticks([idx - 0.5 for idx in range(1, len(row_labels))], minor=True)
+    ax.set_xticks([index - 0.5 for index in range(1, len(columns))], minor=True)
+    ax.set_yticks([index - 0.5 for index in range(1, len(row_labels))], minor=True)
     ax.grid(which="minor", color="white", linestyle="-", linewidth=1.5)
     ax.tick_params(which="minor", bottom=False, left=False, length=0)
     ax.tick_params(which="major", bottom=False, left=False)
-    ax.set_title("batch size", fontsize=8.5)
-    for row_idx in range(len(row_labels)):
-        for col_idx, col_key in enumerate(col_keys):
-            if (row_idx, col_key) in best_cells:
-                ax.text(
-                    col_idx,
-                    row_idx,
-                    "*",
-                    ha="center",
-                    va="center",
-                    fontsize=13,
-                    color="white",
-                    fontweight="bold",
-                )
+    ax.set_title("Batch-size color key (* = selected best)", fontsize=9)
+    for row_index, column in best_cells:
+        ax.text(
+            columns.index(column),
+            row_index,
+            "*",
+            ha="center",
+            va="center",
+            fontsize=13,
+            color="white",
+            fontweight="bold",
+        )
     for spine in ax.spines.values():
         spine.set_visible(False)
 
@@ -2564,6 +2790,17 @@ def lubq_throughput_speedup_rows(entries_by_scenario):
         scalar_selector=best_lubq_throughput_entry,
         batched_selector=best_batched_lubq_throughput_entry,
         baseline_specs=LUBQ_THROUGHPUT_SPEEDUP_BASELINES,
+    )
+
+
+def lubq_yield_throughput_speedup_rows(entries_by_scenario):
+    return _target_throughput_speedup_rows(
+        entries_by_scenario,
+        target_key="lubq_yield",
+        target_title="LUBQ (yield backoff)",
+        scalar_selector=best_lubq_yield_throughput_entry,
+        batched_selector=best_batched_lubq_yield_throughput_entry,
+        baseline_specs=LUBQ_YIELD_THROUGHPUT_SPEEDUP_BASELINES,
     )
 
 
@@ -2768,6 +3005,10 @@ def write_throughput_speedup_csv(out_path: Path, rows):
 
 def write_lubq_throughput_speedup_csv(out_path: Path, rows):
     return _write_target_throughput_speedup_csv(out_path, rows, "lubq")
+
+
+def write_lubq_yield_throughput_speedup_csv(out_path: Path, rows):
+    return _write_target_throughput_speedup_csv(out_path, rows, "lubq_yield")
 
 
 def write_pool_size_observations_csv(out_path: Path, observations, mode: str = "throughput"):
@@ -3121,7 +3362,7 @@ def _plot_target_throughput_speedup_grid(
     vmin = min(-3.0, max(-6.0, min(finite_logs)))
     vmax = max(3.0, min(6.0, max(finite_logs)))
     norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
-    cmap = plt.get_cmap("RdYlGn").copy()
+    cmap = plt.get_cmap(ACCESSIBLE_DIVERGING_CMAP).copy()
     cmap.set_bad("#f2f2f2")
 
     all_target_kinds = (
@@ -3271,6 +3512,28 @@ def plot_lubq_throughput_speedup_grid(
     )
 
 
+def plot_lubq_yield_throughput_speedup_grid(
+    plt,
+    out_path: Path,
+    machine: str,
+    entries_by_scenario,
+    capacity=None,
+    lubq_yield_kind_filter=None,
+):
+    return _plot_target_throughput_speedup_grid(
+        plt,
+        out_path,
+        machine,
+        entries_by_scenario,
+        lubq_yield_throughput_speedup_rows(entries_by_scenario),
+        target_key="lubq_yield",
+        target_title="LUBQ (yield backoff)",
+        baseline_specs=LUBQ_YIELD_THROUGHPUT_SPEEDUP_BASELINES,
+        capacity=capacity,
+        target_kind_filter=lubq_yield_kind_filter,
+    )
+
+
 def plot_pool_size_effect(plt, out_path: Path, machine: str, entries_by_scenario):
     """Plot median matched UBQ performance relative to pool=0."""
     rows = pool_size_effect_rows(entries_by_scenario, "throughput")
@@ -3304,7 +3567,7 @@ def plot_pool_size_effect(plt, out_path: Path, machine: str, entries_by_scenario
 
     limit = max(0.1, max(abs(value) for value in finite_logs))
     norm = TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
-    cmap = plt.get_cmap("RdYlGn").copy()
+    cmap = plt.get_cmap(ACCESSIBLE_DIVERGING_CMAP).copy()
     cmap.set_bad("#f2f2f2")
 
     width = max(8.0, len(methods) * (2.8 + 0.72 * len(pool_sizes)))
@@ -3401,45 +3664,34 @@ def plot_scenario_lines(
     family=None,
     title=None,
     series_styles=None,
-    color_key_families=None,
+    batch_panel_families=None,
+    force_log_y=False,
+    show_queue_label_legend_title=True,
 ):
     if not scenarios or not labels:
         return
 
-    plot_width = max(8.0, 0.55 * len(scenarios) + 4.5)
+    if batch_panel_families is not None:
+        return plot_batch_comparison_panels(
+            plt,
+            out_path,
+            machine,
+            mode,
+            scenarios,
+            entries_by_scenario,
+            error_bars,
+            batch_panel_families,
+            series_styles or {},
+            family=family,
+            title=title,
+        )
 
-    if color_key_families is not None:
-        # Combined batch-comparison plot: a compact family x batch-size
-        # swatch grid replaces the usual per-line legend (see
-        # combined_batch_comparison_color_key) — with several families each
-        # contributing a scalar entry plus every batch size, a standard
-        # legend would need one row per line (20-30+), dwarfing the plot
-        # itself. Its size is fixed by row/column count, not by measuring
-        # rendered content, so no legend-width dance is needed here.
-        row_labels, col_keys, cell_colors, best_cells = combined_batch_comparison_color_key(
-            color_key_families, series_styles or {}
-        )
-        key_width = max(2.4, 0.42 * len(col_keys) + 1.0)
-        key_height = max(1.8, 0.34 * len(row_labels) + 0.9)
-        fig, (ax, key_ax) = plt.subplots(
-            1,
-            2,
-            figsize=(plot_width + key_width + 0.6, max(6.5, key_height + 1.6)),
-            gridspec_kw={"width_ratios": [plot_width, key_width]},
-        )
-    else:
-        # A small, roughly-right starting canvas — just enough margin for
-        # tight_layout to size the axes close to `plot_width` without a
-        # legend in the picture yet (bbox_to_anchor places it outside the
-        # axes, so tight_layout can't account for it). This gets corrected
-        # below once the legend's actual rendered size is known; starting
-        # from something already close to right matters because if this
-        # guess is much wider than `plot_width`, tight_layout gives the axes
-        # most of that extra width too (nothing else is competing for it
-        # yet), inflating the measured axes width and pushing the legend
-        # away from the plot in the final image.
-        fig, ax = plt.subplots(figsize=(plot_width + 2.0, 6.5))
-        key_ax = None
+    plot_width = max(8.0, 0.55 * len(scenarios) + 4.5)
+    # A small, roughly-right starting canvas — just enough margin for
+    # tight_layout to size the axes close to `plot_width` without a legend in
+    # the picture yet. This gets corrected below once the legend's actual
+    # rendered size is known.
+    fig, ax = plt.subplots(figsize=(plot_width + 2.0, 6.5))
     x_positions = list(range(len(scenarios)))
     color_map = plt.get_cmap("tab20", max(len(labels), 1))
 
@@ -3477,61 +3729,177 @@ def plot_scenario_lines(
     ax.set_xticks(x_positions, scenarios, rotation=40, ha="right")
     ax.set_xlabel(family_axis_label(family))
     ax.set_ylabel(metric_axis_label(mode))
-    log_y = scenario_line_uses_log_y(mode)
+    log_y = force_log_y or scenario_line_uses_log_y(mode)
     if log_y:
         ax.set_yscale("log")
+    apply_compact_count_ticks(ax, mode)
     family_prefix = f"{family.upper()} " if family else ""
     ax.set_title(
         title or f"{machine}: {family_prefix}{metric_display_name(mode)} scaling"
     )
     ax.grid(axis="y", which="both" if log_y else "major", linestyle=":", alpha=0.4)
 
-    if key_ax is not None:
-        draw_batch_comparison_color_key(key_ax, row_labels, col_keys, cell_colors, best_cells)
-        fig.tight_layout()
-    else:
-        legend = ax.legend(
-            loc="center left",
-            bbox_to_anchor=(1.02, 0.5),
-            fontsize=8,
-            frameon=False,
-            ncol=max(1, math.ceil(len(labels) / 10)),
-            handlelength=1.6,
-            handletextpad=0.5,
-            columnspacing=1.1,
-            labelspacing=0.35,
-            **queue_label_legend_kwargs(labels),
-        )
-        fig.tight_layout()
+    legend = ax.legend(
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        fontsize=8,
+        frameon=False,
+        ncol=max(1, math.ceil(len(labels) / 10)),
+        handlelength=1.6,
+        handletextpad=0.5,
+        columnspacing=1.1,
+        labelspacing=0.35,
+        **(
+            queue_label_legend_kwargs(labels)
+            if show_queue_label_legend_title
+            else {}
+        ),
+    )
+    fig.tight_layout()
 
-        # tight_layout has no idea how wide the legend actually rendered (it
-        # lives outside the axes via bbox_to_anchor, not in the managed
-        # layout), so a many-entry legend can overflow whatever fraction of
-        # the canvas was guessed and, once bbox_inches="tight" crops to the
-        # true rendered extent below, squeeze the plot itself down to a
-        # sliver next to a legend that ends up taking most of the image.
-        # Instead of guessing, measure the legend's real rendered width and
-        # grow the canvas by exactly that much so the plot keeps its
-        # intended size no matter how large the legend needs to be.
-        fig.canvas.draw()
-        axes_position = ax.get_position()
-        fig_width_in, fig_height_in = fig.get_size_inches()
-        plot_width_in = axes_position.width * fig_width_in
-        legend_width_in = legend.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
-        gap_in = 0.35
-        new_fig_width_in = (
-            axes_position.x0 * fig_width_in + plot_width_in + legend_width_in + gap_in
-        )
-        fig.set_size_inches(new_fig_width_in, fig_height_in)
-        ax.set_position(
-            [
-                axes_position.x0 * fig_width_in / new_fig_width_in,
-                axes_position.y0,
-                plot_width_in / new_fig_width_in,
-                axes_position.height,
-            ]
-        )
+    # tight_layout has no idea how wide the externally anchored legend
+    # rendered, so measure it and grow the canvas by exactly that much.
+    fig.canvas.draw()
+    axes_position = ax.get_position()
+    fig_width_in, fig_height_in = fig.get_size_inches()
+    plot_width_in = axes_position.width * fig_width_in
+    legend_width_in = legend.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
+    gap_in = 0.35
+    new_fig_width_in = (
+        axes_position.x0 * fig_width_in + plot_width_in + legend_width_in + gap_in
+    )
+    fig.set_size_inches(new_fig_width_in, fig_height_in)
+    ax.set_position(
+        [
+            axes_position.x0 * fig_width_in / new_fig_width_in,
+            axes_position.y0,
+            plot_width_in / new_fig_width_in,
+            axes_position.height,
+        ]
+    )
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_batch_comparison_panels(
+    plt,
+    out_path: Path,
+    machine: str,
+    mode: str,
+    scenarios,
+    entries_by_scenario,
+    error_bars: str,
+    families,
+    series_styles,
+    family=None,
+    title=None,
+):
+    """Draw one horizontally adjacent, shared-y panel per queue family."""
+    panel_count = len(families)
+    if panel_count == 0:
+        return
+
+    row_labels, columns, cell_colors, best_cells = (
+        combined_batch_comparison_color_key(families, series_styles)
+    )
+    key_height = max(1.55, 0.26 * len(row_labels) + 0.65)
+    fig_height = 5.4 + key_height
+    fig, axes_grid = plt.subplots(
+        1,
+        panel_count,
+        figsize=(max(8.5, 3.45 * panel_count), fig_height),
+        sharey=True,
+        squeeze=False,
+    )
+    axes = list(axes_grid[0])
+    x_positions = list(range(len(scenarios)))
+    log_y = scenario_line_uses_log_y(mode) or metric_uses_compact_count_ticks(mode)
+
+    for panel_index, (ax, (family_key, family_labels)) in enumerate(
+        zip(axes, families)
+    ):
+        for label in family_labels:
+            xs = []
+            ys = []
+            yerrs = []
+            for x_pos, scenario in zip(x_positions, scenarios):
+                stats = entries_by_scenario[scenario].get(label)
+                if stats is None:
+                    continue
+                xs.append(x_pos)
+                ys.append(stats["mean_ops_per_sec"])
+                err = error_value(stats, error_bars)
+                if err is not None:
+                    yerrs.append(err)
+
+            if not xs:
+                continue
+
+            plot_kwargs = {
+                "label": display_label(label),
+                "color": family_color(family_key, panel_index),
+                "marker": family_marker(family_key, panel_index),
+                "linewidth": 1.8,
+                "markersize": 5,
+            }
+            plot_kwargs.update(series_styles.get(label, {}))
+            if yerrs and any(value != 0.0 for value in yerrs):
+                ax.errorbar(xs, ys, yerr=yerrs, capsize=2.5, **plot_kwargs)
+            else:
+                ax.plot(xs, ys, **plot_kwargs)
+
+        panel_title = (
+            FAMILY_DISPLAY_LABELS.get(family_key, family_key)
+            if family_key in {key for key, _, _ in UBQ_SHAPED_BATCH_FAMILIES}
+            else plain_queue_display_name(family_key)
+        )
+        ax.set_title(panel_title, fontsize=11)
+        ax.set_xticks(x_positions, scenarios, rotation=40, ha="right")
+        ax.set_xlabel(family_axis_label(family))
+        if panel_index == 0:
+            ax.set_ylabel(metric_axis_label(mode))
+        if log_y:
+            ax.set_yscale("log")
+        apply_compact_count_ticks(ax, mode)
+        ax.grid(
+            axis="y",
+            which="both" if log_y else "major",
+            linestyle=":",
+            alpha=0.4,
+        )
+        ax.grid(axis="x", which="major", linestyle=":", alpha=0.16)
+
+    family_prefix = f"{family.upper()} " if family else ""
+    fig.suptitle(
+        title or f"{machine}: {family_prefix}{metric_display_name(mode)} batch comparison",
+        fontsize=14,
+        y=0.98,
+    )
+    key_bottom = 0.035
+    key_fraction = max(
+        0.14, min(0.19, (key_height - 0.35) / fig_height)
+    )
+    bottom = min(0.47, key_bottom + key_fraction + 0.16)
+    fig.subplots_adjust(
+        left=0.055,
+        right=0.992,
+        top=0.90,
+        bottom=bottom,
+        wspace=0.08,
+    )
+    key_ax = fig.add_axes(
+        [
+            0.16,
+            key_bottom,
+            0.68,
+            key_fraction,
+        ]
+    )
+    draw_batch_comparison_color_key(
+        key_ax, row_labels, columns, cell_colors, best_cells
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -3563,8 +3931,11 @@ def plot_machine_comparison_lines(
     )
     axes = list(axes[0])
     color_map = plt.get_cmap("tab20", max(len(labels), 1))
-    colors = {label: color_map(idx) for idx, label in enumerate(labels)}
-    markers = {label: LINE_MARKERS[idx % len(LINE_MARKERS)] for idx, label in enumerate(labels)}
+    colors = {label: color_map(index) for index, label in enumerate(labels)}
+    markers = {
+        label: LINE_MARKERS[index % len(LINE_MARKERS)]
+        for index, label in enumerate(labels)
+    }
     handles_by_label = {}
     log_y = scenario_line_uses_log_y(mode)
     positive_y_values = []
@@ -3624,6 +3995,7 @@ def plot_machine_comparison_lines(
             ax.set_ylabel(y_axis_label or metric_axis_label(mode))
         if log_y:
             ax.set_yscale("log")
+        apply_compact_count_ticks(ax, mode)
 
     if log_y and positive_y_values:
         y_min = min(positive_y_values) / 1.8
@@ -3662,6 +4034,16 @@ def main():
     parser.add_argument(
         "--runs-dir",
         help="Recursively load benchmark JSON files from a runs directory tree",
+    )
+    parser.add_argument(
+        "--machine-labels",
+        action="append",
+        dest="machine_label_filters",
+        default=[],
+        help=(
+            "Only plot JSON records whose meta.machine_label matches one of these labels. "
+            "Accepts comma-separated labels and can be repeated."
+        ),
     )
     parser.add_argument(
         "--csv-dir",
@@ -3706,12 +4088,22 @@ def main():
     )
     args = parser.parse_args()
 
+    try:
+        selected_machine_labels = parse_machine_label_filters(args.machine_label_filters)
+    except ValueError as exc:
+        parser.error(str(exc))
+    selected_machine_label_set = (
+        frozenset(selected_machine_labels) if selected_machine_labels else None
+    )
+
     files = [Path(file) for file in args.files]
     if args.runs_dir:
         files.extend(collect_run_jsons(Path(args.runs_dir)))
 
     if args.csv_dirs and files:
         parser.error("provide either benchmark JSON input/--runs-dir or --csv-dir, not both")
+    if args.csv_dirs and selected_machine_labels:
+        parser.error("--machine-labels filters JSON input and cannot be used with --csv-dir")
     if not files and not args.csv_dirs:
         parser.error("provide at least one benchmark JSON file, --runs-dir, or --csv-dir")
     if args.machine_labels and not args.csv_dirs:
@@ -3749,7 +4141,7 @@ def main():
         sample_points = 0
 
         for path in files:
-            for sample in load_record_samples(path):
+            for sample in load_record_samples(path, selected_machine_label_set):
                 logical_key = (
                     sample["machine"],
                     sample["scenario"],
@@ -3766,7 +4158,9 @@ def main():
                     machine_capacity[sample["machine"]] = max(
                         machine_capacity.get(sample["machine"], 0), capacity
                     )
-            for machine, mode, scenario, specification, sample, status in load_grid_coverage(path):
+            for machine, mode, scenario, specification, sample, status in load_grid_coverage(
+                path, selected_machine_label_set
+            ):
                 merge_grid_coverage(
                     grid_coverage,
                     machine,
@@ -3778,11 +4172,14 @@ def main():
                 )
 
         if sample_points == 0:
-            print("No benchmark records found in input files.")
+            if selected_machine_labels:
+                print(
+                    "No benchmark records found for machine label(s): "
+                    + ", ".join(selected_machine_labels)
+                )
+            else:
+                print("No benchmark records found in input files.")
             return
-
-        if not args.no_clean:
-            clear_generated_outputs(out_root)
 
         # Each (machine_label, scenario) already resolves to a single
         # coalesced record on disk, so there's no cross-environment
@@ -3813,6 +4210,13 @@ def main():
             grouped.setdefault(machine, {}).setdefault(mode, {}).setdefault(scenario, {})[label] = (
                 summarize_ops(samples, authoritative_data[(machine, placement, mode, scenario, label)])
             )
+
+        if not args.no_clean:
+            if selected_machine_labels:
+                for machine in sorted(grouped, key=machine_sort_key):
+                    clear_generated_outputs(out_root / machine)
+            else:
+                clear_generated_outputs(out_root)
 
         for machine in sorted(grouped):
             for mode in sorted(grouped[machine], key=mode_sort_key):
@@ -3969,6 +4373,26 @@ def main():
                     selected_entries,
                 )
                 print(f"Wrote CSV: {batch_csv_path}")
+            if family == "symmetric":
+                overlay_labels = combined_best_batch_comparison_line_labels(
+                    selected_entries
+                )
+                if overlay_labels:
+                    overlay_csv_path = (
+                        out_root
+                        / machine
+                        / "csv"
+                        / "throughput"
+                        / "symmetric_line_throughput_batchcomp_overlay.csv"
+                    )
+                    write_scenario_line_csv(
+                        overlay_csv_path,
+                        "throughput",
+                        selected_scenarios,
+                        overlay_labels,
+                        selected_entries,
+                    )
+                    print(f"Wrote CSV: {overlay_csv_path}")
 
     # Speedup tables do not depend on matplotlib. Emit them before importing
     # the plotting runtime so CSV-only environments still receive both the
@@ -3989,6 +4413,12 @@ def main():
                 lubq_throughput_speedup_rows(entries_by_scenario),
                 "lubq_kind",
                 write_lubq_throughput_speedup_csv,
+            ),
+            (
+                "lubq_yield",
+                lubq_yield_throughput_speedup_rows(entries_by_scenario),
+                "lubq_yield_kind",
+                write_lubq_yield_throughput_speedup_csv,
             ),
         )
         for target_slug, speedup_rows, kind_key, writer in comparison_suites:
@@ -4045,6 +4475,12 @@ def main():
                 lubq_throughput_speedup_rows(entries_by_scenario),
                 "lubq_kind",
                 plot_lubq_throughput_speedup_grid,
+            ),
+            (
+                "lubq_yield",
+                lubq_yield_throughput_speedup_rows(entries_by_scenario),
+                "lubq_yield_kind",
+                plot_lubq_yield_throughput_speedup_grid,
             ),
         )
         for target_slug, speedup_rows, kind_key, plotter in comparison_suites:
@@ -4150,9 +4586,49 @@ def main():
                     series_styles=combined_batch_comparison_series_styles(
                         plt, batch_families, selected_entries, mode
                     ),
-                    color_key_families=batch_families,
+                    batch_panel_families=batch_families,
                 )
                 print(f"Wrote PNG: {batch_png_path}")
+                if family != "symmetric":
+                    continue
+                overlay_families = combined_best_batch_comparison_families(
+                    selected_entries, mode
+                )
+                overlay_labels = [
+                    label
+                    for _queue, labels in overlay_families
+                    for label in labels
+                ]
+                if not overlay_labels:
+                    continue
+                overlay_png_path = (
+                    out_root
+                    / machine
+                    / mode
+                    / "symmetric_line_throughput_batchcomp_overlay.png"
+                )
+                plot_scenario_lines(
+                    plt,
+                    overlay_png_path,
+                    machine,
+                    mode,
+                    selected_scenarios,
+                    overlay_labels,
+                    selected_entries,
+                    args.error_bars,
+                    family=family,
+                    title=(
+                        f"{machine}: symmetric XpXc throughput scalar vs best batch"
+                    ),
+                    series_styles=(
+                        combined_best_batch_comparison_series_styles(
+                            overlay_families
+                        )
+                    ),
+                    force_log_y=True,
+                    show_queue_label_legend_title=False,
+                )
+                print(f"Wrote PNG: {overlay_png_path}")
 
 
 if __name__ == "__main__":

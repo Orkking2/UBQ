@@ -24,7 +24,17 @@ if ((index >= ${#scenarios[@]})); then
 fi
 
 scenario=${scenarios[$index]}
-queue_set=ubq,lubq,segqueue,concurrent-queue,rbbq,lfqueue,wcq,mutex-vecdeque,ms-queue,moodycamel-cq
+queue_set=${UBQ_BENCH_QUEUES:-ubq,lubq,segqueue,concurrent-queue,rbbq,lfqueue,mutex-vecdeque,ms-queue,moodycamel-cq}
+batch_sizes=${UBQ_BENCH_BATCH_SIZES:-2,8,16,64,256,1024,4096,16384,65536,131072,262144}
+fastfifo_block_sizes=${UBQ_BENCH_FASTFIFO_BLOCK_SIZES:-64,256,1024,4096}
+fastfifo_capacities=${UBQ_BENCH_FASTFIFO_CAPACITIES:-1048576}
+lfqueue_segment_sizes=${UBQ_BENCH_LFQUEUE_SEGMENT_SIZES:-32,256,1024}
+wcq_capacities=${UBQ_BENCH_WCQ_CAPACITIES:-4096,65536,1048576}
+repeats=${UBQ_BENCH_REPEATS:-3}
+throughput_warmup_ms=${UBQ_BENCH_WARMUP_MS:-250}
+throughput_pilot_ms=${UBQ_BENCH_PILOT_MS:-100}
+throughput_phase_ms=${UBQ_BENCH_PHASE_MS:-1000}
+throughput_max_round_items=${UBQ_BENCH_MAX_ROUND_ITEMS:-8388608}
 
 if [[ ! "$scenario" =~ ^[0-9]+p[0-9]+c$ ]]; then
     echo "Invalid scenario: $scenario" >&2
@@ -48,6 +58,14 @@ install -m 0755 "$binary" "$TMPDIR/bench_grid"
     hostname
     printf 'scenario=%s\n' "$scenario"
     printf 'queues=%s\n' "$queue_set"
+    printf 'batch_sizes=%s\n' "$batch_sizes"
+    printf 'fastfifo_block_sizes=%s\n' "$fastfifo_block_sizes"
+    printf 'fastfifo_capacities=%s\n' "$fastfifo_capacities"
+    printf 'lfqueue_segment_sizes=%s\n' "$lfqueue_segment_sizes"
+    printf 'repeats=%s\n' "$repeats"
+    printf 'throughput_warmup_ms=%s\n' "$throughput_warmup_ms"
+    printf 'throughput_pilot_ms=%s\n' "$throughput_pilot_ms"
+    printf 'throughput_phase_ms=%s\n' "$throughput_phase_ms"
     sha256sum "$TMPDIR/bench_grid"
     lscpu
     env | LC_ALL=C sort | sed -n '/^SLURM_/p'
@@ -81,14 +99,14 @@ srun \
     --scenarios "$scenario" \
     --queues "$queue_set" \
     --modes throughput \
-    --repeats 3 \
-    --batch-sizes 2,8,16,64,256,1024,4096,16384,65536,131072,262144 \
-    --fastfifo-block-sizes 64,256,1024,4096 \
-    --fastfifo-capacities 1048576 \
-    --lfqueue-segment-sizes 32,256,1024 \
-    --wcq-capacities 4096,65536,1048576 \
+    --repeats "$repeats" \
+    --batch-sizes "$batch_sizes" \
+    --fastfifo-block-sizes "$fastfifo_block_sizes" \
+    --fastfifo-capacities "$fastfifo_capacities" \
+    --lfqueue-segment-sizes "$lfqueue_segment_sizes" \
+    --wcq-capacities "$wcq_capacities" \
     --schedule-seed 0x55425106 \
-    --throughput-warmup-ms 250 \
-    --throughput-pilot-ms 100 \
-    --throughput-phase-ms 1000 \
-    --throughput-max-round-items 8388608
+    --throughput-warmup-ms "$throughput_warmup_ms" \
+    --throughput-pilot-ms "$throughput_pilot_ms" \
+    --throughput-phase-ms "$throughput_phase_ms" \
+    --throughput-max-round-items "$throughput_max_round_items"

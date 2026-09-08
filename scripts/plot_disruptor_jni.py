@@ -23,6 +23,11 @@ if "XDG_CACHE_HOME" not in os.environ:
 
 import matplotlib.pyplot as plt
 
+try:
+    from scripts.plot_style import family_color, family_hatch
+except ImportError:
+    from plot_style import family_color, family_hatch  # type: ignore
+
 
 SCENARIO_RE = re.compile(r"^(?P<producers>\d+)p(?P<consumers>\d+)c$")
 DEFAULT_QUEUE_ORDER = ["disruptor", "ubq", "rbbq"]
@@ -32,9 +37,9 @@ QUEUE_LABELS = {
     "rbbq": "RBBQ",
 }
 QUEUE_COLORS = {
-    "disruptor": "#4c78a8",
-    "ubq": "#f58518",
-    "rbbq": "#54a24b",
+    "disruptor": family_color("Disruptor"),
+    "ubq": family_color("UBQ"),
+    "rbbq": family_color("RBBQ/BBQ"),
 }
 
 
@@ -232,6 +237,7 @@ def plot_throughput(
             width=bar_width * 0.88,
             label=label_for_queue(queue),
             color=color_for_queue(queue, queue_index),
+            hatch=family_hatch(queue, queue_index),
             edgecolor="#222222",
             linewidth=0.5,
             yerr=[lower_errors, upper_errors],
@@ -301,6 +307,7 @@ def plot_speedup(
             width=bar_width * 0.88,
             label=label_for_queue(queue),
             color=color_for_queue(queue, queue_index + 1),
+            hatch=family_hatch(queue, queue_index + 1),
             edgecolor="#222222",
             linewidth=0.5,
         )

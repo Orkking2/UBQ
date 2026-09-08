@@ -15,6 +15,19 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
+try:
+    from scripts.plot_style import (
+        ACCESSIBLE_DIVERGING_CMAP,
+        family_color,
+        family_marker,
+    )
+except ImportError:
+    from plot_style import (  # type: ignore
+        ACCESSIBLE_DIVERGING_CMAP,
+        family_color,
+        family_marker,
+    )
+
 
 SCENARIO_RE = re.compile(r"^(\d+)p(\d+)c_")
 THREAD_LEVELS = [1, 2, 4, 8, 16, 32, 64]
@@ -36,11 +49,8 @@ FAMILY_LABELS = {
 }
 
 FAMILY_COLORS = {
-    "UBQ": "#0072B2",
-    "concurrent-queue": "#009E73",
-    "crossbeam SegQueue": "#CC79A7",
-    "RBBQ/BBQ": "#D55E00",
-    "LSCQ": "#666666",
+    family: family_color(family, index)
+    for index, family in enumerate(FAMILY_ORDER)
 }
 
 
@@ -304,7 +314,7 @@ def plot_speedup_heatmap(
     fig, ax = plt.subplots(figsize=(8.0, 6.4))
     image = ax.imshow(
         log_matrix,
-        cmap="RdYlGn",
+        cmap=ACCESSIBLE_DIVERGING_CMAP,
         norm=TwoSlopeNorm(vcenter=0.0, vmin=-bound, vmax=bound),
         origin="upper",
     )
@@ -372,7 +382,7 @@ def plot_throughput_scaling_lines(
     fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.6), sharey=True)
     for ax, (title, coords, xlabel) in zip(axes, panels):
         x_values = [coord[1] if xlabel == "Consumers" else coord[0] for coord in coords]
-        for family in FAMILY_ORDER:
+        for family_index, family in enumerate(FAMILY_ORDER):
             ys = []
             xs = []
             for x_value, (p, c) in zip(x_values, coords):
@@ -387,7 +397,7 @@ def plot_throughput_scaling_lines(
             ax.plot(
                 xs,
                 ys,
-                marker="o",
+                marker=family_marker(family, family_index),
                 linewidth=2.0 if family == "UBQ" else 1.5,
                 color=FAMILY_COLORS.get(family, "#333333"),
                 label=FAMILY_LABELS.get(family, family),
@@ -544,7 +554,7 @@ def plot_fairness_pareto(results_dir: Path, out_dir: Path, formats: list[str]) -
 
     fig, ax = plt.subplots(figsize=(7.5, 5.2))
     plotted_families: set[str] = set()
-    for family in FAMILY_ORDER:
+    for family_index, family in enumerate(FAMILY_ORDER):
         xs = [
             fairness[queue]
             for queue in common_queues
@@ -561,6 +571,7 @@ def plot_fairness_pareto(results_dir: Path, out_dir: Path, formats: list[str]) -
             xs,
             ys,
             s=48 if family == "UBQ" else 42,
+            marker=family_marker(family, family_index),
             alpha=0.75,
             color=FAMILY_COLORS.get(family, "#333333"),
             label=FAMILY_LABELS.get(family, family),

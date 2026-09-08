@@ -22,12 +22,17 @@ if "XDG_CACHE_HOME" not in os.environ:
 
 import matplotlib.pyplot as plt
 
+try:
+    from scripts.plot_style import family_color, family_hatch
+except ImportError:
+    from plot_style import family_color, family_hatch  # type: ignore
+
 
 QUEUE_ORDER = ["io_uring", "bbq", "ubq"]
 QUEUE_COLORS = {
-    "io_uring": "#4c78a8",
-    "bbq": "#54a24b",
-    "ubq": "#f58518",
+    "io_uring": family_color("io_uring"),
+    "bbq": family_color("RBBQ/BBQ"),
+    "ubq": family_color("UBQ"),
 }
 BATCH_LABELS = {
     "fixed1": "batch 1",
@@ -283,6 +288,7 @@ def plot_latency(
             width=bar_width * 0.88,
             label=label_for_queue(queue),
             color=color_for_queue(queue, queue_index),
+            hatch=family_hatch(queue_family(queue), queue_index),
             edgecolor="#222222",
             linewidth=0.5,
         )
@@ -341,6 +347,7 @@ def plot_throughput(
             width=bar_width * 0.88,
             label=label_for_queue(queue),
             color=color_for_queue(queue, queue_index),
+            hatch=family_hatch(queue_family(queue), queue_index),
             edgecolor="#222222",
             linewidth=0.5,
         )
@@ -401,6 +408,7 @@ def plot_speedup(rows: list[SummaryRow], out_dir: Path, formats: list[str]) -> N
             width=bar_width * 0.88,
             label=label_for_queue(queue),
             color=color_for_queue(queue, queue_index + 1),
+            hatch=family_hatch(queue_family(queue), queue_index + 1),
             edgecolor="#222222",
             linewidth=0.5,
         )

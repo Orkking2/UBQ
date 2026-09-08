@@ -89,6 +89,9 @@ mod tests;
 
 pub use queue::UBQ;
 
+#[cfg(feature = "probe_batch_repair")]
+pub use queue::batch_repair_probe;
+
 /*
 CARGO_TARGET_DIR=/home/nicolas/UBQ/target/vtune \
 CARGO_PROFILE_RELEASE_DEBUG=2 \

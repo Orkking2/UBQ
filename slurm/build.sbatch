@@ -42,12 +42,33 @@ RUSTFLAGS="$profile_rustflags" CARGO_PROFILE_RELEASE_DEBUG=1 cargo build \
     --release \
     --locked \
     --offline \
-    --features bench_registry \
-    --bin bench_profile
+    --features bench_registry,bench_rbbq,bench_lfqueue,bench_moodycamel \
+    --bin bench_profile \
+    --bin bench_atomic_updates \
+    --bin bench_head_reload
 
 install -m 0755 \
     "$CARGO_TARGET_DIR/release/bench_profile" \
     "$artifact_dir/bench_profile"
+install -m 0755 \
+    "$CARGO_TARGET_DIR/release/bench_atomic_updates" \
+    "$artifact_dir/bench_atomic_updates"
+install -m 0755 \
+    "$CARGO_TARGET_DIR/release/bench_head_reload" \
+    "$artifact_dir/bench_head_reload"
+
+# The allocator probe is a separate binary: its shared counter updates must
+# never perturb the throughput shadow or the perf/APX-collected workload.
+export CARGO_TARGET_DIR="$TMPDIR/ubq-allocator-profile-target"
+RUSTFLAGS="$profile_rustflags" CARGO_PROFILE_RELEASE_DEBUG=1 cargo build \
+    --release \
+    --locked \
+    --offline \
+    --features bench_registry,bench_rbbq,bench_lfqueue,bench_moodycamel,profile_allocator_probe \
+    --bin bench_profile
+install -m 0755 \
+    "$CARGO_TARGET_DIR/release/bench_profile" \
+    "$artifact_dir/bench_profile_alloc"
 
 {
     date --iso-8601=seconds
@@ -61,4 +82,7 @@ install -m 0755 \
     module -t list 2>&1
     sha256sum "$artifact_dir/bench_grid"
     sha256sum "$artifact_dir/bench_profile"
+    sha256sum "$artifact_dir/bench_profile_alloc"
+    sha256sum "$artifact_dir/bench_atomic_updates"
+    sha256sum "$artifact_dir/bench_head_reload"
 } > "$artifact_dir/build-info-${SLURM_JOB_ID}.txt"

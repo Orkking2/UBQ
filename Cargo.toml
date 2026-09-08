@@ -68,6 +68,23 @@ bench_moodycamel = ["bench_tools"]
 # Compile the full static UBQ variant registry.
 # Required for bench_grid and bench_matrix to run in-process.
 bench_registry = ["bench_tools"]
+# Build the intrusive counting allocator into bench_profile. The normal
+# profiling binary deliberately omits it so queue performance/APX attribution
+# is not perturbed by shared counter updates.
+profile_allocator_probe = ["bench_tools"]
+# Experimental control for the hardware campaign; changes completion RMW
+# frequency only. Never enable for the bulk-completion measurement binary.
+probe_item_completion = []
+# Counts how often `pop_batch`'s post-reservation repair paths fire. Those
+# branches are only reachable when the producer head appears to move backwards
+# relative to a reservation the consumer already clamped against it, which
+# requires a recycled block address to compare equal. Diagnostic only.
+probe_batch_repair = []
+
+[[bin]]
+name = "bench_hardware"
+path = "src/bin/bench_hardware.rs"
+required-features = ["bench_tools"]
 
 [[bin]]
 name = "bench_grid"

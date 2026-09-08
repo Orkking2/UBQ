@@ -5,7 +5,8 @@ usage() {
     cat <<'EOF'
 Usage: slurm/submit_bench_grid.sh {mn5|grace} <machine-label> [manifest] [--after <job-id>]
 
-Submit slurm/bench_grid_array.sbatch as a Slurm array job: one array task per
+Submit slurm/bench_grid_array.sbatch as a Slurm array job and print its job ID:
+one array task per
 scenario in the manifest, computed from the manifest itself (not hand-typed),
 with no %K concurrency throttle and no node-count cap — Slurm's own
 partition/QOS/fairshare limits decide how many run at once. Each task writes
@@ -24,6 +25,12 @@ Env overrides:
   ACCOUNT   BSC allocation account (default: bsc18)
   UBQ       deployed repo root on the cluster
             (default: /gpfs/projects/$ACCOUNT/$USER/UBQ)
+  UBQ_BENCH_QUEUES, UBQ_BENCH_BATCH_SIZES,
+  UBQ_BENCH_FASTFIFO_BLOCK_SIZES, UBQ_BENCH_FASTFIFO_CAPACITIES,
+  UBQ_BENCH_LFQUEUE_SEGMENT_SIZES, UBQ_BENCH_REPEATS,
+  UBQ_BENCH_WARMUP_MS, UBQ_BENCH_PILOT_MS, UBQ_BENCH_PHASE_MS, and
+  UBQ_BENCH_MAX_ROUND_ITEMS customize the array workload. Their resolved
+  values are recorded in each scenario's slurm-info.txt.
 
 Example:
   build_id=$(slurm/submit_build.sh mn5)
@@ -108,7 +115,7 @@ if [[ -n "$after_job_id" ]]; then
     dependency_args=(--dependency="afterok:$after_job_id")
 fi
 
-sbatch \
+submission_output=$(sbatch --parsable \
     --account="$ACCOUNT" \
     --qos="$qos" \
     --partition="$partition" \
@@ -116,11 +123,12 @@ sbatch \
     --ntasks=1 \
     --cpus-per-task="$cpus" \
     --exclusive \
+    --export=ALL \
     "${extra_sbatch_args[@]+"${extra_sbatch_args[@]}"}" \
     --time=04:00:00 \
     --array="0-$((scenario_count - 1))" \
     "${dependency_args[@]+"${dependency_args[@]}"}" \
-    --job-name="ubq-$cluster" \
+    --job-name="$machine_label" \
     --output="$UBQ/logs/$cluster-%A_%a.out" \
     --error="$UBQ/logs/$cluster-%A_%a.err" \
     "$UBQ/slurm/bench_grid_array.sbatch" \
@@ -128,4 +136,11 @@ sbatch \
     "$UBQ/artifacts/$cluster/bench_grid" \
     "$manifest" \
     "$UBQ/bench_results/runs" \
-    "$machine_label"
+    "$machine_label")
+if [[ -z "$submission_output" ]]; then
+    echo "sbatch succeeded without returning a job id" >&2
+    exit 1
+fi
+slurm_job_id=${submission_output%%$'\n'*}
+slurm_job_id=${slurm_job_id%%;*}
+printf '%s\n' "$slurm_job_id"

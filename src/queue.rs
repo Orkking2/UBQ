@@ -331,6 +331,9 @@ impl<T, B: BackoffPolicy> UBQ<T, B> {
                         let phead = self.acquire_phead();
 
                         if phead.block == chead.block && phead.index < new_chead.index {
+                            #[cfg(feature = "probe_batch_repair")]
+                            batch_repair_probe::REVERTS.fetch_add(1, Relaxed);
+
                             if new_chead.index == block_length {
                                 let x = self.chead.compare_exchange(
                                     new_chead.to_usize(self.head_codec),
@@ -351,6 +354,15 @@ impl<T, B: BackoffPolicy> UBQ<T, B> {
                                     return UBQIter::empty(self);
                                 }
                             } else {
+                                #[cfg(feature = "probe_batch_repair")]
+                                {
+                                    batch_repair_probe::FALSE_FILLS.fetch_add(1, Relaxed);
+                                    batch_repair_probe::FALSE_FILL_SLOTS.fetch_add(
+                                        (new_chead.index - phead.index) as u64,
+                                        Relaxed,
+                                    );
+                                }
+
                                 self.push_batch(FalseIterator {
                                     len: new_chead.index - phead.index,
                                     _marker: PhantomData,
@@ -556,6 +568,31 @@ impl<'a, T, B: BackoffPolicy> Iterator for UBQIter<'a, T, B> {
         }
 
         None
+    }
+}
+
+/// Diagnostic counters for `pop_batch`'s over-reservation repair paths.
+///
+/// Both branches require observing `phead.block == chead.block` with
+/// `phead.index` behind a reservation that was already clamped against `phead`.
+/// The heads advance monotonically within a block epoch, so a nonzero count
+/// means a recycled block address compared equal to a stale one: an ABA on the
+/// untagged `Head` word.
+#[cfg(feature = "probe_batch_repair")]
+pub mod batch_repair_probe {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(crate) static REVERTS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FALSE_FILLS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FALSE_FILL_SLOTS: AtomicU64 = AtomicU64::new(0);
+
+    /// Returns `(reverts, false_fills, false_fill_slots)` observed so far.
+    pub fn counts() -> (u64, u64, u64) {
+        (
+            REVERTS.load(Relaxed),
+            FALSE_FILLS.load(Relaxed),
+            FALSE_FILL_SLOTS.load(Relaxed),
+        )
     }
 }
 

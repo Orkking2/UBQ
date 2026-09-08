@@ -21,6 +21,16 @@ fn main() {
         Ok(result) => println!("{}", serde_json::to_string(&result).unwrap()),
         Err(error) => {
             eprintln!("bench_hardware: {error}");
+            // A failed run writes no result document, so surface the batch
+            // repair diagnostics here or they are lost with the exit code.
+            #[cfg(feature = "probe_batch_repair")]
+            {
+                let (reverts, false_fills, false_fill_slots) = ubq::batch_repair_probe::counts();
+                eprintln!(
+                    "bench_hardware: batch_repair_probe reverts={reverts} \
+false_fills={false_fills} false_fill_slots={false_fill_slots}"
+                );
+            }
             std::process::exit(1);
         }
     }

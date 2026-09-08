@@ -1,0 +1,31 @@
+# Np1c, 1pNc, and NpNc for N in {1,2,4,8,16,32,63,64,72,128,143}.
+# Unique feasible scenarios on a 144-core Grace node (no oversubscription).
+1p1c
+2p1c
+4p1c
+8p1c
+16p1c
+32p1c
+63p1c
+64p1c
+72p1c
+128p1c
+143p1c
+1p2c
+1p4c
+1p8c
+1p16c
+1p32c
+1p63c
+1p64c
+1p72c
+1p128c
+1p143c
+2p2c
+4p4c
+8p8c
+16p16c
+32p32c
+63p63c
+64p64c
+72p72c

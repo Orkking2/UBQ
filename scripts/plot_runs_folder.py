@@ -54,6 +54,15 @@ def main() -> int:
         help="Output root for generated CSV/PNG artifacts (default: bench_results/plots)",
     )
     parser.add_argument(
+        "--machine-labels",
+        action="append",
+        default=[],
+        help=(
+            "Only plot records with these machine labels. Accepts comma-separated "
+            "labels and can be repeated."
+        ),
+    )
+    parser.add_argument(
         "--error-bars",
         choices=["sem", "stddev", "none"],
         default="sem",
@@ -96,6 +105,8 @@ def main() -> int:
         "--max-line-series",
         str(args.max_line_series),
     ]
+    for machine_labels in args.machine_labels:
+        cmd.extend(("--machine-labels", machine_labels))
     if args.no_clean:
         cmd.append("--no-clean")
     print(f"Plot command: {shlex.join(cmd)}")

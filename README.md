@@ -247,6 +247,33 @@ deliberately rejects MN5 because `arm_performix/2026.3.1` is not known to be
 available on `mn5gpp`. See [docs/performix.md](docs/performix.md) for the full
 workflow and interpretation order.
 
+For evidence-driven optimization campaigns, use
+[docs/profiling_harness.md](docs/profiling_harness.md). It pairs every real,
+unprofiled throughput measurement with an exact-work hardware collection,
+screens broad cases with portable `perf stat` counters, and narrows Performix
+Code Hotspots / CPU Microarchitecture / Instruction Mix runs to observed
+scaling cliffs. An existing schema-v7 raw sweep can drive the same selector;
+the bounded mode keeps only evidence-backed cliff, fast-control, and slow-
+contrast queue variations at each chosen scenario. Its aggregator emits
+quality-gated trial data, normalized
+hardware metrics, hotspot attribution, robust summaries, and software-variant
+effect intervals without comparing collector-perturbed throughput.
+
+The complete throughput-guided `Np1c`/`1pNc`/`NpNc` sweep, winner selection,
+matched tuning contrasts, stable Performix import names, and MCP correlation
+commands are in
+[docs/performix_contention_campaign.md](docs/performix_contention_campaign.md).
+For a single revision-safe remote entry point, including an unattended `auto`
+dependency graph plus lower-level `start`, `select`, `submit`, `status`, and
+`paths` commands, use
+[docs/remote_performix_workflow.md](docs/remote_performix_workflow.md).
+
+For the bounded hardware-evidence campaign on exclusive Grace and MN5 nodes,
+including memory lifecycle probes and paired software controls, use
+[the weekend campaign run guide](docs/run_weekend_hardware_campaign.md).
+Its `hardware_campaign.py start` command freezes the source, builds, gates and
+dispatches the campaign with scheduler-managed concurrency.
+
 ### Personal machines
 
 `bench_grid` runs the same way with no Slurm involved: point `--runs-dir` at
@@ -493,13 +520,22 @@ badge reports that the declared grid is exhausted; a red badge reports
 incomplete or legacy coverage while the plotted winners remain the best
 measurements present.
 
-The MPSC and SPMC throughput outputs also include `*_batchcomp` plots. These
-show the best scalar-compatible configuration, the scalar counterpart of the
-best batched configuration, and every measured batch size for that underlying
-UBQ configuration. Duplicate scalar configurations are shown only once. Cool
-shades group batches below the selected winner, warm shades group larger
-batches, the winning batch uses a green star, the best scalar is black, and a
-distinct scalar counterpart is dashed gray.
+The MPSC, SPMC, and symmetric throughput outputs also include `*_batchcomp`
+plots. These include UBQ and every queue with native batch measurements. Queue
+families use stable colors based on the colorblind-safe Okabe-Ito palette;
+LUBQ is vermillion while SegQueue is bluish green. Each family gets a
+horizontally adjacent panel with a shared y-axis, repeated scenario x-axis,
+plus a compact family-by-batch shade grid below the panels. Hue/lightness and
+marker shape encode batch size. Only the contention-weighted selected best is
+solid and starred; every other scalar or batch series is dashed. Throughput
+uses a shared logarithmic y-axis with compact K/M/B tick labels. These styling
+rules are scoped to `*_batchcomp` figures; ordinary scaling plots retain their
+existing series styling. The symmetric suite additionally emits
+`symmetric_line_throughput_batchcomp_overlay`, which places every queue on one
+axis and retains only its scalar winner and contention-weighted best batch for
+direct comparison. Ratio heatmaps use a purple/orange diverging map with numeric
+cell labels instead of a red/green scale. Shared semantic colors and accessible
+fallbacks live in `scripts/plot_style.py`.
 
 LUBQ also gets dedicated speedup grids rather than appearing only as one line
 in the general queue-family plots. The scalar grid compares scalar LUBQ with
@@ -525,6 +561,9 @@ Generate plots manually (PNG + CSV when `matplotlib` is installed, CSV-only othe
 
 # Render plots from all JSON files under bench_results/runs recursively.
 ./.venv/bin/python scripts/plot_runs_folder.py --runs-dir bench_results/runs --out-dir bench_results/plots
+
+# Render only selected machine labels (comma-separated or repeated).
+./.venv/bin/python scripts/plot_runs_folder.py --runs-dir bench_results/runs --out-dir bench_results/plots --machine-labels grace-7,mn5-6
 
 # Render PNGs from existing generated CSV machine folders.
 ./.venv/bin/python scripts/plot_bench.py \
@@ -556,6 +595,7 @@ Outputs are grouped by `meta.machine_label` and mode, e.g.:
 - `bench_results/plots/grace/throughput/mpsc_line_throughput.png`
 - `bench_results/plots/grace/throughput/mpsc_line_throughput_batchcomp.png`
 - `bench_results/plots/grace/throughput/spmc_line_throughput_batchcomp.png`
+- `bench_results/plots/grace/throughput/symmetric_line_throughput_batchcomp_overlay.png`
 
 Schema-v7 plotting deduplicates reruns, summarizes repeats by median, and
 emits separate handoff, enqueue-ceiling, and dequeue-ceiling CSVs/plots.

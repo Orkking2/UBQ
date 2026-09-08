@@ -1,0 +1,383 @@
+{
+  "schema": "ubq.hardware_probe_design.v1",
+  "status": "implemented_with_explicit_deferrals_remote_gates_required",
+  "name": "queue-hardware-probe-v1",
+  "scope": "Hardware evidence for queue mechanisms and matched software changes; memory footprint and retention at controlled occupancy",
+  "machines": {
+    "grace": {
+      "worker_cores": 144,
+      "exclusive_node": true
+    },
+    "mn5": {
+      "worker_cores": 112,
+      "exclusive_node": true,
+      "node_cohort": "standard DDR5 GPP; HBM and high-memory cohorts separate"
+    }
+  },
+  "scheduling": {
+    "concurrency": "scheduler_managed_no_array_throttle",
+    "submission": "bounded outstanding tasks based on actual QoS headroom; defer submissions rather than execution only",
+    "resume": "immutable source/protocol identity; terminal predecessors do not gate independent cases on afterok",
+    "weekend_budget": "48h elapsed including queueing; prioritize core panels; finish already-started cases within per-case budgets"
+  },
+  "configs": [
+    {
+      "config_id": "ubq-scalar",
+      "queue": "ubq",
+      "algorithm": "Shared MPMC page blocks",
+      "batch_size": null,
+      "backoff": "crossbeam",
+      "block_size": "page",
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "lubq-scalar",
+      "queue": "lubq",
+      "algorithm": "Producer-owned SPMC shards",
+      "batch_size": null,
+      "backoff": "crossbeam",
+      "block_size": "page",
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "segqueue-scalar",
+      "queue": "segqueue",
+      "algorithm": "Crossbeam SegQueue",
+      "batch_size": null,
+      "backoff": null,
+      "block_size": null,
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "concurrent-queue-scalar",
+      "queue": "concurrent-queue",
+      "algorithm": "ConcurrentQueue unbounded",
+      "batch_size": null,
+      "backoff": null,
+      "block_size": null,
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "mutex-vecdeque-scalar",
+      "queue": "mutex-vecdeque",
+      "algorithm": "Mutex + contiguous deque",
+      "batch_size": null,
+      "backoff": null,
+      "block_size": null,
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "ms-queue-scalar",
+      "queue": "ms-queue",
+      "algorithm": "Michael-Scott linked queue",
+      "batch_size": null,
+      "backoff": null,
+      "block_size": null,
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "moodycamel-cq-scalar",
+      "queue": "moodycamel-cq",
+      "algorithm": "Moodycamel producer subqueues",
+      "batch_size": null,
+      "backoff": null,
+      "block_size": null,
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "fastfifo-scalar",
+      "queue": "fastfifo",
+      "algorithm": "RBBQ bounded ring",
+      "batch_size": null,
+      "backoff": null,
+      "block_size": 256,
+      "segment_size": null,
+      "capacity": 1048576
+    },
+    {
+      "config_id": "lfqueue-scalar",
+      "queue": "lfqueue",
+      "algorithm": "LSCQ segmented queue",
+      "batch_size": null,
+      "backoff": null,
+      "block_size": null,
+      "segment_size": 256,
+      "capacity": null
+    },
+    {
+      "config_id": "ubq-b256",
+      "queue": "ubq",
+      "algorithm": "Shared MPMC page blocks",
+      "batch_size": 256,
+      "backoff": "crossbeam",
+      "block_size": "page",
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "lubq-b256",
+      "queue": "lubq",
+      "algorithm": "Producer-owned SPMC shards",
+      "batch_size": 256,
+      "backoff": "crossbeam",
+      "block_size": "page",
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "segqueue-b256",
+      "queue": "segqueue",
+      "algorithm": "Crossbeam BatchQueue (distinct implementation)",
+      "batch_size": 256,
+      "backoff": null,
+      "block_size": null,
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "mutex-vecdeque-b256",
+      "queue": "mutex-vecdeque",
+      "algorithm": "Mutex + contiguous deque",
+      "batch_size": 256,
+      "backoff": null,
+      "block_size": null,
+      "segment_size": null,
+      "capacity": null
+    },
+    {
+      "config_id": "moodycamel-cq-b256",
+      "queue": "moodycamel-cq",
+      "algorithm": "Moodycamel producer subqueues",
+      "batch_size": 256,
+      "backoff": null,
+      "block_size": null,
+      "segment_size": null,
+      "capacity": null
+    }
+  ],
+  "scenarios": {
+    "grace": [
+      "1p1c",
+      "8p1c",
+      "16p1c",
+      "32p1c",
+      "64p1c",
+      "143p1c",
+      "1p16c",
+      "1p32c",
+      "1p64c",
+      "1p143c",
+      "32p32c",
+      "72p72c"
+    ],
+    "mn5": [
+      "1p1c",
+      "8p1c",
+      "16p1c",
+      "32p1c",
+      "64p1c",
+      "111p1c",
+      "1p16c",
+      "1p32c",
+      "1p64c",
+      "1p111c",
+      "32p32c",
+      "56p56c"
+    ]
+  },
+  "core_cells": 336,
+  "independent_repeats": 3,
+  "workload": {
+    "payload": "u64",
+    "count_unit": "one completed producer-to-consumer handoff",
+    "round_items_cap": 8388608,
+    "pilot_round_caps": [
+      262144,
+      1048576,
+      8388608
+    ],
+    "calibrate": "number of bounded drained rounds, never enlarge work in one round to hit duration",
+    "persistent_workers": true,
+    "throughput_duration_target_seconds": 30,
+    "fixed_schedule_replay": true,
+    "paired_arms_same_rounds_items_affinity_prewarm": true,
+    "workload_rss_soft_limit_mib": 8192,
+    "barrier_overhead_target_max_fraction": 0.05,
+    "note": "round cap bounds offered work per burst; actual occupancy remains algorithm-dependent"
+  },
+  "memory_panel": {
+    "implementations": 10,
+    "producer_handles": [
+      1,
+      16,
+      "cores-1"
+    ],
+    "depths_items": [
+      4096,
+      65536,
+      524288
+    ],
+    "states": [
+      "constructed-empty",
+      "full",
+      "drained",
+      "idle-1s",
+      "idle-10s",
+      "refilled",
+      "destroyed"
+    ],
+    "fresh_process_repeats": 3,
+    "bundles_per_machine": 30,
+    "process_runs_total": 540,
+    "metrics": [
+      "process-private RSS/PSS at checkpoints",
+      "queue live/cached/reserved bytes where instrumented",
+      "allocation calls/bytes by covered allocator",
+      "faults and mmap/munmap/mprotect activity",
+      "empty footprint vs producer handles",
+      "refill CPU/throughput",
+      "retained bytes after drain"
+    ],
+    "caveat": "Rust GlobalAlloc does not cover C++ Moodycamel allocations; report instrumentation coverage and use process-wide measurements for comparisons"
+  },
+  "mechanism_pairs_per_machine": [
+    {
+      "mechanism": "backoff",
+      "queue": "ubq",
+      "scenario": "1p32c",
+      "control": "crossbeam",
+      "treatment": "yield",
+      "batch_size": 256
+    },
+    {
+      "mechanism": "backoff",
+      "queue": "ubq",
+      "scenario": "full-balanced",
+      "control": "crossbeam",
+      "treatment": "yield",
+      "batch_size": 256
+    },
+    {
+      "mechanism": "backoff",
+      "queue": "lubq",
+      "scenario": "1p32c",
+      "control": "crossbeam",
+      "treatment": "yield",
+      "batch_size": 256
+    },
+    {
+      "mechanism": "backoff",
+      "queue": "lubq",
+      "scenario": "full-balanced",
+      "control": "crossbeam",
+      "treatment": "yield",
+      "batch_size": 256
+    },
+    {
+      "mechanism": "completion-accounting",
+      "queue": "ubq",
+      "scenario": "1p32c",
+      "control": "one completion RMW per item",
+      "treatment": "one completion RMW per block segment",
+      "batch_size": 256,
+      "requires": "same correctness-approved source; diagnostic accounting toggle"
+    },
+    {
+      "mechanism": "completion-accounting",
+      "queue": "ubq",
+      "scenario": "full-balanced",
+      "control": "one completion RMW per item",
+      "treatment": "one completion RMW per block segment",
+      "batch_size": 256,
+      "requires": "same correctness-approved source; diagnostic accounting toggle"
+    },
+    {
+      "mechanism": "block-retention",
+      "queue": "lubq",
+      "scenario": "8p1c",
+      "control": "current retain-all eligible blocks",
+      "treatment": "bounded retained blocks per shard; safe excess release",
+      "batch_size": 256,
+      "requires": "correctness-approved reclamation path; freeze cap after unprofiled pilot"
+    },
+    {
+      "mechanism": "block-retention",
+      "queue": "lubq",
+      "scenario": "full-balanced",
+      "control": "current retain-all eligible blocks",
+      "treatment": "bounded retained blocks per shard; safe excess release",
+      "batch_size": 256,
+      "requires": "correctness-approved reclamation path; freeze cap after unprofiled pilot"
+    }
+  ],
+  "deep_panel": {
+    "baseline_coordinates_per_machine": 56,
+    "baseline_scenarios": [
+      "1p1c",
+      "16p1c",
+      "1p32c",
+      "full-balanced"
+    ],
+    "ab_arm_coordinates_max_per_machine": 16,
+    "grace_collectors": [
+      "code_hotspots",
+      "cpu_microarchitecture",
+      "instruction_mix",
+      "memory_access_if_SPE_validated"
+    ],
+    "mn5_collectors": [
+      "perf_record",
+      "perf_mem_or_c2c_if_validated"
+    ],
+    "grace_captures_max": 864,
+    "mn5_captures_max": 432,
+    "repeat_count": 3,
+    "notes": [
+      "core PMU groups run on all 336 core cells",
+      "counter groups are selected from each installed PMU and are not assumed identical across ISAs",
+      "Memory Access absence does not block PMU/OS/memory-footprint panels"
+    ]
+  },
+  "optional_topology_panel": {
+    "queues": [
+      "ubq",
+      "lubq"
+    ],
+    "scenario": "16p16c",
+    "placements": [
+      "all workers and memory on one NUMA node",
+      "producers and producer-touched memory on node 0, consumers on node 1",
+      "role-reversed placement to check socket asymmetry"
+    ],
+    "eligibility": "requires explicit topology-derived CPU map and memory placement, not core_offset alone"
+  },
+  "launch_gates": [
+    "bounded persistent-worker harness validated",
+    "exact-once UBQ failure reproductions and all A/B paths pass",
+    "one full successful run of each enabled collector per machine",
+    "per-process memory measurement and instrumentation coverage recorded",
+    "runner refuses missing workload result and reconciles accounting",
+    "dynamic submission headroom and complete wall-time budget",
+    "source and binary hashes frozen"
+  ],
+  "matrix_sha256": "2379b68f0eb9059f74a88a5788c272fd6663de7c83edc9aa0f859c36ae2cd3a4",
+  "runner": "scripts/hardware_campaign.py",
+  "run_guide": "docs/run_weekend_hardware_campaign.md",
+  "implementation_notes": {
+    "source_of_truth": "Generated hardware_campaign.py plan and run guide specify executable coverage",
+    "independent_allocations_per_repetition": true,
+    "retention_ab": "deferred: no safe excess-block reclamation control",
+    "allocation_metrics": "process footprint only; no allocator interception",
+    "numa_intervention": "deferred",
+    "counter_running_fraction_minimum": 0.9,
+    "grace_max_allocations_excluding_build": 1389,
+    "mn5_max_allocations_excluding_build": 1202
+  }
+}

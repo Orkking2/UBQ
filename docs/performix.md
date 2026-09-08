@@ -1,5 +1,14 @@
 # Profiling UBQ queues with Arm Performix
 
+> This page documents the legacy one-case Grace helper. For MN5/Grace
+> campaigns, fixed-work collection, portable counters, aggregation, and plots,
+> use [the profiling harness](profiling_harness.md). Both submission paths use
+> the required `--constraint=perfparanoid` Slurm option.
+
+For the throughput-guided full contention ladder, stable APX run names,
+resumable local import, and Performix/MCP-first interpretation, use the
+[Performix contention campaign](performix_contention_campaign.md).
+
 This workflow answers a narrow question at a time: where does one queue spend
 CPU time for one producer/consumer shape and one operation size? It runs the
 same queue handoff shape used by the comparative harness, but as a foreground

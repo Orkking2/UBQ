@@ -16,11 +16,13 @@ class SlurmWorkflowTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.deployed_root = Path(self.tmp.name) / "UBQ"
         self.fake_bin = Path(self.tmp.name) / "bin"
+        self.sbatch_args = Path(self.tmp.name) / "sbatch-args.txt"
         (self.deployed_root / "manifests").mkdir(parents=True)
         self.fake_bin.mkdir()
         fake_sbatch = self.fake_bin / "sbatch"
         fake_sbatch.write_text(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\"\n",
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$SBATCH_ARGS_FILE\"\n"
+            "printf '4242\\n'\n",
             encoding="utf-8",
         )
         fake_sbatch.chmod(0o755)
@@ -31,6 +33,7 @@ class SlurmWorkflowTest(unittest.TestCase):
                 "ACCOUNT": "test-account",
                 "UBQ": str(self.deployed_root),
                 "PATH": f"{self.fake_bin}{os.pathsep}{self.env['PATH']}",
+                "SBATCH_ARGS_FILE": str(self.sbatch_args),
             }
         )
 
@@ -42,7 +45,8 @@ class SlurmWorkflowTest(unittest.TestCase):
             text=True,
             env=self.env,
         )
-        return result.stdout.splitlines()
+        self.assertEqual("4242", result.stdout.strip())
+        return self.sbatch_args.read_text(encoding="utf-8").splitlines()
 
     def assert_repo_root_follows_job_script(self, args, job_script):
         script_path = str(self.deployed_root / "slurm" / job_script)
@@ -64,6 +68,7 @@ class SlurmWorkflowTest(unittest.TestCase):
             str(manifest),
         )
         self.assertIn("--array=0-0", args)
+        self.assertIn("--parsable", args)
         self.assert_repo_root_follows_job_script(args, "bench_grid_array.sbatch")
 
     def test_performix_submission_uses_workspace_root_and_accepts_lubq(self):
@@ -78,6 +83,18 @@ class SlurmWorkflowTest(unittest.TestCase):
         self.assert_repo_root_follows_job_script(args, "performix_grace.sbatch")
         self.assertIn("lubq", args)
         self.assertIn("256", args)
+
+    def test_campaign_controller_depends_on_complete_frontier(self):
+        args = self.submit_args(
+            "submit_performix_campaign_controller.sh",
+            "grace",
+            "grace-auto-v1",
+            "--after",
+            "1234",
+        )
+        self.assertIn("--dependency=afterok:1234", args)
+        self.assertIn("--cpus-per-task=1", args)
+        self.assert_repo_root_follows_job_script(args, "performix_campaign_controller.sbatch")
 
     def test_grid_array_declares_and_passes_lubq(self):
         source = (SLURM_DIR / "bench_grid_array.sbatch").read_text(encoding="utf-8")

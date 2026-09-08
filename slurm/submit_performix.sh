@@ -125,6 +125,7 @@ sbatch --parsable \
     --ntasks=1 \
     --cpus-per-task=144 \
     --exclusive \
+    --constraint=perfparanoid \
     --time=00:10:00 \
     "${dependency_args[@]+"${dependency_args[@]}"}" \
     --job-name="apx-$queue-$scenario" \

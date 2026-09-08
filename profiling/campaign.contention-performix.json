@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "campaign": "queue-contention-performix-v1",
+  "description": "Throughput-guided Performix candidates for the feasible Np1c, 1pNc, and NpNc contention grid. Includes every implemented, correctness-eligible comparative queue; lfqueue is LSCQ, not LCRQ.",
+  "schedule_seed": 1430409478,
+  "variants": [
+    {
+      "name": "bulk-consumed",
+      "is_baseline": true,
+      "binary": "artifacts/{cluster}/bench_profile",
+      "allocator_binary": "artifacts/{cluster}/bench_profile_alloc",
+      "factors": {
+        "allocator": "system",
+        "page_distributor": "build-defined",
+        "build_variant": "bulk-consumed"
+      }
+    }
+  ],
+  "stages": [
+    {
+      "name": "contention-apx-hotspots",
+      "backend": "apx",
+      "allocator_probe": false,
+      "clusters": ["mn5", "grace"],
+      "variants": ["bulk-consumed"],
+      "queues": [
+        {
+          "name": "ubq",
+          "ubq_labels": [
+            "balanced,1,page,crossbeam",
+            "balanced,1,page,yield"
+          ],
+          "batch_sizes": [null, 8, 64, 256, 1024, 4096]
+        },
+        {
+          "name": "lubq",
+          "lubq_backoffs": ["crossbeam", "yield"],
+          "batch_sizes": [null, 8, 64, 256, 1024, 4096]
+        },
+        {"name": "segqueue", "batch_sizes": [null, 8, 64, 256, 1024, 4096]},
+        {"name": "mutex-vecdeque", "batch_sizes": [null, 8, 64, 256, 1024, 4096]},
+        {"name": "moodycamel-cq", "batch_sizes": [null, 8, 64, 256, 1024, 4096]},
+        {"name": "concurrent-queue", "batch_sizes": [null]},
+        {"name": "ms-queue", "batch_sizes": [null]},
+        {
+          "name": "fastfifo",
+          "batch_sizes": [null],
+          "fastfifo_block_sizes": [64, 256, 1024, 4096],
+          "fastfifo_capacities": [1048576]
+        },
+        {
+          "name": "lfqueue",
+          "batch_sizes": [null],
+          "lfqueue_segment_sizes": [32, 256, 1024]
+        }
+      ],
+      "scenarios": {
+        "mn5": [
+          "1p1c",
+          "2p1c", "4p1c", "8p1c", "16p1c", "32p1c", "63p1c", "64p1c", "72p1c",
+          "1p2c", "1p4c", "1p8c", "1p16c", "1p32c", "1p63c", "1p64c", "1p72c",
+          "2p2c", "4p4c", "8p8c", "16p16c", "32p32c"
+        ],
+        "grace": [
+          "1p1c",
+          "2p1c", "4p1c", "8p1c", "16p1c", "32p1c", "63p1c", "64p1c", "72p1c", "128p1c", "143p1c",
+          "1p2c", "1p4c", "1p8c", "1p16c", "1p32c", "1p63c", "1p64c", "1p72c", "1p128c", "1p143c",
+          "2p2c", "4p4c", "8p8c", "16p16c", "32p32c", "63p63c", "64p64c", "72p72c"
+        ]
+      },
+      "recipes": {"all": ["code_hotspots"]},
+      "repeats": 3,
+      "warmup_secs": 2,
+      "duration_secs": 30,
+      "collector_timeout_secs": 1200,
+      "calibrate_outside_collector": true,
+      "quality_policy": {
+        "require_affinity": true,
+        "minimum_samples": 1000
+      }
+    },
+    {
+      "name": "contention-apx-hardware",
+      "backend": "apx",
+      "allocator_probe": false,
+      "clusters": ["grace"],
+      "variants": ["bulk-consumed"],
+      "queues": [
+        {
+          "name": "ubq",
+          "ubq_labels": [
+            "balanced,1,page,crossbeam",
+            "balanced,1,page,yield"
+          ],
+          "batch_sizes": [null, 8, 64, 256, 1024, 4096]
+        },
+        {
+          "name": "lubq",
+          "lubq_backoffs": ["crossbeam", "yield"],
+          "batch_sizes": [null, 8, 64, 256, 1024, 4096]
+        },
+        {"name": "segqueue", "batch_sizes": [null, 8, 64, 256, 1024, 4096]},
+        {"name": "mutex-vecdeque", "batch_sizes": [null, 8, 64, 256, 1024, 4096]},
+        {"name": "moodycamel-cq", "batch_sizes": [null, 8, 64, 256, 1024, 4096]},
+        {"name": "concurrent-queue", "batch_sizes": [null]},
+        {"name": "ms-queue", "batch_sizes": [null]},
+        {
+          "name": "fastfifo",
+          "batch_sizes": [null],
+          "fastfifo_block_sizes": [64, 256, 1024, 4096],
+          "fastfifo_capacities": [1048576]
+        },
+        {
+          "name": "lfqueue",
+          "batch_sizes": [null],
+          "lfqueue_segment_sizes": [32, 256, 1024]
+        }
+      ],
+      "scenarios": [
+        "1p1c",
+        "2p1c", "4p1c", "8p1c", "16p1c", "32p1c", "63p1c", "64p1c", "72p1c", "128p1c", "143p1c",
+        "1p2c", "1p4c", "1p8c", "1p16c", "1p32c", "1p63c", "1p64c", "1p72c", "1p128c", "1p143c",
+        "2p2c", "4p4c", "8p8c", "16p16c", "32p32c", "63p63c", "64p64c", "72p72c"
+      ],
+      "recipes": ["cpu_microarchitecture", "instruction_mix", "memory_access"],
+      "repeats": 3,
+      "warmup_secs": 2,
+      "duration_secs": 30,
+      "collector_timeout_secs": 1800,
+      "calibrate_outside_collector": true,
+      "quality_policy": {
+        "require_affinity": true,
+        "minimum_samples": 1000
+      }
+    }
+  ]
+}

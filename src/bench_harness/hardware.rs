@@ -1,7 +1,132 @@
 //! Bounded, replayable hardware probes. No shared per-item counters in timing mode.
 use super::*;
+use crossbeam_utils::CachePadded;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU8, AtomicUsize};
+
+/// Sense-reversing round barrier for pinned benchmark workers.
+///
+/// `std::sync::Barrier` rendezvouses through a mutex and condvar, so every
+/// round wakes every worker through the scheduler. At 144 pinned threads that
+/// costs roughly a millisecond per round, which dominated the measured time of
+/// the fastest batch configurations in the v3 Grace campaign: an empty round
+/// cost ~860 us while a full 8,388,608-item LUBQ batch-256 round at 72p72c took
+/// ~1.4 ms, leaving 69% of the sample as harness control flow.
+///
+/// Workers spin briefly on a generation counter before falling back to
+/// `yield_now`, so fast rounds rendezvous in user space while slow rounds
+/// (seconds, for the contended scalar queues) still release their cores instead
+/// of burning them.
+pub struct RoundBarrier {
+    participants: usize,
+    /// Per-shard arrival counters. Sharding keeps 144 workers off a single
+    /// contended cache line; only the last arrival in each shard touches the
+    /// root counter.
+    shards: Vec<CachePadded<AtomicUsize>>,
+    shard_quota: Vec<usize>,
+    root: CachePadded<AtomicUsize>,
+    generation: CachePadded<AtomicUsize>,
+}
+
+/// Arrival shards. Grace exposes 72 cores per socket, so eight shards keep each
+/// contended line to at most ~18 writers while the root sees only eight.
+const BARRIER_SHARDS: usize = 8;
+
+impl RoundBarrier {
+    pub fn new(participants: usize) -> Self {
+        let shards = BARRIER_SHARDS.min(participants.max(1));
+        Self {
+            participants,
+            shards: (0..shards)
+                .map(|_| CachePadded::new(AtomicUsize::new(0)))
+                .collect(),
+            shard_quota: (0..shards)
+                .map(|shard| (shard..participants).step_by(shards).count())
+                .collect(),
+            root: CachePadded::new(AtomicUsize::new(0)),
+            generation: CachePadded::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// `id` must be a stable index below the participant count; each
+    /// participant of a given barrier must always pass the same one.
+    pub fn wait(&self, id: usize) {
+        // A single participant has nobody to rendezvous with.
+        if self.participants <= 1 {
+            return;
+        }
+        let generation = self.generation.load(AtomicOrdering::Acquire);
+        let shard = id % self.shards.len();
+        // Each counter is reset by its own last arrival, before the generation
+        // is published, so a fast worker re-entering `wait` cannot count itself
+        // into the round it just left.
+        if self.shards[shard].fetch_add(1, AtomicOrdering::AcqRel) + 1 == self.shard_quota[shard] {
+            self.shards[shard].store(0, AtomicOrdering::Relaxed);
+            if self.root.fetch_add(1, AtomicOrdering::AcqRel) + 1 == self.shards.len() {
+                self.root.store(0, AtomicOrdering::Relaxed);
+                self.generation.fetch_add(1, AtomicOrdering::Release);
+                return;
+            }
+        }
+        let mut spins = 0u32;
+        while self.generation.load(AtomicOrdering::Acquire) == generation {
+            if spins < SPIN_BEFORE_YIELD {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+}
+
+/// Reports `pop_batch` over-reservation repair counts when the diagnostic
+/// feature is compiled in. A nonzero count is evidence of a recycled block
+/// address comparing equal to a stale reservation.
+fn batch_repair_counts() -> Value {
+    #[cfg(feature = "probe_batch_repair")]
+    {
+        let (reverts, false_fills, false_fill_slots) = crate::batch_repair_probe::counts();
+        json!({
+            "reverts": reverts,
+            "false_fills": false_fills,
+            "false_fill_slots": false_fill_slots,
+        })
+    }
+    #[cfg(not(feature = "probe_batch_repair"))]
+    {
+        Value::Null
+    }
+}
+
+/// Bounded spin before a waiting worker releases its core. Long enough to cover
+/// a fast round's rendezvous, short enough that a multi-second round does not
+/// spend meaningful CPU waiting.
+const SPIN_BEFORE_YIELD: u32 = spin_budget();
+
+const fn spin_budget() -> u32 {
+    match option_env!("UBQ_ROUND_BARRIER_SPINS") {
+        // `const` parsing keeps the budget a compile-time constant so the spin
+        // loop stays branch-predictable.
+        Some(raw) => konst_parse_u32(raw.as_bytes(), 0),
+        // Measured on a 144-core Grace node: at 72p72c a 4096-iteration budget
+        // gives a ~97 us empty round, while 65536 degrades it to ~1.25 ms and
+        // cuts LUBQ batch throughput from 10.8 to 3.3 G handoffs/s. Long spins
+        // keep every waiter hammering the shared arrival line, so the budget
+        // stays short and the fallback does the waiting.
+        None => 4_096,
+    }
+}
+
+const fn konst_parse_u32(bytes: &[u8], acc: u32) -> u32 {
+    match bytes {
+        [] => acc,
+        [digit, rest @ ..] if *digit >= b'0' && *digit <= b'9' => {
+            konst_parse_u32(rest, acc * 10 + (*digit - b'0') as u32)
+        }
+        _ => acc,
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -135,9 +260,9 @@ impl BenchQueueOps for MemoryScaffold {
 }
 
 struct Workers {
-    start: Arc<Barrier>,
-    producers_finished: Arc<Barrier>,
-    end: Arc<Barrier>,
+    start: Arc<RoundBarrier>,
+    producers_finished: Arc<RoundBarrier>,
+    end: Arc<RoundBarrier>,
     action: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
     slots: Arc<Vec<Mutex<(u64, u64)>>>,
@@ -156,9 +281,9 @@ impl Workers {
     ) -> Self {
         let threads = scenario.total_threads();
         let mut workers = Self {
-            start: Arc::new(Barrier::new(threads + 1)),
-            producers_finished: Arc::new(Barrier::new(scenario.producers + 1)),
-            end: Arc::new(Barrier::new(threads + 1)),
+            start: Arc::new(RoundBarrier::new(threads + 1)),
+            producers_finished: Arc::new(RoundBarrier::new(scenario.producers + 1)),
+            end: Arc::new(RoundBarrier::new(threads + 1)),
             action: Arc::new(AtomicUsize::new(STOP)),
             done: Arc::new(AtomicBool::new(false)),
             slots: Arc::new((0..threads).map(|_| Mutex::new((0, 0))).collect()),
@@ -173,7 +298,7 @@ impl Workers {
             expected,
         };
         let (p, c) = (scenario.producers, scenario.consumers);
-        let ready = Arc::new(Barrier::new(threads + 1));
+        let ready = Arc::new(RoundBarrier::new(threads + 1));
         for id in 0..threads {
             let ready = ready.clone();
             let producer = id < p;
@@ -205,9 +330,9 @@ impl Workers {
                     if !pin_current_bench_thread(core) {
                         affinity.store(false, AtomicOrdering::Relaxed);
                     }
-                    ready.wait();
+                    ready.wait(id);
                     loop {
-                        start.wait();
+                        start.wait(id);
                         let mode = action.load(AtomicOrdering::Acquire);
                         if mode == STOP {
                             break;
@@ -235,7 +360,7 @@ impl Workers {
                                 count = quota;
                             }
                             *slots[id].lock().unwrap() = (count, clock.elapsed().as_nanos() as u64);
-                            pdone.wait();
+                            pdone.wait(index);
                         } else {
                             if mode == HANDOFF || mode == DRAIN {
                                 let backoff = Backoff::new();
@@ -291,7 +416,7 @@ impl Workers {
                             }
                             *slots[id].lock().unwrap() = (count, clock.elapsed().as_nanos() as u64);
                         }
-                        end.wait();
+                        end.wait(id);
                     }
                 }));
                 if result.is_err() {
@@ -299,7 +424,7 @@ impl Workers {
                 }
             }));
         }
-        ready.wait();
+        ready.wait(threads);
         workers
     }
     fn round(&self, mode: usize, producers: usize) -> Result<u64, String> {
@@ -310,10 +435,10 @@ impl Workers {
         self.done.store(mode == DRAIN, AtomicOrdering::Release);
         self.action.store(mode, AtomicOrdering::Release);
         let begin = Instant::now();
-        self.start.wait();
-        self.producers_finished.wait();
+        self.start.wait(self.slots.len());
+        self.producers_finished.wait(producers);
         self.done.store(true, AtomicOrdering::Release);
-        self.end.wait();
+        self.end.wait(self.slots.len());
         let elapsed = begin.elapsed().as_nanos() as u64;
         let sent: u64 = self.slots[..producers]
             .iter()
@@ -326,8 +451,21 @@ impl Workers {
         if mode != IDLE
             && (mode != DRAIN && sent != self.expected || mode != FILL && received != self.expected)
         {
+            // When the exact-once map is live, say what the surplus or deficit
+            // actually is: duplicated in-range values, or values never seen.
+            let detail = if self.seen.is_empty() {
+                String::new()
+            } else {
+                let missing = self
+                    .seen
+                    .iter()
+                    .filter(|s| s.load(AtomicOrdering::Relaxed) == 0)
+                    .count();
+                let duplicated = self.bad_value.load(AtomicOrdering::Relaxed);
+                format!(" (never-delivered values {missing}; duplicate or out-of-range observed {duplicated})")
+            };
             return Err(format!(
-                "integrity mismatch: expected {} sent {sent} consumed {received}",
+                "integrity mismatch: expected {} sent {sent} consumed {received}{detail}",
                 self.expected
             ));
         }
@@ -350,7 +488,7 @@ impl Workers {
 impl Drop for Workers {
     fn drop(&mut self) {
         self.action.store(STOP, AtomicOrdering::Release);
-        self.start.wait();
+        self.start.wait(self.slots.len());
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
@@ -460,6 +598,7 @@ fn run_with<Q: BenchQueueHandleFactory, const VERIFY: bool>(
         "round_items":expected,"rounds":rounds,"warmup_rounds":cfg.warmup_rounds,
         "items":items,"elapsed_ns":elapsed,"ops_per_sec":items as f64*1e9/elapsed as f64,
         "fixed_work":cfg.rounds.is_some(),"affinity_ok":affinity,"exact_once_checked":VERIFY,
+        "batch_repair_probe": batch_repair_counts(),
         "empty_round_median_ns":empty_round_median_ns,
         "barrier_overhead_proxy_fraction":empty_round_median_ns as f64*rounds as f64/elapsed as f64,
         "persistent_workers":true,"memory":memory_snapshot(),"os":os,"config":cfg});
