@@ -70,6 +70,8 @@ mod head;
 mod page;
 mod slot;
 
+pub mod v8;
+
 #[cfg(any(unix, windows, target_family = "wasm"))]
 pub mod kfifo;
 

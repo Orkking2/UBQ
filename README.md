@@ -533,7 +533,12 @@ rules are scoped to `*_batchcomp` figures; ordinary scaling plots retain their
 existing series styling. The symmetric suite additionally emits
 `symmetric_line_throughput_batchcomp_overlay`, which places every queue on one
 axis and retains only its scalar winner and contention-weighted best batch for
-direct comparison. Ratio heatmaps use a purple/orange diverging map with numeric
+direct comparison. LUBQ's crossbeam and yield backoffs compete as tuning
+variants within one family: scalar and batched representatives are selected
+separately, with one fixed backoff across each scaling plot. Batch-size panels
+show the batch sizes of the winning batched backoff. Legends use LUBQ without a
+backoff suffix; CSV queue labels retain the actual selected backoff. Default
+output omits the separate yield-versus-crossbeam speedup grids. Ratio heatmaps use a purple/orange diverging map with numeric
 cell labels instead of a red/green scale. Shared semantic colors and accessible
 fallbacks live in `scripts/plot_style.py`.
 

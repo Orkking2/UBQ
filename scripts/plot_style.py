@@ -46,6 +46,8 @@ _FAMILY_ALIASES = {
     "ubq": "UBQ",
     "UBQ batched": "UBQ",
     "lubq": "LUBQ",
+    "lubq-yield": "LUBQ",
+    "LUBQ-yield": "LUBQ",
     "LUBQ batched": "LUBQ",
     "segqueue": "SegQueue",
     "crossbeam SegQueue": "SegQueue",

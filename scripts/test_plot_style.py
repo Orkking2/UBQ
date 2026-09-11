@@ -28,6 +28,8 @@ class PlotStyleTests(unittest.TestCase):
         for scalar, batched in (
             ("UBQ", "UBQ batched"),
             ("LUBQ", "LUBQ batched"),
+            ("LUBQ", "lubq-yield"),
+            ("LUBQ", "LUBQ-yield"),
             ("crossbeam SegQueue", "crossbeam SegQueue batched"),
         ):
             self.assertEqual(canonical_family(scalar), canonical_family(batched))

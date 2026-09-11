@@ -1291,14 +1291,14 @@ class PlainBatchNativeQueueTest(unittest.TestCase):
         self.assertEqual("LUBQ", queue_metadata("lubq")["family"])
         self.assertEqual("LUBQ batched", queue_metadata(batch_label)["family"])
 
-    def test_lubq_yield_shares_the_lubq_family_but_has_its_own_label(self):
+    def test_lubq_yield_shares_the_lubq_family_and_display_label(self):
         """lubq-yield is a backoff-policy variant of the same LUBQ
         architecture (see PLAIN_QUEUE_METADATA), so family-level plots
         (scenario lines, best-of-family charts) pick whichever backoff policy
         actually wins -- exactly like UBQ's own label variants already do."""
         batch_label = format_batched_plain_label("lubq-yield", 256)
-        self.assertEqual("LUBQ-yield", display_label("lubq-yield"))
-        self.assertEqual("LUBQ-yieldb (256)", display_label(batch_label))
+        self.assertEqual("LUBQ", display_label("lubq-yield"))
+        self.assertEqual("LUBQb (256)", display_label(batch_label))
         self.assertEqual("LUBQ", queue_metadata("lubq-yield")["family"])
         self.assertEqual("LUBQ batched", queue_metadata(batch_label)["family"])
 
@@ -1677,6 +1677,55 @@ class CombinedBatchComparisonTest(unittest.TestCase):
             [ubq_scalar, ubq_batch32, "segqueue", segqueue_batch32],
             combined_best_batch_comparison_line_labels(entries_by_scenario),
         )
+
+    def test_backoffs_compete_with_fixed_scalar_and_batch_representatives(self):
+        cross8 = format_batched_plain_label("lubq", 8)
+        cross32 = format_batched_plain_label("lubq", 32)
+        yield8 = format_batched_plain_label("lubq-yield", 8)
+        yield32 = format_batched_plain_label("lubq-yield", 32)
+        seg32 = format_batched_plain_label("segqueue", 32)
+        entries = {
+            "1p1c": {
+                "lubq": stats(300), "lubq-yield": stats(100),
+                cross8: stats(100), cross32: stats(200),
+                yield8: stats(400), yield32: stats(300),
+                "segqueue": stats(90), seg32: stats(120),
+            },
+            "32p32c": {
+                "lubq": stats(100), "lubq-yield": stats(300),
+                cross8: stats(200), cross32: stats(400),
+                yield8: stats(100), yield32: stats(200),
+                "segqueue": stats(80), seg32: stats(110),
+            },
+        }
+        families = combined_batch_comparison_families(entries)
+        self.assertEqual(["lubq", "segqueue"], [key for key, _ in families])
+        self.assertEqual(["lubq-yield", cross8, cross32], dict(families)["lubq"])
+        overlay = combined_best_batch_comparison_families(entries)
+        self.assertEqual(["lubq-yield", cross32], dict(overlay)["lubq"])
+        styles = combined_best_batch_comparison_series_styles(overlay)
+        self.assertEqual("LUBQ scalar", styles["lubq-yield"]["label"])
+        self.assertEqual(family_color("LUBQ"), styles["lubq-yield"]["color"])
+        self.assertNotEqual(styles["lubq-yield"]["color"], styles["segqueue"]["color"])
+        self.assertNotEqual(styles["lubq-yield"]["marker"], styles["segqueue"]["marker"])
+        panel_styles = combined_batch_comparison_series_styles(FakePyplot(), families, entries)
+        self.assertEqual("scalar", panel_styles["lubq-yield"]["label"])
+        self.assertEqual("-", panel_styles[cross32]["linestyle"])
+        # Latency reverses the selection, and still keeps whole measured curves.
+        lower = dict(combined_best_batch_comparison_families(entries, "data_latency"))
+        self.assertEqual(["lubq", yield8], lower["lubq"])
+
+    def test_yield_only_data_still_uses_lubq_identity(self):
+        batched = format_batched_plain_label("lubq-yield", 32)
+        entries = {"4p4c": {"lubq-yield": stats(100), batched: stats(200)}}
+        families = combined_best_batch_comparison_families(entries)
+        self.assertEqual([("lubq", ["lubq-yield", batched])], families)
+        styles = combined_best_batch_comparison_series_styles(families)
+        self.assertEqual("LUBQ batch=32 (best)", styles[batched]["label"])
+        rows = lubq_throughput_speedup_rows(
+            {"4p4c": {**entries["4p4c"], "segqueue": stats(50)}}
+        )
+        self.assertEqual("lubq-yield", rows[0]["lubq_queue"])
 
     def test_overlay_styles_identify_queue_and_method(self):
         ubq_scalar = "ubq_balanced,8,127,crossbeam"

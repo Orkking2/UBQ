@@ -72,8 +72,8 @@ THROUGHPUT_SPEEDUP_BASELINES = (
     (
         "lubq",
         "LUBQ",
-        lambda label: label == "lubq",
-        lambda label: _is_batched_plain_queue(label, "lubq"),
+        lambda label: queue_metadata(label)["family"] == "LUBQ",
+        lambda label: queue_metadata(label)["family"] == "LUBQ batched",
     ),
     (
         "segqueue",
@@ -197,8 +197,8 @@ LUBQ_YIELD_THROUGHPUT_SPEEDUP_BASELINES = (
 )
 UBQ_BATCHED_PREFIX = "ubq_batched_"
 PUBLICATION_SERIES = (
-    ("LUBQ", lambda label: label == "lubq"),
-    ("LUBQ batched", lambda label: _is_batched_plain_queue(label, "lubq")),
+    ("LUBQ", lambda label: queue_metadata(label)["family"] == "LUBQ"),
+    ("LUBQ batched", lambda label: queue_metadata(label)["family"] == "LUBQ batched"),
     ("segqueue", lambda label: label == "segqueue"),
     ("SegQueue batched", lambda label: parse_batched_segqueue_label(label) is not None),
     ("concurrent-queue", lambda label: label == "concurrent-queue"),
@@ -239,7 +239,7 @@ QUEUE_FAMILY_PRIORITY = {
 # changes beyond an optional display-name entry here.
 PLAIN_QUEUE_DISPLAY_NAMES = {
     "lubq": "LUBQ",
-    "lubq-yield": "LUBQ-yield",
+    "lubq-yield": "LUBQ",
     "segqueue": "SegQueue",
     "mutex-vecdeque": "Mutex+VecDeque",
     "ms-queue": "MS-Queue",
@@ -937,13 +937,15 @@ def best_batched_ubq_throughput_entry(entries, scenario):
 
 
 def best_lubq_throughput_entry(entries, _scenario=None):
-    return best_throughput_entry(entries, lambda label: label == "lubq")
+    return best_throughput_entry(
+        entries, lambda label: queue_metadata(label)["family"] == "LUBQ"
+    )
 
 
 def best_batched_lubq_throughput_entry(entries, _scenario=None):
     return best_throughput_entry(
         entries,
-        lambda label: _is_batched_plain_queue(label, "lubq"),
+        lambda label: queue_metadata(label)["family"] == "LUBQ batched",
     )
 
 
@@ -2255,6 +2257,11 @@ def batch_comparison_series_styles(
     return styles
 
 
+def plain_queue_representative_key(queue: str) -> str:
+    """Group backoff tuning variants under their queue architecture."""
+    return "lubq" if queue == "lubq-yield" else queue
+
+
 def plain_batch_family_queues(entries_by_scenario):
     """Every 'plain' batch-native queue (no internal variant params, see
     format_batched_plain_label) with at least one batched record anywhere in
@@ -2265,35 +2272,45 @@ def plain_batch_family_queues(entries_by_scenario):
         for label in entries:
             parsed = parse_batched_plain_label(label)
             if parsed is not None:
-                queues.add(parsed[0])
+                queues.add(plain_queue_representative_key(parsed[0]))
     return sorted(queues)
 
 
 def plain_batch_comparison_line_labels(entries_by_scenario, mode: str, queue: str):
-    """For one plain batch-native queue: its scalar label (if it has valid
-    data for `mode` anywhere) plus every batch-size label observed for it,
-    sorted by batch size.
+    """Select the best scalar and all batch sizes of the winning backoff.
 
-    Unlike UBQ's batch_comparison_line_labels, there is no internal
-    variant-param winner to pick — a plain queue has exactly one scalar
-    configuration, so every batch size it was measured at is shown directly
-    rather than narrowed to "the batch sizes matching the winning params".
+    Representatives are fixed across scenarios using the same contention-
+    weighted score as UBQ. Raw labels preserve the selected backoff in CSVs.
     """
-    batched_labels = set()
-    has_scalar = False
-    for entries in entries_by_scenario.values():
-        valid_labels = set(labels_by_metric(entries, mode))
-        if queue in valid_labels:
-            has_scalar = True
-        for label in valid_labels:
-            parsed = parse_batched_plain_label(label)
-            if parsed is not None and parsed[0] == queue:
-                batched_labels.add(label)
-    labels = [queue] if has_scalar else []
-    labels.extend(
-        sorted(batched_labels, key=lambda label: parse_batched_plain_label(label)[1])
+    family_entries = {}
+    for scenario, entries in entries_by_scenario.items():
+        family_entries[scenario] = {
+            label: entries[label]
+            for label in labels_by_metric(entries, mode)
+            if plain_queue_representative_key(
+                parsed[0] if (parsed := parse_batched_plain_label(label)) else label
+            ) == plain_queue_representative_key(queue)
+            and queue_label_valid_for_scenario(label, scenario)
+        }
+    winners = aggregate_family_variation_labels(family_entries, mode)
+    scalar = [label for label in winners if parse_batched_plain_label(label) is None]
+    batched_winner = next(
+        (label for label in winners if parse_batched_plain_label(label) is not None),
+        None,
     )
-    return labels
+    if batched_winner is None:
+        return scalar
+    winning_queue = parse_batched_plain_label(batched_winner)[0]
+    batched_labels = {
+        label
+        for entries in family_entries.values()
+        for label in entries
+        if (parsed := parse_batched_plain_label(label)) is not None
+        and parsed[0] == winning_queue
+    }
+    return scalar + sorted(
+        batched_labels, key=lambda label: parse_batched_plain_label(label)[1]
+    )
 
 
 def plain_batch_comparison_series_styles(
@@ -2320,8 +2337,11 @@ def plain_batch_comparison_series_styles(
     cmap = cmap if cmap is not None else plt.get_cmap(ACCESSIBLE_DIVERGING_CMAP)
     prefix = f"{family_label} " if family_label else ""
     styles = {}
-    if queue in labels:
-        styles[queue] = {
+    scalar = next(
+        (label for label in labels if parse_batched_plain_label(label) is None), None
+    )
+    if scalar is not None:
+        styles[scalar] = {
             "label": f"{prefix}scalar",
             "color": scalar_color,
             "marker": "o",
@@ -2334,7 +2354,7 @@ def plain_batch_comparison_series_styles(
         (
             (label, parse_batched_plain_label(label)[1])
             for label in labels
-            if label != queue
+            if parse_batched_plain_label(label) is not None
         ),
         key=lambda item: item[1],
     )
@@ -2431,24 +2451,14 @@ def combined_best_batch_comparison_families(
 ):
     """Reduce each queue to its scalar winner and contention-weighted best batch.
 
-    Selection is performed within each plotted queue so tuning variants that
-    share a metadata family (for example LUBQ backoff variants) do not suppress
-    one another's best batch in the overlaid comparison.
+    Backoff variants compete within one architecture; each plotted family
+    contributes only one scalar and one batched representative.
     """
+    selected = set(aggregate_family_variation_labels(entries_by_scenario, mode))
     selected_families = []
     for family, family_labels in combined_batch_comparison_families(
         entries_by_scenario, mode
     ):
-        family_label_set = set(family_labels)
-        family_entries = {
-            scenario: {
-                label: stats
-                for label, stats in entries.items()
-                if label in family_label_set
-            }
-            for scenario, entries in entries_by_scenario.items()
-        }
-        selected = set(aggregate_family_variation_labels(family_entries, mode))
         labels = [label for label in family_labels if label in selected]
         if labels:
             selected_families.append((family, labels))
@@ -4414,12 +4424,6 @@ def main():
                 "lubq_kind",
                 write_lubq_throughput_speedup_csv,
             ),
-            (
-                "lubq_yield",
-                lubq_yield_throughput_speedup_rows(entries_by_scenario),
-                "lubq_yield_kind",
-                write_lubq_yield_throughput_speedup_csv,
-            ),
         )
         for target_slug, speedup_rows, kind_key, writer in comparison_suites:
             for target_kind in ("scalar", "batched"):
@@ -4475,12 +4479,6 @@ def main():
                 lubq_throughput_speedup_rows(entries_by_scenario),
                 "lubq_kind",
                 plot_lubq_throughput_speedup_grid,
-            ),
-            (
-                "lubq_yield",
-                lubq_yield_throughput_speedup_rows(entries_by_scenario),
-                "lubq_yield_kind",
-                plot_lubq_yield_throughput_speedup_grid,
             ),
         )
         for target_slug, speedup_rows, kind_key, plotter in comparison_suites:
