@@ -8,6 +8,7 @@ const BACKOFF_INFO: &[(&str, &str)] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    generate_queue_variants();
 
     if std::env::var("CARGO_FEATURE_BENCH_MOODYCAMEL").is_ok() {
         println!("cargo:rerun-if-changed=third_party/moodycamel/shim.cpp");
@@ -96,4 +97,91 @@ fn main() {
     writeln!(code, "}}").unwrap();
 
     std::fs::write(path, code).expect("failed to write bench_registry.rs");
+}
+
+/// The same registry is read by `ab new`, FIFO validation, and Cargo.
+fn generate_queue_variants() {
+    println!("cargo:rerun-if-changed=src/queue_variants.tsv");
+    let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let registry = std::fs::read_to_string(root.join("src/queue_variants.tsv")).unwrap();
+    let mut modules = String::new();
+    let mut adapters = String::new();
+    let mut dispatch = String::from(
+        "fn run_registered(cfg: &Config, scenario: &ScenarioConfig, before: Value) -> Option<Result<Value, String>> {\n\
+         macro_rules! probe { ($queue:expr) => {{\n\
+         if cfg.mode == \"verify\" { run_with::<_, true>($queue, cfg, scenario, before) }\n\
+         else { run_with::<_, false>($queue, cfg, scenario, before) }\n\
+         }}; }\n",
+    );
+    let mut names = std::collections::HashSet::new();
+    let mut module_names = std::collections::HashSet::new();
+    let mut rows: Vec<_> = registry
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .collect();
+    // A name may extend another queue's geometry prefix; exact variants win.
+    rows.sort_by_key(|line| std::cmp::Reverse(line.split('\t').next().unwrap().len()));
+    for line in rows {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 5, "invalid queue registry row: {line}");
+        let (name, module, source, adapter, fifo) =
+            (fields[0], fields[1], fields[2], fields[3], fields[4]);
+        assert!(
+            names.insert(name) && module_names.insert(module),
+            "duplicate queue registration: {line}"
+        );
+        assert!(
+            matches!(adapter, "ubq" | "v8") && matches!(fifo, "strict" | "relaxed"),
+            "invalid queue registration: {line}"
+        );
+        let implementation = if module == "crate" {
+            assert_eq!((name, source, adapter), ("ubq", "src", "ubq"));
+            "crate".to_string()
+        } else {
+            writeln!(
+                modules,
+                "#[doc = {:?}]\n#[path = {:?}]\npub mod {module};",
+                format!("Queue variant `{name}`; registered in src/queue_variants.tsv."),
+                root.join(source).join("mod.rs")
+            )
+            .unwrap();
+            format!("crate::{module}")
+        };
+        let adapter_module = format!("registered_{module}");
+        writeln!(
+            adapters,
+            "mod {adapter_module} {{ use {implementation} as implementation; include!({:?}); }}",
+            root.join(format!("src/bench_harness/adapters/{adapter}.rs"))
+        )
+        .unwrap();
+        let queue = if name == "ubq" {
+            "ubq".to_string()
+        } else {
+            format!("ubq-{name}")
+        };
+        // Every registered queue takes the workload's backoff policy; owned-buffer
+        // queues also take their geometry from the queue name.
+        if adapter == "v8" {
+            writeln!(dispatch,
+                "if cfg.queue == {queue:?} || cfg.queue.starts_with(concat!({queue:?}, \"-s\")) {{\n\
+                 return Some((|| {{\n\
+                 let (slots, vblocks) = parse_geometry(&cfg.queue, {queue:?})?;\n\
+                 if cfg.backoff == \"yield\" {{\n\
+                 probe!({adapter_module}::Queue::<backoff::Yield>::new(slots, vblocks)?)\n\
+                 }} else {{ probe!({adapter_module}::Queue::<backoff::Crossbeam>::new(slots, vblocks)?) }}\n\
+                 }})()); }}").unwrap();
+        } else {
+            writeln!(
+                dispatch,
+                "if cfg.queue == {queue:?} {{ return Some(if cfg.backoff == \"yield\" {{\n\
+                 probe!({adapter_module}::Queue::<backoff::Yield>::new())\n\
+                 }} else {{ probe!({adapter_module}::Queue::<backoff::Crossbeam>::new()) }}); }}"
+            )
+            .unwrap();
+        }
+    }
+    dispatch.push_str("None\n}\n");
+    std::fs::write(out.join("queue_modules.rs"), modules).unwrap();
+    std::fs::write(out.join("queue_dispatch.rs"), adapters + &dispatch).unwrap();
 }

@@ -1,0 +1,11 @@
+{
+  "name": "dynblock-vs-ubq",
+  "question": "How do small vblocks with per-vblock counters compare with the original UBQ reservations and per-slot publication, and which backoff policy suits each queue?",
+  "arms": [
+    {"name": "ubq", "ref": "WORKTREE", "workload": {"queue": "ubq", "backoff": "crossbeam"}},
+    {"name": "ubq-yield", "ref": "WORKTREE", "workload": {"queue": "ubq", "backoff": "yield"}},
+    {"name": "dynblock", "ref": "WORKTREE", "workload": {"queue": "ubq-dynblock-s32-v32", "backoff": "crossbeam"}},
+    {"name": "dynblock-yield", "ref": "WORKTREE", "workload": {"queue": "ubq-dynblock-s32-v32", "backoff": "yield"}}
+  ],
+  "build": {"tests": ["dynblock::", "bench_harness::hardware"]}
+}

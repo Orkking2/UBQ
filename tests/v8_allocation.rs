@@ -38,7 +38,7 @@ impl Drop for Tracking {
 
 #[test]
 fn scalar_transfers_and_empty_pops_do_not_allocate_temporary_buffers() {
-    let q = UBQ::with_config(Config {
+    let q = UBQ::<u64>::with_config(Config {
         slots_per_vblock: 64,
         vblocks_per_block: 2,
     })

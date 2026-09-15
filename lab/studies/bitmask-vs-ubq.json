@@ -1,0 +1,15 @@
+{
+  "name": "bitmask-vs-ubq",
+  "question": "Do 64-slot VBlocks published through produced/consumed bitmasks and the attach-all freelist counted in the producer index (ubq-bitmask) beat v8 and the original UBQ, and which backoff suits each queue?",
+  "arms": [
+    {"name": "ubq", "ref": "WORKTREE", "workload": {"queue": "ubq", "backoff": "crossbeam"}},
+    {"name": "ubq-yield", "ref": "WORKTREE", "workload": {"queue": "ubq", "backoff": "yield"}},
+    {"name": "v8", "ref": "WORKTREE", "workload": {"queue": "ubq-v8-s4096-v32", "backoff": "crossbeam"}},
+    {"name": "v8-yield", "ref": "WORKTREE", "workload": {"queue": "ubq-v8-s4096-v32", "backoff": "yield"}},
+    {"name": "bitmask", "ref": "WORKTREE", "workload": {"queue": "ubq-bitmask-s64-v2048", "backoff": "crossbeam"}},
+    {"name": "bitmask-yield", "ref": "WORKTREE", "workload": {"queue": "ubq-bitmask-s64-v2048", "backoff": "yield"}}
+  ],
+  "workload": {"queue": "ubq-v8-s4096-v32", "rss_limit_mib": 65536},
+  "clusters": ["grace", "mn5"],
+  "build": {"tests": ["tests::", "block::", "head::", "v8::", "bitmask::", "bench_harness::hardware"]}
+}

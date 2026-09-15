@@ -1,0 +1,61 @@
+{
+  "transfer_host": "stg",
+  "remote_root": "/gpfs/scratch/bsc18/bsc614227/ubq-lab",
+  "sync": {
+    "stg": "/gpfs/projects/bsc18/bsc614227/UBQ",
+    "hebrides": "UBQ",
+    "lab": "UBQ"
+  },
+  "clusters": {
+    "grace": {
+      "host": "grace",
+      "scheduler": "slurm",
+      "cores": 144,
+      "account": "bsc18",
+      "partition": "ngpp",
+      "qos": "ngp_bsccs",
+      "build_qos": "ngp_debug",
+      "array_limit": 300,
+      "constraint": "perfparanoid",
+      "exclusive_mem0": true,
+      "build_modules": ["gcc", "rust"],
+      "task_modules": ["arm_performix/2026.3.1"],
+      "collectors": ["counters", "perf_record", "perf_mem", "code_hotspots",
+                     "cpu_microarchitecture", "instruction_mix"],
+      "counter_groups": {
+        "ipc": ["cycles:u", "instructions:u"],
+        "stall": ["cycles:u", "stalled-cycles-frontend:u", "stalled-cycles-backend:u"],
+        "cache": ["cache-references:u", "cache-misses:u"],
+        "tlb": ["dTLB-loads:u", "dTLB-load-misses:u"],
+        "branch": ["branches:u", "branch-misses:u"]
+      }
+    },
+    "mn5": {
+      "host": "mn5gpp",
+      "scheduler": "slurm",
+      "cores": 112,
+      "account": "bsc18",
+      "partition": "gpp",
+      "qos": "gp_bsccs",
+      "build_qos": "gp_debug",
+      "array_limit": 300,
+      "constraint": "perfparanoid",
+      "exclusive_mem0": false,
+      "build_modules": ["gcc", "rust"],
+      "task_modules": [],
+      "collectors": ["counters", "perf_record", "perf_mem", "perf_c2c"],
+      "counter_groups": {
+        "ipc": ["cycles:u", "instructions:u"],
+        "cache": ["cache-references:u", "cache-misses:u"],
+        "tlb": ["dTLB-loads:u", "dTLB-load-misses:u"],
+        "branch": ["branches:u", "branch-misses:u"]
+      }
+    },
+    "local": {
+      "scheduler": "local",
+      "cores": null,
+      "collectors": [],
+      "counter_groups": {}
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "batch-geometry",
+  "question": "How do the push and pop batch sizes interact with the VBlock size (slots) and block size (VBlocks per block)? Does a batch larger than a VBlock, or a block smaller than a batch, change the per-call and per-item costs?",
+  "grid": {"queues": ["ubq-v8"],
+           "geometries": ["s4096-v128", "s256-v2", "s256-v128", "s4096-v2", "s16384-v2", "s16384-v128"]},
+  "workload": {"queue": "ubq-v8-s4096-v128", "backoff": "yield", "rss_limit_mib": 65536},
+  "clusters": ["grace"],
+  "throughput": {
+    "scenarios": ["Np1c", "16p1c", "1p1c"],
+    "batch_sizes": [1, 16, 256, 4096, 16384, [16, 1], [256, 1], [4096, 1], [1, 256], [4096, 256]],
+    "replicates": 3
+  },
+  "memory": {"scenarios": [], "depths": []},
+  "deep": {"auto": false},
+  "build": {"tests": ["v8::", "bench_harness::hardware"]}
+}

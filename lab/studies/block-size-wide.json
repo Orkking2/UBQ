@@ -1,0 +1,14 @@
+{
+  "name": "block-size-wide",
+  "question": "The widest batched shapes of the block-size sweep, with the RSS guard raised so small-block and many-VBlock geometries are measured rather than killed: which geometry wins when 143 or 72 producers push 4096-item batches?",
+  "grid": {
+    "queues": ["ubq-v8"],
+    "geometries": ["s4096-v32", "s256-v32", "s1024-v32", "s16384-v32", "s4096-v2", "s4096-v8", "s4096-v128"]
+  },
+  "workload": {"queue": "ubq-v8-s4096", "rss_limit_mib": 65536},
+  "clusters": ["grace"],
+  "throughput": {"scenarios": ["Np1c", "HpHc", "64p1c", "1pNc"], "batch_sizes": [4096]},
+  "memory": {"depths": []},
+  "deep": {"auto": false},
+  "build": {"tests": ["v8::", "bench_harness::hardware"]}
+}

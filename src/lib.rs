@@ -70,7 +70,7 @@ mod head;
 mod page;
 mod slot;
 
-pub mod v8;
+include!(concat!(env!("OUT_DIR"), "/queue_modules.rs"));
 
 #[cfg(any(unix, windows, target_family = "wasm"))]
 pub mod kfifo;
@@ -93,19 +93,3 @@ pub use queue::UBQ;
 
 #[cfg(feature = "probe_batch_repair")]
 pub use queue::batch_repair_probe;
-
-/*
-CARGO_TARGET_DIR=/home/nicolas/UBQ/target/vtune \
-CARGO_PROFILE_RELEASE_DEBUG=2 \
-RUSTFLAGS="-C force-frame-pointers=yes" \
-cargo build --release \
-  --features bench_registry,bench_rbbq,bench_lfqueue,bench_wcq \
-  --bin bench_matrix \
-  --bin bench_atomic_updates \
-  --bin bench_head_reload
-*/
-
-// rsync -avhzc \
-//   --include '/logs/' \
-//   --exclude '/*/' \
-//   "$REMOTE_HOST:$REMOTE_UBQ/" "$LOCAL_UBQ/remote/"

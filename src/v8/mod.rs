@@ -5,10 +5,14 @@
 //! Correctness and lock-free progress have not yet been established.
 //! The existing [`crate::UBQ`] remains the default queue.
 //!
+//! Every wait goes through the queue's [`BackoffPolicy`](crate::backoff::BackoffPolicy)
+//! type parameter, [`Crossbeam`](crate::backoff::Crossbeam) by default, exactly
+//! as for [`ubq::UBQ`](crate::UBQ).
+//!
 //! ```
 //! use ubq::v8::{Config, UBQ};
 //!
-//! let queue = UBQ::with_config(Config {
+//! let queue = UBQ::<String>::with_config(Config {
 //!     slots_per_vblock: 32,
 //!     vblocks_per_block: 8,
 //! }).unwrap();

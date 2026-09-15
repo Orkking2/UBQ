@@ -1,0 +1,12 @@
+{
+  "name": "strict-baselines",
+  "question": "Where does v8 at its selected geometry fall against the original UBQ and crossbeam's SegQueue, the other strict FIFOs?",
+  "arms": [
+    {"name": "v8", "ref": "WORKTREE", "workload": {"queue": "ubq-v8-s4096-v128"}},
+    {"name": "ubq", "ref": "WORKTREE", "workload": {"queue": "ubq"}},
+    {"name": "segqueue", "ref": "WORKTREE", "workload": {"queue": "segqueue"}}
+  ],
+  "workload": {"queue": "ubq-v8-s4096", "rss_limit_mib": 65536},
+  "clusters": ["grace", "mn5"],
+  "build": {"tests": ["tests::", "v8::", "bench_harness::hardware"]}
+}

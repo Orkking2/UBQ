@@ -44,6 +44,12 @@ its lifetime, so a cached block is reused with the same layout.
 `push` and `pop` allocate their temporary one-element buffers. Borrowed-slice
 and append-to-Vec convenience operations from the old scaffold are not present.
 
+`UBQ<T, B>` takes the same `BackoffPolicy` parameter as `ubq::UBQ`
+(`backoff::Crossbeam` by default, `backoff::Yield` as the alternative); every
+spin and snooze in the reservation and publication waits goes through it, so
+`bench_hardware` and the lab select the policy per workload for v8 and its
+forks exactly as for the original queue.
+
 ## Reservation and publication
 
 Each head has a separate block pointer and packed index. The index uses one

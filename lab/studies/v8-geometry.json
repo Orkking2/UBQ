@@ -1,0 +1,8 @@
+{
+  "name": "v8-geometry",
+  "question": "Do larger VBlocks keep paying off beyond 4096 slots?",
+  "arms": [
+    {"name": "s4096", "ref": "WORKTREE", "workload": {"queue": "ubq-v8-s4096"}},
+    {"name": "s16384", "ref": "WORKTREE", "workload": {"queue": "ubq-v8-s16384"}}
+  ]
+}

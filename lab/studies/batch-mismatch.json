@@ -1,0 +1,21 @@
+{
+  "name": "batch-mismatch",
+  "question": "Must the producer batch match the consumer batch? At 143p1c, is pushing one item at a time while the consumer pops 256 faster than scalar on both sides, or than other push/pop pairs?",
+  "arms": [
+    {"name": "v8", "ref": "WORKTREE", "workload": {"queue": "ubq-v8-s4096-v128", "backoff": "yield"}},
+    {"name": "ubq", "ref": "WORKTREE", "workload": {"queue": "ubq", "backoff": "yield"}}
+  ],
+  "workload": {"queue": "ubq-v8-s4096-v128", "backoff": "yield", "rss_limit_mib": 65536},
+  "clusters": ["grace", "mn5"],
+  "throughput": {
+    "scenarios": ["Np1c", "64p1c", "16p1c", "1pNc", "1p64c", "1p16c", "HpHc", "16p16c", "1p1c"],
+    "batch_sizes": [[1, 1], [1, 16], [1, 256], [1, 4096],
+                    [16, 1], [16, 16], [16, 256], [16, 4096],
+                    [256, 1], [256, 16], [256, 256], [256, 4096],
+                    [4096, 1], [4096, 16], [4096, 256], [4096, 4096]],
+    "replicates": 3
+  },
+  "memory": {"scenarios": [], "depths": []},
+  "deep": {"auto": false},
+  "build": {"tests": ["v8::", "bench_harness::hardware"]}
+}

@@ -59,7 +59,7 @@ fn drop_releases_every_queued_value_without_popping() {
     // Cover partial, exact-full, and multi-block batches.
     for count in [0, 1, 5, 6, 7, 12, 41, 42] {
         let drops = Arc::new((0..count).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
-        let q = UBQ::with_config(config(3, 2)).unwrap();
+        let q = UBQ::<Value>::with_config(config(3, 2)).unwrap();
         if count != 0 {
             let returned = q.push_batch((0..count).map(|id| Value(id, drops.clone())).collect());
             assert!(returned.is_empty());

@@ -4,9 +4,11 @@ use super::{
     block::{Block, BlockList, Geometry, OwnedBlock},
     freelist::FreeList,
 };
+use crate::backoff::{BackoffPolicy, Crossbeam};
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     fmt,
+    marker::PhantomData,
     mem::MaybeUninit,
     ptr::{self, null_mut},
     sync::atomic::{
@@ -15,7 +17,7 @@ use core::{
         fence,
     },
 };
-use crossbeam_utils::{Backoff, CachePadded};
+use crossbeam_utils::CachePadded;
 
 /// buf.is_empty() ? Ok(buf) : Err(buf)
 pub fn empty_vec_to_box_uninit<U>(buf: Vec<U>) -> Result<Box<[MaybeUninit<U>]>, Vec<U>> {
@@ -81,11 +83,15 @@ impl core::error::Error for ConfigError {}
 ///
 /// Batch operations copy one virtual-block segment at a time. Whole-batch
 /// atomicity and lock-free progress are not established contracts yet.
-pub struct UBQ<T> {
+///
+/// `B` is the [`BackoffPolicy`] every wait in the queue uses, as for
+/// [`crate::UBQ`]; it defaults to [`Crossbeam`].
+pub struct UBQ<T, B = Crossbeam> {
     geometry: Geometry,
     producer: CachePadded<Head<T>>,
     consumer: CachePadded<Head<T>>,
     freelist: CachePadded<FreeList<T>>,
+    _backoff: PhantomData<B>,
 }
 
 // The pointer and packed reservation index are separate atomics.
@@ -141,16 +147,16 @@ impl<T> Drop for PopOutput<T> {
 }
 
 // TODO: Safety.
-unsafe impl<T: Send> Send for UBQ<T> {}
-unsafe impl<T: Send> Sync for UBQ<T> {}
+unsafe impl<T: Send, B> Send for UBQ<T, B> {}
+unsafe impl<T: Send, B> Sync for UBQ<T, B> {}
 
-impl<T> Default for UBQ<T> {
+impl<T, B: BackoffPolicy> Default for UBQ<T, B> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> UBQ<T> {
+impl<T, B: BackoffPolicy> UBQ<T, B> {
     /// Creates a queue with experimental default geometry.
     pub fn new() -> Self {
         Self::with_config(Config::default()).expect("invalid default geometry")
@@ -172,6 +178,7 @@ impl<T> UBQ<T> {
             producer: CachePadded::new(Head::new(block)),
             consumer: CachePadded::new(Head::new(block)),
             freelist: CachePadded::new(FreeList::new()),
+            _backoff: PhantomData,
         })
     }
 
@@ -240,7 +247,7 @@ impl<T> UBQ<T> {
         if len == 0 {
             return;
         }
-        let backoff = Backoff::new();
+        let backoff = B::new();
 
         let nv = self.config().vblocks_per_block;
         let ns = self.config().slots_per_vblock;
@@ -396,7 +403,7 @@ impl<T> UBQ<T> {
         if cap == 0 {
             return;
         }
-        let backoff = Backoff::new();
+        let backoff = B::new();
 
         let nv = self.config().vblocks_per_block;
         let ns = self.config().slots_per_vblock;
@@ -607,7 +614,7 @@ impl<T> UBQ<T> {
         mut new_index: usize,
         cap: usize,
         len: &mut usize,
-        backoff: &Backoff,
+        backoff: &B,
     ) {
         let nv = self.config().vblocks_per_block;
         let ns = self.config().slots_per_vblock;
@@ -664,7 +671,7 @@ impl<T> UBQ<T> {
     }
 }
 
-impl<T> Drop for UBQ<T> {
+impl<T, B> Drop for UBQ<T, B> {
     fn drop(&mut self) {
         let block = core::mem::replace(self.consumer.block.get_mut(), null_mut());
         *self.producer.block.get_mut() = null_mut();

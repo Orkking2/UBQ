@@ -5,7 +5,7 @@ use ubq::bench_harness::hardware::{Config, run};
 #[derive(Parser)]
 #[command(about = "Bounded persistent-worker hardware and memory probe")]
 struct Args {
-    /// Frozen JSON workload configuration produced by hardware_campaign.py.
+    /// JSON workload configuration, as written by the lab (lab/ablab/task.py).
     #[arg(long)]
     config: PathBuf,
 }

@@ -1,0 +1,11 @@
+{
+  "name": "block-size",
+  "question": "Which block geometry (slots per VBlock x VBlocks per allocation) gives the most slots per second, for v8, across producer, consumer and balanced scaling and batch sizes?",
+  "grid": {
+    "queues": ["ubq-v8"],
+    "geometries": ["s4096-v32", "s256-v32", "s1024-v32", "s16384-v32", "s4096-v2", "s4096-v8", "s4096-v128"]
+  },
+  "workload": {"queue": "ubq-v8-s4096"},
+  "clusters": ["grace"],
+  "build": {"tests": ["v8::", "bench_harness::hardware"]}
+}

@@ -1,0 +1,15 @@
+{
+  "name": "geometry-matrix",
+  "question": "Over the full matrix of slots per VBlock x VBlocks per block, which geometry gives v8 the most items per second, across producer, consumer and balanced scaling and batch sizes, and what does each cost in memory?",
+  "grid": {
+    "queues": ["ubq-v8"],
+    "geometries": ["s4096-v32",
+                   "s256-v2", "s256-v8", "s256-v32", "s256-v128",
+                   "s1024-v2", "s1024-v8", "s1024-v32", "s1024-v128",
+                   "s4096-v2", "s4096-v8", "s4096-v128",
+                   "s16384-v2", "s16384-v8", "s16384-v32", "s16384-v128"]
+  },
+  "workload": {"queue": "ubq-v8-s4096", "rss_limit_mib": 65536},
+  "clusters": ["grace", "mn5"],
+  "build": {"tests": ["v8::", "bench_harness::hardware"]}
+}

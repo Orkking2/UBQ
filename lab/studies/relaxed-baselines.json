@@ -1,0 +1,11 @@
+{
+  "name": "relaxed-baselines",
+  "question": "Among relaxed FIFOs (per-producer order only), how does LUBQ compare with moodycamel::ConcurrentQueue? A relaxed derivative of v8 belongs in this study, never in a strict one.",
+  "arms": [
+    {"name": "lubq", "ref": "WORKTREE", "workload": {"queue": "lubq"}},
+    {"name": "moodycamel", "ref": "WORKTREE", "features": ["bench_moodycamel"], "workload": {"queue": "moodycamel-cq"}}
+  ],
+  "workload": {"queue": "lubq", "rss_limit_mib": 65536},
+  "clusters": ["grace", "mn5"],
+  "build": {"tests": ["tests::", "bench_harness::hardware"]}
+}

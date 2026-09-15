@@ -1,0 +1,5 @@
+# name	module	source	adapter	fifo
+ubq	crate	src	ubq	strict
+v8	v8	src/v8	v8	strict
+dynblock	dynblock	src/dynblock	v8	strict
+bitmask	bitmask	src/bitmask	v8	strict

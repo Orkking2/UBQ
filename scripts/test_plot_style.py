@@ -9,10 +9,28 @@ from scripts.plot_style import (
     family_hatch,
     family_linestyle,
     family_marker,
+    fifo_ordering,
 )
 
 
 class PlotStyleTests(unittest.TestCase):
+    def test_strict_and_relaxed_fifos_are_classified(self):
+        for queue in ("ubq", "ubq-v8-s256", "segqueue", "fastfifo", "lfqueue", "ms-queue",
+                      "mutex-vecdeque", "concurrent-queue"):
+            self.assertEqual("strict", fifo_ordering(queue), queue)
+        for queue in ("lubq", "lubq-yield", "moodycamel-cq"):
+            self.assertEqual("relaxed", fifo_ordering(queue), queue)
+
+    def test_unclassified_families_must_be_placed_deliberately(self):
+        with self.assertRaises(KeyError):
+            fifo_ordering("disruptor")
+
+    def test_v8_geometries_share_one_family_distinct_from_ubq(self):
+        self.assertEqual("UBQ v8", canonical_family("ubq-v8-s256"))
+        self.assertEqual(family_color("ubq-v8-s256"), family_color("ubq-v8-s4096"))
+        self.assertNotEqual(family_color("UBQ"), family_color("UBQ v8"))
+        self.assertNotEqual(family_marker("UBQ"), family_marker("UBQ v8"))
+
     def test_dense_batch_families_have_unique_base_colors(self):
         families = ("UBQ", "LUBQ", "SegQueue", "moodycamel::CQ", "Mutex+VecDeque")
         self.assertEqual(len(families), len({family_color(family) for family in families}))

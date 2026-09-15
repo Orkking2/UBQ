@@ -1,0 +1,11 @@
+{
+  "name": "v8-vs-ubq",
+  "question": "How does v8 compare with the original UBQ under the same workloads, and which backoff policy suits each queue?",
+  "arms": [
+    {"name": "ubq", "ref": "WORKTREE", "workload": {"queue": "ubq", "backoff": "crossbeam"}},
+    {"name": "ubq-yield", "ref": "WORKTREE", "workload": {"queue": "ubq", "backoff": "yield"}},
+    {"name": "v8", "ref": "WORKTREE", "workload": {"queue": "ubq-v8-s4096", "backoff": "crossbeam"}},
+    {"name": "v8-yield", "ref": "WORKTREE", "workload": {"queue": "ubq-v8-s4096", "backoff": "yield"}}
+  ],
+  "build": {"tests": ["tests::", "block::", "head::", "v8::", "bench_harness::hardware"]}
+}

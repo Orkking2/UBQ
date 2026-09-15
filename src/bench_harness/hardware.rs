@@ -133,7 +133,12 @@ const fn konst_parse_u32(bytes: &[u8], acc: u32) -> u32 {
 pub struct Config {
     pub queue: String,
     pub scenario: String,
-    pub batch_size: Option<usize>,
+    /// Items per `send_batch` call; `None` pushes one item per call.
+    pub producer_batch: Option<usize>,
+    /// Items requested per `try_recv_batch` call; `None` pops one item per call.
+    /// The two sides are independent, so a workload can push singly and pop in
+    /// batches, or the reverse.
+    pub consumer_batch: Option<usize>,
     pub backoff: String,
     pub mode: String,
     pub round_items: u64,
@@ -153,7 +158,8 @@ impl Default for Config {
         Self {
             queue: "ubq".into(),
             scenario: "1p1c".into(),
-            batch_size: None,
+            producer_batch: None,
+            consumer_batch: None,
             backoff: "crossbeam".into(),
             mode: "handoff".into(),
             round_items: 8_388_608,
@@ -317,7 +323,11 @@ impl Workers {
             let affinity = workers.affinity.clone();
             let seen = workers.seen.clone();
             let bad = workers.bad_value.clone();
-            let batch = cfg.batch_size;
+            let batch = if producer {
+                cfg.producer_batch
+            } else {
+                cfg.consumer_batch
+            };
             let core = if producer {
                 producer_core_id(0, p, c, index)
             } else {
@@ -502,7 +512,7 @@ fn run_with<Q: BenchQueueHandleFactory, const VERIFY: bool>(
     before_queue: Value,
 ) -> Result<Value, String> {
     let memory = cfg.mode == "memory";
-    let alignment = scenario.producers as u64 * cfg.batch_size.unwrap_or(1) as u64;
+    let alignment = scenario.producers as u64 * cfg.producer_batch.unwrap_or(1) as u64;
     let expected = if memory {
         cfg.memory_depth
     } else {
@@ -556,7 +566,8 @@ fn run_with<Q: BenchQueueHandleFactory, const VERIFY: bool>(
         }
         return Ok(
             json!({"benchmark":"queue_memory_lifecycle","schema_version":1,"queue":cfg.queue,
-            "scenario":cfg.scenario,"batch_size":cfg.batch_size,"affinity_ok":affinity,
+            "scenario":cfg.scenario,"producer_batch":cfg.producer_batch,"consumer_batch":cfg.consumer_batch,
+            "affinity_ok":affinity,
             "memory_depth":expected,"checkpoints":checkpoints,"phase_elapsed_ns":durations,
             "allocation_coverage":"process footprint; no allocator interception", "config":cfg}),
         );
@@ -592,8 +603,9 @@ fn run_with<Q: BenchQueueHandleFactory, const VERIFY: bool>(
     }
     let items = expected.checked_mul(rounds).ok_or("item count overflow")?;
     let result = json!({"benchmark":"queue_bounded_handoff","schema_version":1,
-        "queue":cfg.queue,"queue_implementation":if cfg.queue=="segqueue" && cfg.batch_size.is_some() {"crossbeam-batchqueue"} else {&cfg.queue},
-        "scenario":cfg.scenario,"batch_size":cfg.batch_size,"backoff":cfg.backoff,
+        "queue":cfg.queue,"queue_implementation":if cfg.queue=="segqueue" && batched(cfg) {"crossbeam-batchqueue"} else {&cfg.queue},
+        "scenario":cfg.scenario,"producer_batch":cfg.producer_batch,"consumer_batch":cfg.consumer_batch,
+        "backoff":cfg.backoff,
         "completion_accounting":if cfg!(feature="probe_item_completion") {"item"} else {"segment"},
         "round_items":expected,"rounds":rounds,"warmup_rounds":cfg.warmup_rounds,
         "items":items,"elapsed_ns":elapsed,"ops_per_sec":items as f64*1e9/elapsed as f64,
@@ -605,6 +617,30 @@ fn run_with<Q: BenchQueueHandleFactory, const VERIFY: bool>(
     Ok(result)
 }
 
+// Module registration is generated from src/queue_variants.tsv. The adapters
+// and measurement code remain identical across variants.
+include!(concat!(env!("OUT_DIR"), "/queue_dispatch.rs"));
+
+/// Parse a registered owned-buffer queue's optional VBlock geometry. Without
+/// a suffix, both dimensions take the implementation's defaults.
+fn parse_geometry(name: &str, prefix: &str) -> Result<(Option<usize>, Option<usize>), String> {
+    let invalid = || format!("invalid queue geometry: {name}");
+    if name == prefix {
+        return Ok((None, None));
+    }
+    let geometry = name.strip_prefix(prefix).and_then(|s| s.strip_prefix("-s")).ok_or_else(invalid)?;
+    let (slots, vblocks) = match geometry.split_once("-v") {
+        Some((slots, vblocks)) => (slots, Some(vblocks.parse().map_err(|_| invalid())?)),
+        None => (geometry, None),
+    };
+    Ok((Some(slots.parse().map_err(|_| invalid())?), vblocks))
+}
+
+/// Whether either side uses a batch API; queues without one run scalar only.
+fn batched(cfg: &Config) -> bool {
+    cfg.producer_batch.is_some() || cfg.consumer_batch.is_some()
+}
+
 pub fn run(cfg: &Config) -> Result<Value, String> {
     if !matches!(cfg.mode.as_str(), "handoff" | "verify" | "memory") {
         return Err("mode must be handoff, verify or memory".into());
@@ -612,7 +648,8 @@ pub fn run(cfg: &Config) -> Result<Value, String> {
     if cfg.rounds == Some(0)
         || cfg.round_items == 0
         || cfg.memory_depth == 0
-        || cfg.batch_size == Some(0)
+        || cfg.producer_batch == Some(0)
+        || cfg.consumer_batch == Some(0)
         || !cfg.duration_secs.is_finite()
         || cfg.duration_secs <= 0.
         || !matches!(cfg.backoff.as_str(), "crossbeam" | "yield")
@@ -638,12 +675,13 @@ pub fn run(cfg: &Config) -> Result<Value, String> {
             }
         }};
     }
+    if let Some(result) = run_registered(cfg, &scenario, before.clone()) {
+        return result;
+    }
     match cfg.queue.as_str() {
         "memory-scaffold" if cfg.mode == "memory" => {
             probe!(Arc::new(MemoryScaffold(AtomicU64::new(0))))
         }
-        "ubq" if cfg.backoff == "yield" => probe!(UBQ::<u64, backoff::Yield>::new_queue()),
-        "ubq" => probe!(UBQ::<u64, backoff::Crossbeam>::new_queue()),
         "lubq" if cfg.backoff == "yield" => probe!(LubqBenchQueue::<u64, backoff::Yield>::new(
             scenario.producers,
             scenario.consumers
@@ -652,21 +690,21 @@ pub fn run(cfg: &Config) -> Result<Value, String> {
             scenario.producers,
             scenario.consumers
         )),
-        "segqueue" if cfg.batch_size.is_some() => probe!(BatchQueue::<u64>::new_queue()),
+        "segqueue" if batched(cfg) => probe!(BatchQueue::<u64>::new_queue()),
         "segqueue" => probe!(SegQueue::<u64>::new_queue()),
         "mutex-vecdeque" => probe!(MutexQueue::<u64>::new_queue()),
-        "concurrent-queue" if cfg.batch_size.is_none() => {
+        "concurrent-queue" if !batched(cfg) => {
             probe!(ConcurrentQueue::<u64>::new_queue())
         }
-        "ms-queue" if cfg.batch_size.is_none() => probe!(MsQueue::<u64>::new_queue()),
+        "ms-queue" if !batched(cfg) => probe!(MsQueue::<u64>::new_queue()),
         #[cfg(feature = "bench_moodycamel")]
         "moodycamel-cq" => probe!(MoodycamelQueue::new_handle()),
         #[cfg(feature = "bench_fastfifo")]
-        "fastfifo" if cfg.batch_size.is_none() && cfg.block_size > 0 && cfg.capacity > 0 => {
+        "fastfifo" if !batched(cfg) && cfg.block_size > 0 && cfg.capacity > 0 => {
             probe!(RbbqBenchQueue::new(cfg.block_size, cfg.capacity))
         }
         #[cfg(feature = "bench_lfqueue")]
-        "lfqueue" if cfg.batch_size.is_none() && cfg.segment_size > 0 => {
+        "lfqueue" if !batched(cfg) && cfg.segment_size > 0 => {
             probe!(LfQueueBenchQueue::new(cfg.segment_size))
         }
         _ => Err(format!(
@@ -683,7 +721,8 @@ mod tests {
         Config {
             queue: queue.into(),
             scenario: "2p2c".into(),
-            batch_size: Some(64),
+            producer_batch: Some(64),
+            consumer_batch: Some(64),
             round_items: 4096,
             rounds: Some(8),
             warmup_rounds: 2,
@@ -694,7 +733,7 @@ mod tests {
     }
     #[test]
     fn bounded_rounds_replay_exact_work_with_persistent_handles() {
-        for queue in ["mutex-vecdeque", "lubq", "segqueue"] {
+        for queue in ["mutex-vecdeque", "lubq", "segqueue", "ubq-v8-s64", "ubq-v8-s64-v3"] {
             let cfg = config(queue);
             let result = run(&cfg).unwrap();
             assert_eq!(result["items"], 32768);
@@ -705,10 +744,62 @@ mod tests {
     }
     #[test]
     fn native_batches_are_verified_exactly_once_across_reuse() {
-        for queue in ["ubq", "lubq", "segqueue", "mutex-vecdeque"] {
+        for queue in ["ubq", "lubq", "segqueue", "mutex-vecdeque", "ubq-v8-s64", "ubq-v8-s64-v3"] {
             let mut cfg = config(queue);
             cfg.mode = "verify".into();
             assert_eq!(run(&cfg).unwrap()["exact_once_checked"], true);
+        }
+    }
+    #[test]
+    fn producer_and_consumer_batches_are_independent() {
+        // Scalar pushes against batched pops and the reverse: the round stays
+        // aligned to the producer side, and every item still arrives once.
+        for queue in ["ubq", "lubq", "segqueue", "mutex-vecdeque", "ubq-v8-s64-v3"] {
+            for (producer, consumer) in [(None, Some(256)), (Some(256), None), (Some(16), Some(4096))] {
+                let mut cfg = config(queue);
+                cfg.mode = "verify".into();
+                cfg.producer_batch = producer;
+                cfg.consumer_batch = consumer;
+                let result = run(&cfg).unwrap_or_else(|e| panic!("{queue} {producer:?}/{consumer:?}: {e}"));
+                assert_eq!(result["exact_once_checked"], true, "{queue}");
+                assert_eq!(result["items"], 32768, "{queue} {producer:?}/{consumer:?}");
+                assert_eq!(result["producer_batch"], json!(producer));
+                assert_eq!(result["consumer_batch"], json!(consumer));
+            }
+        }
+        // A scalar-only queue accepts no batch on either side.
+        let mut cfg = config("ms-queue");
+        cfg.producer_batch = None;
+        assert!(run(&cfg).is_err());
+    }
+    #[test]
+    fn every_registered_queue_runs_under_both_backoff_policies() {
+        for queue in ["ubq", "ubq-v8-s64-v3", "ubq-dynblock-s8-v3"] {
+            for backoff in ["crossbeam", "yield"] {
+                for mode in ["handoff", "verify"] {
+                    let mut cfg = config(queue);
+                    cfg.backoff = backoff.into();
+                    cfg.mode = mode.into();
+                    let result = run(&cfg).unwrap_or_else(|e| panic!("{queue} {backoff} {mode}: {e}"));
+                    assert_eq!(result["backoff"], backoff, "{queue} {mode}");
+                    assert_eq!(result["items"], 32768, "{queue} {backoff} {mode}");
+                    if mode == "verify" {
+                        assert_eq!(result["exact_once_checked"], true, "{queue} {backoff}");
+                    }
+                }
+            }
+        }
+        let mut cfg = config("ubq-v8-s64");
+        cfg.backoff = "spin".into();
+        assert!(run(&cfg).is_err());
+    }
+    #[test]
+    fn v8_geometry_names_select_slots_and_optional_vblocks() {
+        assert_eq!(parse_geometry("ubq-v8", "ubq-v8"), Ok((None, None)));
+        assert_eq!(parse_geometry("ubq-v8-s4096", "ubq-v8"), Ok((Some(4096), None)));
+        assert_eq!(parse_geometry("ubq-v8-s256-v64", "ubq-v8"), Ok((Some(256), Some(64))));
+        for bad in ["ubq-v8-s", "ubq-v8-sx", "ubq-v8-s64-v", "ubq-v8-s64-vx"] {
+            assert!(parse_geometry(bad, "ubq-v8").is_err(), "{bad}");
         }
     }
     #[test]

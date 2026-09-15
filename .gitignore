@@ -1,11 +1,7 @@
 /target
-/bench_results*
-/performix_results/
-/profiling_results/
+/results/
 .*/
 __pycache__/
 *.pyc
 /vendor
 related_works/
-artifacts/
-logs/

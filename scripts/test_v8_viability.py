@@ -16,6 +16,8 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Queue modules that run the shared acceptance cases, by Cargo test target.
+TARGETS = {"v8": "v8_viability"}
 REQUIRED_CASES = {
     "cases::empty_and_zero_capacity_operations",
     "cases::scalar_fifo_across_empty_refill_cycles",
@@ -93,13 +95,16 @@ def positive_int(value):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", action="store_true", help="validate fixtures only, without building v8")
+    parser.add_argument("--target", choices=sorted(TARGETS), default="v8",
+                        help="queue module to run the cases against (default: v8)")
     parser.add_argument("--profile", choices=["debug", "release", "all"], default="all")
     parser.add_argument("--repeat", type=positive_int, default=3)
     parser.add_argument("--timeout", type=positive_float, default=20, help="seconds per case (default: 20)")
     parser.add_argument("--build-timeout", type=positive_float, default=120)
     parser.add_argument("--report", type=Path, help="JSON output (default: target/v8-viability/<target>.json)")
     args = parser.parse_args(argv)
-    target = "reference" if args.reference else "v8"
+    target = "reference" if args.reference else args.target
+    test_target = TARGETS[args.target]
     profiles = ["debug", "release"] if args.profile == "all" else [args.profile]
     report = dict(schema_version=1, target=target, milestone="correctness_and_bounded_completion",
                   status="passed", profiles=profiles, repeat=args.repeat, timeout_seconds=args.timeout,
@@ -114,7 +119,7 @@ def main(argv=None):
                 command += ["-O"] if profile == "release" else []
             else:
                 command = ["cargo", "test", "--offline", "--no-default-features", "--features", "std",
-                           "--test", "v8_viability", "--no-run", "--message-format=json-render-diagnostics"]
+                           "--test", test_target, "--no-run", "--message-format=json-render-diagnostics"]
                 command += ["--release"] if profile == "release" else []
             print(f"BUILD {target} {profile}", flush=True)
             build = run_process(command, args.build_timeout)
@@ -131,12 +136,12 @@ def main(argv=None):
                     except json.JSONDecodeError:
                         continue
                     if (event.get("reason") == "compiler-artifact"
-                            and event.get("target", {}).get("name") == "v8_viability"
+                            and event.get("target", {}).get("name") == test_target
                             and event.get("profile", {}).get("test")
                             and event.get("executable")):
                         binaries.add(event["executable"])
                 if len(binaries) != 1:
-                    report.update(status="build_failed", reason="Expected one v8_viability test executable")
+                    report.update(status="build_failed", reason=f"Expected one {test_target} test executable")
                     break
                 binary = Path(binaries.pop())
             discovery = run_process([str(binary), "--list", "--format", "terse"], args.timeout)
@@ -158,7 +163,7 @@ def main(argv=None):
                         print(result["stdout"] + result["stderr"], flush=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2) + "\n")
-    label = "REFERENCE CONTROL ONLY" if args.reference else "V8 CORRECTNESS MILESTONE"
+    label = "REFERENCE CONTROL ONLY" if args.reference else f"{target.upper()} CORRECTNESS MILESTONE"
     print(f"{label}: {report['status']}; report: {path}")
     return 0 if report["status"] == "passed" else 1
 

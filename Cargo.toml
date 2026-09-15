@@ -22,7 +22,7 @@ cc = "1"
 [dependencies]
 concurrent-queue = { version = "2", optional = true }
 core_affinity = { version = "0.8", optional = true }
-crossbeam-epoch = { version = "0.9", optional = true }
+crossbeam-epoch = { version = "0.9", default-features = false, features = ["alloc"] }
 crossbeam-queue = { version = "0.3.13", git = "https://github.com/Orkking2/crossbeam", branch = "batch", optional = true }
 crossbeam-utils = { version = "0.8.21", default-features = false }
 lfqueue = { version = "0.8.1", optional = true }
@@ -45,14 +45,13 @@ lfqueue = { git = "https://github.com/khyperia/lfqueue", branch = "allocscqring-
 
 [features]
 default = ["std","bench_tools"]
-std = ["crossbeam-utils/std"]
+std = ["crossbeam-utils/std", "crossbeam-epoch/std"]
 jni = ["std"]
 bench_tools = [
     "std",
     "dep:clap",
     "dep:concurrent-queue",
     "dep:core_affinity",
-    "dep:crossbeam-epoch",
     "dep:crossbeam-queue",
     "dep:portable-atomic",
     "dep:serde",
@@ -65,15 +64,10 @@ bench_lfqueue = ["bench_tools", "dep:lfqueue"]
 bench_wcq = ["bench_tools", "dep:wcq"]
 # Compiles third_party/moodycamel/shim.cpp via cc; requires a C++ compiler.
 bench_moodycamel = ["bench_tools"]
-# Compile the full static UBQ variant registry.
-# Required for bench_grid and bench_matrix to run in-process.
+# Compile the static UBQ variant registry into the benchmark harness.
 bench_registry = ["bench_tools"]
-# Build the intrusive counting allocator into bench_profile. The normal
-# profiling binary deliberately omits it so queue performance/APX attribution
-# is not perturbed by shared counter updates.
-profile_allocator_probe = ["bench_tools"]
-# Experimental control for the hardware campaign; changes completion RMW
-# frequency only. Never enable for the bulk-completion measurement binary.
+# Experimental control: one completion RMW per item instead of one per block
+# segment. A lab arm enables it through its `features` to A/B the two.
 probe_item_completion = []
 # Counts how often `pop_batch`'s post-reservation repair paths fire. Those
 # branches are only reachable when the producer head appears to move backwards
@@ -84,21 +78,6 @@ probe_batch_repair = []
 [[bin]]
 name = "bench_hardware"
 path = "src/bin/bench_hardware.rs"
-required-features = ["bench_tools"]
-
-[[bin]]
-name = "bench_grid"
-path = "src/bin/bench_grid.rs"
-required-features = ["bench_registry"]
-
-[[bin]]
-name = "bench_profile"
-path = "src/bin/bench_profile.rs"
-required-features = ["bench_registry"]
-
-[[bin]]
-name = "bench_matrix"
-path = "src/bin/bench_matrix.rs"
 required-features = ["bench_tools"]
 
 [[bin]]
