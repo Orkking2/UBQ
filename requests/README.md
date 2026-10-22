@@ -62,5 +62,5 @@ Put the archives in a zip and send it to Nicolas over Zulip, with the status rep
 ## The requests, in order
 
 1. `01-recover-september-runs.md`: no jobs; checks whether Nicolas's old scratch is readable and packages four runs that were never collected. It can run now.
-2. `02-paper-matrix.md`: the benchmark proper, one run per queue, with the bundle and the budget. It lands in a later commit on this branch together with the bundle, as a release asset; until then the answers to `01` decide how it is written.
+2. `02-paper-matrix.md`: the benchmark proper, one run per queue, with the launch commands and the budget; its bundle is the release asset `bsc-requests-2026-10-21` of this repository. The answers to `01` say whether the old scratch can be reused, but the bundle carries everything regardless.
 3. `03-perf-and-performix.md`: the profiling data Guillem asked for: what the runs already capture, how to send it, and how to ask for more cells. It applies once `02` runs.
