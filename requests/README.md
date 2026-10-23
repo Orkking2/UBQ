@@ -2,6 +2,17 @@
 
 These files ask an agent with a shell on BSC's login nodes to run a benchmark lab on Grace and MareNostrum 5 and send the results back. They were written by Nicolas (the author of UBQ) for Guillem, who runs them under his own account; the agent that runs them is a Claude Code session, so each request is written for it: read the whole file, run what it says, paste back what it asks for, and stop when something fails rather than improvising.
 
+## Changes
+
+**2026-10-23: the bundle of 2026-10-21 is replaced by the release `bsc-requests-2026-10-23`, and `02-paper-matrix.md` now names its runs.** The runner in the old bundle built each queue from its main thread, which was not pinned, so on a two-socket node the queue's memory was sometimes placed on the socket away from the worker threads. On a 2 × 80-core Neoverse-N1 machine this happened in about one trial in four, and those trials ran up to thirty times slower; every queue was exposed to it. The new runner holds the main thread on the first worker's core while the queue is built, then releases it before anything is measured. Nothing else changed: the frozen source `3f212ad9a8…` differs from the old `444e2a79ec…` only in `src/bench_harness/hardware.rs`, and the matrix, the specs and the cluster settings are the same. RBBQ is left out of the new bundle (see `02-paper-matrix.md`).
+
+- If nothing from the old bundle was launched, follow `02-paper-matrix.md` as it now stands.
+- If runs from the old bundle were launched, do not send their results; if some were already sent, say which. Extract the new bundle into the same `$ROOT`: it adds a new source and new run directories beside the old ones. Then launch the new runs as `02-paper-matrix.md` says. Deploying a new run of a queue cancels that queue's older run on the same cluster automatically, and its state becomes `superseded`. Only `rbbq-982b56fc` has no successor; if it was launched, cancel it on each cluster where it runs:
+
+  ```sh
+  python3 $ROOT/runs/rbbq-982b56fc/tool/ab.py remote cancel $ROOT/runs/rbbq-982b56fc/<cluster>
+  ```
+
 ## What is being measured
 
 UBQ is an unbounded multi-producer, multi-consumer FIFO queue (this repository). The requests measure it, in several configurations, against other strict FIFO queues on two machines, for a paper. One run measures one queue over a fixed matrix: 23 producer/consumer shapes, several batch sizes, four item sizes, three replicates, each cell on an exclusive node; then a second stage profiles representative cells with `perf` and, on Grace, Arm Performix. The lab's own documentation is `lab/README.md` in this repository.
@@ -62,5 +73,5 @@ Put the archives in a zip and send it to Nicolas over Zulip, with the status rep
 ## The requests, in order
 
 1. `01-recover-september-runs.md`: no jobs; checks whether Nicolas's old scratch is readable and packages four runs that were never collected. It can run now.
-2. `02-paper-matrix.md`: the benchmark proper, one run per queue, with the launch commands and the budget; its bundle is the release asset `bsc-requests-2026-10-21` of this repository. The answers to `01` say whether the old scratch can be reused, but the bundle carries everything regardless.
+2. `02-paper-matrix.md`: the benchmark proper, one run per queue, with the launch commands and the budget; its bundle is the release asset `bsc-requests-2026-10-23` of this repository (the earlier `bsc-requests-2026-10-21` is superseded; see "Changes"). The answers to `01` say whether the old scratch can be reused, but the bundle carries everything regardless.
 3. `03-perf-and-performix.md`: the profiling data Guillem asked for: what the runs already capture, how to send it, and how to ask for more cells. It applies once `02` runs.
