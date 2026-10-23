@@ -4,14 +4,18 @@ These files ask an agent with a shell on BSC's login nodes to run a benchmark la
 
 ## Changes
 
-**2026-10-23: the bundle of 2026-10-21 is replaced by the release `bsc-requests-2026-10-23`, and `02-paper-matrix.md` now names its runs.** The runner in the old bundle built each queue from its main thread, which was not pinned, so on a two-socket node the queue's memory was sometimes placed on the socket away from the worker threads. On a 2 × 80-core Neoverse-N1 machine this happened in about one trial in four, and those trials ran up to thirty times slower; every queue was exposed to it. The new runner holds the main thread on the first worker's core while the queue is built, then releases it before anything is measured. Nothing else changed: the frozen source `3f212ad9a8…` differs from the old `444e2a79ec…` only in `src/bench_harness/hardware.rs`, and the matrix, the specs and the cluster settings are the same. RBBQ is left out of the new bundle (see `02-paper-matrix.md`).
+**2026-10-23: the bundle of 2026-10-21 is replaced by the release `bsc-requests-2026-10-23`, and `02-paper-matrix.md` now names its runs.** The runner in the old bundle built each queue from its main thread, which was not pinned, so on a two-socket node the queue's memory was sometimes placed on the socket away from the worker threads. On a 2 × 80-core Neoverse-N1 machine this happened in about one trial in four, and those trials ran up to thirty times slower; every queue was exposed to it.
 
-- If nothing from the old bundle was launched, follow `02-paper-matrix.md` as it now stands.
-- If runs from the old bundle were launched, do not send their results; if some were already sent, say which. Extract the new bundle into the same `$ROOT`: it adds a new source and new run directories beside the old ones. Then launch the new runs as `02-paper-matrix.md` says. Deploying a new run of a queue cancels that queue's older run on the same cluster automatically, and its state becomes `superseded`. Only `rbbq-982b56fc` has no successor; if it was launched, cancel it on each cluster where it runs:
+The new runner builds the queue and coordinates the measurement from a fresh thread, which gets a memory arena of its own. It holds that thread on the first worker's core while the queue is built, then releases it before anything is measured.
 
-  ```sh
-  python3 $ROOT/runs/rbbq-982b56fc/tool/ab.py remote cancel $ROOT/runs/rbbq-982b56fc/<cluster>
-  ```
+RBBQ now runs with a fix to its consumer path: under heavy consumer contention it had delivered some items twice. Its vendored `rbbq` 0.1.0 carries the patch, so the vendor tree has a new hash.
+
+Nothing else changed. The frozen source `30fffae70c…` differs from the old `444e2a79ec…` only in `src/bench_harness/hardware.rs`, the vendor tree only in `rbbq`, and the matrix, the specs and the cluster settings are the same.
+
+The release's asset was replaced once on 2026-10-23. An earlier asset of the same name (sha256 `07a00950…1e16`, nine runs, without RBBQ) carried a weaker form of the runner fix, published under a `3f212ad9a8…` source. If you downloaded that one, download the bundle again and check its sha256 against `02-paper-matrix.md`.
+
+- If nothing from an older bundle was launched, follow `02-paper-matrix.md` as it now stands.
+- If runs from an older bundle were launched, do not send their results; if some were already sent, say which. Extract the new bundle into the same `$ROOT`: it adds a new source, a new vendor tree and new run directories beside the old ones. Then launch the new runs as `02-paper-matrix.md` says. Deploying a new run of a queue cancels that queue's older run on the same cluster automatically, and its state becomes `superseded`; no manual cancellation is needed.
 
 ## What is being measured
 
