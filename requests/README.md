@@ -1,25 +1,14 @@
 # Benchmark requests for BSC
 
-These files ask an agent with a shell on BSC's login nodes to run a benchmark lab on Grace and MareNostrum 5 and send the results back. They were written by Nicolas (the author of UBQ) for Guillem, who runs them under his own account; the agent that runs them is a Claude Code session, so each request is written for it: read the whole file, run what it says, paste back what it asks for, and stop when something fails rather than improvising.
+These files ask an agent with a shell on BSC's login nodes to run a benchmark lab on Grace and MareNostrum 5, and to send the results back. Nicolas, the author of UBQ, wrote them for Guillem, who runs them under his own account. The agent that runs them is a Claude Code session, so each request is written for it: read the whole file, run what it says, and stop when something fails rather than improvising.
 
-## Changes
-
-**2026-10-23: the bundle of 2026-10-21 is replaced by the release `bsc-requests-2026-10-23`, and `02-paper-matrix.md` now names its runs.** The runner in the old bundle built each queue from its main thread, which was not pinned, so on a two-socket node the queue's memory was sometimes placed on the socket away from the worker threads. On a 2 × 80-core Neoverse-N1 machine this happened in about one trial in four, and those trials ran up to thirty times slower; every queue was exposed to it.
-
-The new runner builds the queue and coordinates the measurement from a fresh thread, which gets a memory arena of its own. It holds that thread on the first worker's core while the queue is built, then releases it before anything is measured.
-
-RBBQ now runs with a fix to its consumer path: under heavy consumer contention it had delivered some items twice. Its vendored `rbbq` 0.1.0 carries the patch, so the vendor tree has a new hash.
-
-Nothing else changed. The frozen source `30fffae70c…` differs from the old `444e2a79ec…` only in `src/bench_harness/hardware.rs`, the vendor tree only in `rbbq`, and the matrix, the specs and the cluster settings are the same.
-
-The release's asset was replaced once on 2026-10-23. An earlier asset of the same name (sha256 `07a00950…1e16`, nine runs, without RBBQ) carried a weaker form of the runner fix, published under a `3f212ad9a8…` source. If you downloaded that one, download the bundle again and check its sha256 against `02-paper-matrix.md`.
-
-- If nothing from an older bundle was launched, follow `02-paper-matrix.md` as it now stands.
-- If runs from an older bundle were launched, do not send their results; if some were already sent, say which. Extract the new bundle into the same `$ROOT`: it adds a new source, a new vendor tree and new run directories beside the old ones. Then launch the new runs as `02-paper-matrix.md` says. Deploying a new run of a queue cancels that queue's older run on the same cluster automatically, and its state becomes `superseded`; no manual cancellation is needed.
+**This directory holds one request: `2026-10-30-full-benchmark.md`.** Every earlier request and bundle is withdrawn, finished or not. Launch nothing from them and send none of their results; step 0 of the request deals with whatever of them is still running.
 
 ## What is being measured
 
-UBQ is an unbounded multi-producer, multi-consumer FIFO queue (this repository). The requests measure it, in several configurations, against other strict FIFO queues on two machines, for a paper. One run measures one queue over a fixed matrix: 23 producer/consumer shapes, several batch sizes, four item sizes, three replicates, each cell on an exclusive node; then a second stage profiles representative cells with `perf` and, on Grace, Arm Performix. The lab's own documentation is `lab/README.md` in this repository.
+UBQ is an unbounded multi-producer, multi-consumer FIFO queue (this repository). The request measures it, in several configurations, against other strict FIFO queues on two machines, for a paper.
+
+One run measures one queue over a fixed matrix: 23 producer/consumer shapes, several batch sizes and four item sizes, three replicates each, every cell on an exclusive node. Every cell also checks that each item is delivered exactly once. A memory section records what each queue holds at seven element sizes. A second stage then profiles chosen cells with `perf` and, on Grace, Arm Performix. The lab's own documentation is `lab/README.md` in this repository.
 
 ## The lab on the cluster side
 
@@ -42,17 +31,32 @@ python3 $ROOT/runs/<id>/tool/ab.py remote deploy $ROOT/runs/<id> grace   # on gr
 python3 $ROOT/runs/<id>/tool/ab.py remote deploy $ROOT/runs/<id> mn5     # on glogin1.bsc.es
 ```
 
-It writes `$ROOT/runs/<id>/<cluster>/` (`plan.json`, `state.json`, `logs/`, later `tasks/`), submits the build job with `sbatch`, and prints one JSON line of status. After that the run advances itself: every job that ends submits what comes next, and a one-core watchdog job follows each array. To see where a run stands at any time, or to push it along after a quota refusal:
+It writes `$ROOT/runs/<id>/<cluster>/` (`plan.json`, `state.json`, `logs/`, later `tasks/`), submits the build job with `sbatch`, and prints one JSON line of status. After that the run advances itself: every job that ends submits what comes next, and a one-core watchdog job follows each array. Deploying a run cancels any older, unfinished run of the same queue on that cluster.
+
+To see where a run stands, or to push it along after a quota refusal:
 
 ```sh
 python3 $ROOT/runs/<id>/tool/ab.py remote advance $ROOT/runs/<id>/<cluster>
 ```
 
-The reply names the phase (`building`, `stage1`, `stage2`, `done`, or an error), counts the tasks by status, lists failures, and repeats the latest notes. `remote cancel` with the same argument cancels a run's jobs.
+The reply names the phase, counts the tasks by status, lists failures, and repeats the latest notes. The phase is one of:
+- `building`;
+- `measuring` (stage 1);
+- `deep` (stage 2, the profiling);
+- `done`;
+- `failed`, `superseded` or `cancelled`.
 
-The jobs are submitted with the account, partition, QOS and node constraint written in `run.json` under `config.clusters.<cluster>`: account `bsc18`, partitions `ngpp` (Grace) and `gpp` (MareNostrum 5), QOS `ngp_bsccs` and `gp_bsccs` for measurements, `ngp_debug` and `gp_debug` for the build, and the node constraint `perfparanoid`, which gives nodes where `perf` runs unprivileged. If `sacctmgr show assoc user=$USER format=account,partition,qos -P` shows other values for your account, change those fields in `run.json` before launching; nothing else in `run.json` should change.
+Two more commands take the same argument:
+- `remote cancel` cancels a run's jobs.
+- `remote retry` gives every failed task of the run one more attempt. Each task already has one automatic retry; `remote retry` is the only other one.
 
-A measurement task takes an exclusive node for a few minutes; the whole matrix of one run is hundreds of allocations, listed with their node-hour estimates in each request. Confirm the budget with Guillem before launching the expensive runs; the cheap ones can go first.
+The jobs are submitted with the account, partition, QOS and node constraint written in `run.json` under `config.clusters.<cluster>`:
+- account `bsc18`;
+- partitions `ngpp` (Grace) and `gpp` (MareNostrum 5);
+- QOS `ngp_bsccs` and `gp_bsccs` for measurements, `ngp_debug` and `gp_debug` for the build;
+- the node constraint `perfparanoid`, which gives nodes where `perf` runs unprivileged.
+
+If `sacctmgr show assoc user=$USER format=account,partition,qos -P` shows other values for your account, change those fields in each `run.json` before launching; nothing else in `run.json` should change. MareNostrum 5's task time limits are three times Grace's (`time_factor` in its cluster settings), because its processes started up to a minute late in October.
 
 ## What comes back
 
@@ -64,18 +68,13 @@ tar czf ~/<id>-<cluster>.tar.gz --exclude='perf.data*' --exclude=lock --exclude=
 sha256sum ~/<id>-<cluster>.tar.gz
 ```
 
-Put the archives in a zip and send it to Nicolas over Zulip, with the status replies and the checksums pasted into the message. The results are JSON and logs; tens of megabytes per run. Back on Nicolas's machine the archives drop into the lab and produce the reports and figures.
+The archives go in one zip, sent to Nicolas through Guillem over Zulip, with the status replies and the checksums in the message. The results are JSON and logs, tens of megabytes per run. Back on Nicolas's machine the archives drop into the lab and produce the reports and figures.
 
 ## Rules for the agent
 
-- Run the commands as written, in order. Do not change `tool/`, `sources/`, `vendor/` or `run.json` except the account and QOS fields named above.
-- Do not delete, move or change anything under `/gpfs/scratch/bsc18/bsc614227/` or `/gpfs/projects/bsc18/bsc614227/`, Nicolas's former directories: read them if they are readable, copy what a request asks for.
-- If a command fails, paste its output and stop that request; the others may go on.
+- **Reply once per request, when the request is complete**, as the request defines it. Send no progress messages and no partial results.
+- Run the commands as written, in order. Do not change `tool/`, `sources/`, `vendor/` or `run.json`, except the account and QOS fields named above.
+- Do not delete, move or change anything under `/gpfs/scratch/bsc18/bsc614227/` or `/gpfs/projects/bsc18/bsc614227/`, Nicolas's former directories.
+- If a command of the request itself fails, stop there and report it in the one reply. A queue that crashes, hangs or miscounts inside a measurement is a result the lab records, not a failure of the request.
 - Builds happen inside a Slurm job (the job script loads the `gcc` and `rust` modules); nothing is compiled on a login node.
-- Scratch may be purged: send the archives as soon as a run is done.
-
-## The requests, in order
-
-1. `01-recover-september-runs.md`: no jobs; checks whether Nicolas's old scratch is readable and packages four runs that were never collected. It can run now.
-2. `02-paper-matrix.md`: the benchmark proper, one run per queue, with the launch commands and the budget; its bundle is the release asset `bsc-requests-2026-10-23` of this repository (the earlier `bsc-requests-2026-10-21` is superseded; see "Changes"). The answers to `01` say whether the old scratch can be reused, but the bundle carries everything regardless.
-3. `03-perf-and-performix.md`: the profiling data Guillem asked for: what the runs already capture, how to send it, and how to ask for more cells. It applies once `02` runs.
+- Scratch may be purged, so copy each archive to `$HOME` as soon as its run is done, and send them all together at the end.
