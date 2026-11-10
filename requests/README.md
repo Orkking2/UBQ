@@ -2,7 +2,7 @@
 
 These files ask an agent with a shell on BSC's login nodes to run a benchmark lab on Grace and MareNostrum 5, and to send the results back. Nicolas, the author of UBQ, wrote them for Guillem, who runs them under his own account. The agent that runs them is a Claude Code session, so each request is written for it: read the whole file, run what it says, and stop when something fails rather than improvising.
 
-**This directory holds one request: `2026-10-30-full-benchmark.md`.** Every earlier request and bundle is withdrawn, finished or not. Launch nothing from them and send none of their results; step 0 of the request deals with whatever of them is still running.
+**This directory holds one request: `2026-11-10-step-overhead.md`.** It is a short diagnosis on debug nodes, and it ends the request of 2026-10-30: its step 2 archives everything that request's runs have finished, then cancels the rest. Launch nothing from earlier requests. The description of the lab below is the earlier request's; this request uses its directory, `$ROOT` on `/gpfs/projects`, and changes nothing in it.
 
 ## What is being measured
 
