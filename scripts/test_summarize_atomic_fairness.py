@@ -76,6 +76,7 @@ class AtomicFairnessSummaryTests(unittest.TestCase):
         self.assertEqual(zero_backoff["same_updater_fraction"], 1.00)
         self.assertEqual(zero_backoff["max_updater_share"], 0.72)
         self.assertEqual(zero_backoff["fair_share"], 0.5)
+        self.assertEqual(zero_backoff["counter_addresses"], 0)
         self.assertAlmostEqual(zero_backoff["cas_failures_per_update"], 0.01)
 
         paced_backoff = by_key[(32, "cas_backoff")]
@@ -101,6 +102,13 @@ class AtomicFairnessSummaryTests(unittest.TestCase):
             [s["layout"] for s in summarize(rows, layout="mixed_u128_u64")],
             ["mixed_u128_u64"],
         )
+
+    def test_distinct_counter_addresses_are_counted(self):
+        results = [result("faa", 0, 2, repeat, 90.0, 0.6, 0.5) for repeat in (1, 2, 3)]
+        for sample, address in zip(results, ("0x1000", "0x2000", "0x1000")):
+            sample["counter_address_hex"] = address
+        summaries = summarize(self.load(payload(results)))
+        self.assertEqual(summaries[0]["counter_addresses"], 2)
 
     def test_older_schemas_are_ignored(self):
         self.assertEqual(

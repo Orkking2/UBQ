@@ -42,6 +42,7 @@ CSV_FIELDS = (
     "cas_failures_per_update",
     "max_updater_share",
     "fair_share",
+    "counter_addresses",
 )
 
 
@@ -79,6 +80,7 @@ def load_rows(path):
                 "cas_failures_per_update": int(result.get("cas_failures", 0))
                 / operations,
                 "max_updater_share": float(result["max_updater_share"]),
+                "counter_address": result.get("counter_address_hex"),
             }
         )
     return rows
@@ -133,6 +135,12 @@ def summarize(rows, layout="u64", block_size=None):
                     s["max_updater_share"] for s in samples
                 ),
                 "fair_share": 1.0 / updaters,
+                # Distinct counter allocations behind this row; a wide
+                # min/max spread with more than one address may be a
+                # placement effect rather than run-to-run noise.
+                "counter_addresses": len(
+                    {s["counter_address"] for s in samples if s["counter_address"]}
+                ),
             }
         )
 

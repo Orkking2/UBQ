@@ -7,8 +7,8 @@ All notable changes to UBQ are documented in this file.
 ### Added
 
 - `bench_atomic_updates` accepts `--think-iters` (thread-local work after each
-  update) and `--update-chunk`, and records `same_updater_fraction` and the
-  per-updater share of updates. Results use schema v4; the default sweep is
+  update) and `--update-chunk`, and records `same_updater_fraction`, the
+  per-updater share of updates and each sample's counter address. Results use schema v4; the default sweep is
   unchanged. `scripts/summarize_atomic_fairness.py` tabulates throughput, the
   ratio to FAA and fairness per think level. See
   `docs/atomic_update_fairness.md`.

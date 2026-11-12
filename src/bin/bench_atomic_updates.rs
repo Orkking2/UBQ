@@ -488,6 +488,9 @@ struct Sample {
     final_full_value_hex: Option<String>,
     assigned_core_ids: Vec<usize>,
     pinned_threads: usize,
+    /// Virtual address of the sample's counter allocation. Throughput modes
+    /// that follow the allocation rather than the method show up here.
+    counter_address_hex: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -987,6 +990,7 @@ fn run_trial(
     core_ids: &[core_affinity::CoreId],
 ) -> Result<Sample, String> {
     let counter = Arc::new(CachePadded::new(Counter::new(case.layout, block)));
+    let counter_address = Arc::as_ptr(&counter) as usize;
     let stop = Arc::new(CachePadded::new(AtomicBool::new(false)));
     let ready = Arc::new(Barrier::new(updater_count + 1));
     let start_gate = Arc::new(Barrier::new(updater_count + 1));
@@ -1187,6 +1191,7 @@ fn run_trial(
             .map(|core| core.id)
             .collect(),
         pinned_threads: outcomes.iter().filter(|outcome| outcome.pinned).count(),
+        counter_address_hex: format!("{counter_address:#x}"),
     })
 }
 
@@ -1779,5 +1784,10 @@ mod tests {
         assert_eq!(sample.same_updater_updates, sample.operations - 1);
         assert_eq!(sample.min_updater_share, 1.0);
         assert_eq!(sample.max_updater_share, 1.0);
+        let address =
+            usize::from_str_radix(sample.counter_address_hex.trim_start_matches("0x"), 16)
+                .expect("hex counter address");
+        assert_ne!(address, 0);
+        assert_eq!(address % std::mem::align_of::<CachePadded<Counter>>(), 0);
     }
 }
