@@ -452,7 +452,10 @@ updates that directly followed the same updater's previous write, and the
 smallest and largest share of updates taken by one updater. Summarize a run
 with `python3 scripts/summarize_atomic_fairness.py <run.json>`. These fields
 separate an update method being cheaper from one core retaining the counter's
-cache line in the zero-work loop; see
+cache line in the zero-work loop. On a multi-socket machine run it under
+`numactl --membind=<node>`: the counter is first touched by the unpinned main
+thread, and on hebrides its NUMA node changes FAA throughput by about 10x and
+decides which method wins. See
 [`docs/atomic_update_fairness.md`](docs/atomic_update_fairness.md).
 
 The mixed-width layout is a hardware experiment, not a Rust-memory-model-safe
