@@ -14,7 +14,8 @@ nobind: two cells, both where the counter's address changed between repeats:
   think=0 upd=32 CAS+backoff: 7.09 at ...38d00, 1.40 at ...59300, 1.39 at ...57080
 nobind counter addresses (samples): 0xb6de32a38d00 (122), 0xb6de32a5dc80 (24), 0xb6de32a57080 (12),
   0xb6de32a59300 (4), 0xb6de32a5d280 (4), 0xb6de32a5d780 (2). FAA at 16+ updaters was slow at ...38d00
-  and fast at ...59300, ...57080, ...5d280, ...5dc80. The node of each page in this run was not captured.
+  and fast at ...59300, ...57080, ...5d280, ...5dc80. Per-page nodes were not captured; numa_maps snapshots
+  show the heap holding all of these addresses on both nodes (N1=12 early, then N0=5 N1=23, whole mapping).
 
 hebrides-mem0 | ordering ubq | block 4095
  think     ~ns  upd |         faa         cas cas_backoff    segqueue Mops/s |         cas/faa cas_backoff/faa    segqueue/faa | same-updater fraction (max share / fair share)

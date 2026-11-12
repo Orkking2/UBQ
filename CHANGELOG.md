@@ -14,6 +14,13 @@ All notable changes to UBQ are documented in this file.
   FAA and fairness per think level. On multi-socket machines bind memory with
   `numactl`: which method wins depends on the counter's NUMA node. See
   `docs/atomic_update_fairness.md`.
+- `bench_atomic_updates --counter-node unplaced|local|<node>,...` places each
+  trial's counter in a page of its own bound to a NUMA node with `mbind`, and
+  sweeps placements like think levels. Every sample records the counter's node
+  before and after the measurement, whether it moved, the updaters' nodes and
+  a local/remote/mixed label (schema v5; the default sweep stays unplaced).
+  The summary script keeps counter nodes apart and flags mixed placement, and
+  the plot script selects one node with `--counter-node`.
 
 ### Changed
 

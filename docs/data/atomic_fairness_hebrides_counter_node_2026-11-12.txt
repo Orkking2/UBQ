@@ -1,0 +1,52 @@
+bench_atomic_updates at ff773d0, hebrides (2 x 80 Neoverse-N1, no SMT, Linux 6.8.0-147), 2026-11-12.
+Default RUSTFLAGS. Output of scripts/summarize_atomic_fairness.py (medians of 3 repeats), u64 layout.
+Flags: --block-sizes 4095 --think-iters 0,32 --update-chunk 64 --repeats 3 --max-updaters 64 --counter-node 0,1
+No numactl: placement comes from the benchmark's own mbind binding.
+Updaters are pinned to CPUs 0-63, all on NUMA node 0 (node 0 = CPUs 0-79, node 1 = CPUs 80-159).
+/proc/sys/kernel/numa_balancing = 1. 1-minute load 5.32 at the start of the sweep; no other heavy process.
+
+Recorded per sample (all 588 samples, both layouts):
+  counter_placement node0: counter_node 0 before and after, updater_nodes [0], counter_relation local (294 samples)
+  counter_placement node1: counter_node 1 before and after, updater_nodes [0], counter_relation remote (294 samples)
+  counter_node_moved: false in every sample.
+Repeats differing by more than 2x: none (0 of 112 u64 cells; largest max/min spread 1.38).
+
+Cross-checks (think 0, 1 and 2 updaters, 1 repeat):
+  numactl --membind=1 with the default --counter-node unplaced: every sample recorded counter_node 1, remote.
+  --counter-node local: resolved to node 0 (CPU 0's node); every sample recorded counter_node 0, local.
+
+hebrides-numa | ordering ubq | block 4095 | counter node 0 (local)
+ think     ~ns  upd |         faa         cas cas_backoff    segqueue Mops/s |         cas/faa cas_backoff/faa    segqueue/faa | same-updater fraction (max share / fair share)
+     0       0    1 |      114.77      112.56      112.50       94.85        |            0.98            0.98            0.83 | faa=1.00(1.00/1.00)  cas=1.00(1.00/1.00)  cas_backoff=1.00(1.00/1.00)  segqueue=1.00(1.00/1.00)
+     0       0    2 |       35.31       23.19      104.41       85.13        |            0.66            2.96            2.41 | faa=0.66(0.50/0.50)  cas=0.60(0.50/0.50)  cas_backoff=1.00(0.55/0.50)  segqueue=1.00(0.63/0.50)
+     0       0    4 |       17.59       12.21       78.70       65.29        |            0.69            4.47            3.71 | faa=0.34(0.25/0.25)  cas=0.03(0.25/0.25)  cas_backoff=1.00(0.51/0.25)  segqueue=1.00(0.49/0.25)
+     0       0    8 |       13.05       10.05       48.31       34.64        |            0.77            3.70            2.65 | faa=0.14(0.13/0.12)  cas=0.02(0.13/0.12)  cas_backoff=1.00(0.26/0.12)  segqueue=1.00(0.25/0.12)
+     0       0   16 |       13.18       10.47       14.22       10.69        |            0.79            1.08            0.81 | faa=0.13(0.06/0.06)  cas=0.01(0.06/0.06)  cas_backoff=1.00(0.22/0.06)  segqueue=1.00(0.27/0.06)
+     0       0   32 |       12.37        9.74        1.45        1.76        |            0.79            0.12            0.14 | faa=0.15(0.03/0.03)  cas=0.02(0.03/0.03)  cas_backoff=0.90(0.06/0.03)  segqueue=0.79(0.07/0.03)
+     0       0   64 |       12.72        5.47        0.59        0.55        |            0.43            0.05            0.04 | faa=0.13(0.02/0.02)  cas=0.07(0.02/0.02)  cas_backoff=0.24(0.03/0.02)  segqueue=0.20(0.03/0.02)
+    32      63    1 |       13.74       13.81       13.85       13.82        |            1.01            1.01            1.01 | faa=1.00(1.00/1.00)  cas=1.00(1.00/1.00)  cas_backoff=1.00(1.00/1.00)  segqueue=1.00(1.00/1.00)
+    32      63    2 |       17.63       17.40       13.10       12.73        |            0.99            0.74            0.72 | faa=0.01(0.50/0.50)  cas=0.00(0.50/0.50)  cas_backoff=0.98(0.61/0.50)  segqueue=0.89(0.60/0.50)
+    32      63    4 |       10.56       10.49       10.73       10.87        |            0.99            1.02            1.03 | faa=0.17(0.25/0.25)  cas=0.00(0.25/0.25)  cas_backoff=0.94(0.40/0.25)  segqueue=0.91(0.57/0.25)
+    32      63    8 |       13.46       11.49        8.40        8.28        |            0.85            0.62            0.61 | faa=0.06(0.13/0.12)  cas=0.00(0.13/0.12)  cas_backoff=0.98(0.26/0.12)  segqueue=0.90(0.44/0.12)
+    32      63   16 |       14.99       10.60        3.95        3.55        |            0.71            0.26            0.24 | faa=0.03(0.06/0.06)  cas=0.00(0.07/0.06)  cas_backoff=0.39(0.18/0.06)  segqueue=0.14(0.22/0.06)
+    32      63   32 |       14.81       12.24        1.43        1.47        |            0.83            0.10            0.10 | faa=0.01(0.03/0.03)  cas=0.00(0.03/0.03)  cas_backoff=0.07(0.19/0.03)  segqueue=0.04(0.13/0.03)
+    32      63   64 |       15.32        8.50        0.47        0.47        |            0.56            0.03            0.03 | faa=0.00(0.02/0.02)  cas=0.00(0.02/0.02)  cas_backoff=0.03(0.03/0.02)  segqueue=0.03(0.04/0.02)
+
+hebrides-numa | ordering ubq | block 4095 | counter node 1 (remote)
+ think     ~ns  upd |         faa         cas cas_backoff    segqueue Mops/s |         cas/faa cas_backoff/faa    segqueue/faa | same-updater fraction (max share / fair share)
+     0       0    1 |      114.83      112.67      112.56       94.88        |            0.98            0.98            0.83 | faa=1.00(1.00/1.00)  cas=1.00(1.00/1.00)  cas_backoff=1.00(1.00/1.00)  segqueue=1.00(1.00/1.00)
+     0       0    2 |        3.16        1.61       10.63       30.59        |            0.51            3.36            9.67 | faa=0.43(0.53/0.50)  cas=0.60(0.56/0.50)  cas_backoff=1.00(0.64/0.50)  segqueue=1.00(0.66/0.50)
+     0       0    4 |        2.74        1.72        6.31       10.57        |            0.63            2.31            3.86 | faa=0.25(0.25/0.25)  cas=0.08(0.26/0.25)  cas_backoff=0.97(0.27/0.25)  segqueue=0.97(0.26/0.25)
+     0       0    8 |        2.56        1.08       12.03       11.15        |            0.42            4.69            4.35 | faa=0.24(0.13/0.12)  cas=0.18(0.13/0.12)  cas_backoff=0.97(0.14/0.12)  segqueue=0.97(0.13/0.12)
+     0       0   16 |        2.48        0.92       11.80       11.48        |            0.37            4.76            4.63 | faa=0.23(0.07/0.06)  cas=0.15(0.07/0.06)  cas_backoff=0.97(0.08/0.06)  segqueue=0.97(0.07/0.06)
+     0       0   32 |        2.40        0.86        7.10        8.12        |            0.36            2.96            3.38 | faa=0.23(0.03/0.03)  cas=0.10(0.03/0.03)  cas_backoff=0.97(0.05/0.03)  segqueue=0.97(0.04/0.03)
+     0       0   64 |        2.34        0.84        3.78        4.27        |            0.36            1.61            1.82 | faa=0.21(0.02/0.02)  cas=0.11(0.02/0.02)  cas_backoff=0.97(0.03/0.02)  segqueue=0.97(0.03/0.02)
+    32      63    1 |       13.72       13.82       13.84       13.83        |            1.01            1.01            1.01 | faa=1.00(1.00/1.00)  cas=1.00(1.00/1.00)  cas_backoff=1.00(1.00/1.00)  segqueue=1.00(1.00/1.00)
+    32      63    2 |        1.63        1.53        0.87        0.89        |            0.94            0.54            0.55 | faa=0.27(0.51/0.50)  cas=0.29(0.51/0.50)  cas_backoff=0.94(0.75/0.50)  segqueue=0.93(0.76/0.50)
+    32      63    4 |        1.47        1.44        3.11        3.14        |            0.97            2.11            2.13 | faa=0.01(0.25/0.25)  cas=0.01(0.25/0.25)  cas_backoff=0.85(0.35/0.25)  segqueue=0.85(0.31/0.25)
+    32      63    8 |        1.45        1.30        4.25        4.28        |            0.89            2.92            2.94 | faa=0.01(0.13/0.12)  cas=0.01(0.13/0.12)  cas_backoff=0.84(0.17/0.12)  segqueue=0.84(0.17/0.12)
+    32      63   16 |        1.44        1.28        4.76        4.90        |            0.89            3.31            3.40 | faa=0.00(0.06/0.06)  cas=0.01(0.06/0.06)  cas_backoff=0.83(0.11/0.06)  segqueue=0.83(0.12/0.06)
+    32      63   32 |        1.43        1.27        4.74        5.15        |            0.89            3.32            3.60 | faa=0.00(0.03/0.03)  cas=0.00(0.03/0.03)  cas_backoff=0.83(0.06/0.03)  segqueue=0.83(0.06/0.03)
+    32      63   64 |        1.43        1.26        3.30        5.14        |            0.88            2.31            3.60 | faa=0.00(0.02/0.02)  cas=0.00(0.02/0.02)  cas_backoff=0.83(0.03/0.02)  segqueue=0.83(0.03/0.02)
+
+Wrote CSV: /private/tmp/claude-501/-Users-neb-GitHub-RBBQ/7526eb3f-da88-4246-97dc-a8967185de63/scratchpad/numa_val/sweep.csv

@@ -16,9 +16,11 @@ say.
   to 8 updaters with no work between updates; everywhere else they are level
   with FAA or behind it, by up to 25x. With the counter on the other node, the backoff methods win at 4
   to 64 updaters by 2x to 5x, with or without work.
-- The benchmark does not control that placement. Unbound runs mix the two
-  cases, about 10x apart in FAA throughput. Any hebrides number taken without
-  binding memory is one or the other without saying which.
+- Placement is now part of the benchmark (schema v5): `--counter-node` binds
+  the counter's page to a node, and every sample records the node the kernel
+  reports for it, so the two cases, about 10x apart in FAA throughput, can no
+  longer mix silently. Older unbound hebrides numbers are one or the other
+  without saying which.
 
 ## Hypothesis
 
@@ -49,6 +51,25 @@ Schema v4 of `bench_atomic_updates` adds, without changing the default sweep:
 | `counter_address_hex` | Virtual address of the sample's counter allocation, so throughput levels can be checked against placement. |
 | `--update-chunk n` | Successful updates between checks of the stop flag (default 4096, unchanged). When one updater completes only thousands of updates per second, a 4096-update chunk outlasts the sample and the updaters stop at different times; use a small chunk for those sweeps. |
 
+Schema v5 makes the counter's NUMA placement part of the experiment:
+
+| Addition | Meaning |
+| --- | --- |
+| `--counter-node a,b` | Placements swept like think levels: `unplaced` (default, the historical behaviour: wherever the first write lands), `local` (the first updater's node), or a node number. A placement the platform cannot honour is an error, not a silent fallback; binding needs Linux. |
+| `counter_node`, `counter_node_after`, `counter_node_moved` | The node the kernel reports for the counter's page (`get_mempolicy` with `MPOL_F_NODE \| MPOL_F_ADDR`) before and after the measured interval, and whether it changed. Null where the OS does not report nodes. |
+| `updater_nodes`, `counter_relation` | The distinct nodes of the updaters' pinned CPUs, and the sample's label: `local` (counter on the updaters' one node), `remote`, `mixed` (updaters span nodes), or `unknown`. |
+| `meta.numa_nodes`, `meta.numa_balancing` | Each node's CPU list from `/sys/devices/system/node`, and the kernel's automatic NUMA balancing setting, which can migrate an unplaced page during a run. |
+
+Every trial's counter has an anonymous mapping of its own rather than a heap
+slot. For a placed counter the mapping is bound with `mbind(MPOL_BIND,
+MPOL_MF_MOVE | MPOL_MF_STRICT)` before its first write, so the kernel allocates
+the page on that node, nothing else shares the binding, and automatic
+balancing leaves it there. `scripts/summarize_atomic_fairness.py` keeps rows
+for different counter nodes apart and flags any configuration measured on more
+than one node or whose page moved during a sample;
+`scripts/plot_atomic_updates.py` requires `--counter-node` when its inputs
+span nodes.
+
 `same_updater_fraction` is computed from values each updater already holds:
 the word it observed when its update succeeded, compared with the word its own
 previous write left. It adds one register compare per update and no shared
@@ -56,31 +77,33 @@ memory access.
 
 ## Running it
 
-On a multi-socket machine, bind memory. The counter is allocated and first
-touched by the unpinned main thread, so without binding its node is arbitrary.
+On a multi-socket machine, choose the counter's node. Unplaced, its page
+lands wherever its first write happens to run, so its node is arbitrary.
 
 ```bash
 cargo build --release --features bench_tools --bin bench_atomic_updates
 
-# Updaters are pinned to CPUs in order; keep them on one node and choose the
-# counter's node explicitly. On hebrides node 0 is CPUs 0-79.
-for node in 0 1; do
-  numactl --membind=$node ./target/release/bench_atomic_updates \
-    --machine-label hebrides-mem$node \
-    --block-sizes 4095 \
-    --think-iters 0,32,128,512 \
-    --update-chunk 64 \
-    --max-updaters 64 \
-    --repeats 5
-done
+# Updaters are pinned to CPUs in order; keep them on one node and sweep the
+# counter's node. On hebrides node 0 is CPUs 0-79.
+./target/release/bench_atomic_updates \
+  --machine-label hebrides \
+  --block-sizes 4095 \
+  --think-iters 0,32,128,512 \
+  --update-chunk 64 \
+  --max-updaters 64 \
+  --counter-node 0,1 \
+  --repeats 5
 
 python3 scripts/summarize_atomic_fairness.py \
-  bench_results/runs/hebrides-mem0/atomic_updates/*.json \
-  --csv bench_results/atomic_fairness_hebrides_mem0.csv
+  bench_results/runs/hebrides/atomic_updates/*.json \
+  --csv bench_results/atomic_fairness_hebrides.csv
 ```
 
 With one block size this is 7 cases x 5 repeats x 4 think levels per updater
-count at 0.6 s each: about 10 minutes per node at seven updater counts.
+count and node at 0.6 s each: about 10 minutes per node at seven updater
+counts. `numactl --membind=<node>` with the default `--counter-node unplaced`
+remains a cross-check from outside: the recorded `counter_node` is the bound
+node.
 `scripts/plot_atomic_updates.py --think-iters N` renders the existing plots
 for one think level at a time. The summary CSV carries each row's minimum and
 maximum throughput and its number of distinct counter addresses.
@@ -95,6 +118,10 @@ NUMA balancing on. All tables are from this binary and are committed under
   memory bound to node 0, to node 1, and unbound; updaters on CPUs 0 to 63
   (node 0); think 0 and 63 ns; three repeats. These are the controlled runs
   and the ones the conclusions below rest on.
+- [`atomic_fairness_hebrides_counter_node_2026-11-12.txt`](data/atomic_fairness_hebrides_counter_node_2026-11-12.txt):
+  the same sweep with placement done by the benchmark itself
+  (`--counter-node 0,1`, no `numactl`), with the node recorded per sample.
+  It reproduces the bound runs to within a few percent.
 - [`atomic_fairness_hebrides_2026-11-12.txt`](data/atomic_fairness_hebrides_2026-11-12.txt):
   two earlier unbound runs with four think levels and up to 128 updaters, one
   with default flags and one with `-C target-cpu=native`. Where those two
@@ -108,13 +135,23 @@ NUMA balancing on. All tables are from this binary and are committed under
 | same as updaters (`--membind=0`) | 36.6 / 13.3 / 11.8 Mops/s | 19.0 / 15.0 / 13.9 Mops/s | 0 of 56 |
 | other node (`--membind=1`) | 3.1 / 2.5 / 2.3 Mops/s | 1.6 / 1.4 / 1.4 Mops/s | 0 of 56 |
 | unbound | either, by counter address | either, by counter address | 2 of 56 |
+| `--counter-node 0` (benchmark binds; recorded node 0, `local`) | 35.3 / 13.2 / 12.7 Mops/s | 17.6 / 15.0 / 15.3 Mops/s | 0 of 56 |
+| `--counter-node 1` (benchmark binds; recorded node 1, `remote`) | 3.2 / 2.5 / 2.3 Mops/s | 1.6 / 1.4 / 1.4 Mops/s | 0 of 56 |
+
+The benchmark's own binding reproduces the `numactl` runs, and every one of
+its 588 samples recorded its counter on the requested node both before and
+after the measurement. As cross-checks, an unplaced run under `numactl
+--membind=1` recorded node 1 and `--counter-node local` resolved to node 0.
 
 `/proc/<pid>/numa_maps` confirmed the heap was entirely on the bound node in
 both bound runs. In the unbound run each counter address kept one level for
 as long as it was used, and the only two cells that mixed levels are ones
-where the address changed between repeats; the node of each page in that run
-was not captured, so "the unbound levels are the two nodes" is inferred from
-the match in throughput, not observed. With the counter on the other node
+where the address changed between repeats. Snapshots of that run's
+`numa_maps` show the heap holding every counter address on both nodes (12
+pages on node 1 early in the run, then 5 on node 0 and 23 on node 1). Those
+counts are for the whole heap mapping, not per page, so they fit "the unbound
+levels are the two nodes" without proving which page held which counter; the
+`--counter-node` runs below settle it. With the counter on the other node
 one FAA update costs roughly 0.3 to 0.7 us whoever makes it, and total
 throughput barely moves from 2 to 64 updaters.
 
@@ -178,10 +215,10 @@ both below 0.8x with 58 ns of work).
   other two-socket systems.
 - The bound runs have three repeats, two think levels and at most 64
   updaters. The 250 ns and 1 us levels have only been run unbound.
-- Placement is controlled from outside with `numactl`. The benchmark itself
-  neither pins the allocating thread nor records the counter's node.
+- Only the counter is placed. The stop flag and each updater's stack land
+  wherever they land; neither is touched in the update loop's hot path.
 - Updaters were always on node 0. The symmetric case, and updaters spanning
-  both nodes, are untested.
+  both nodes (labelled `mixed`), are untested.
 - A counter, not a queue. Nothing here measures UBQ end to end, and whether
   `bench_grid` results on hebrides carry the same two levels is unchecked.
 - The think work is register-only. Real producers touch the slot they
@@ -190,19 +227,16 @@ both below 0.8x with 58 ns of work).
 
 ## Next steps
 
-1. Make placement part of the benchmark: allocate and first-touch the counter
-   from a thread pinned to a chosen node (or bind it with `mbind`), record the
-   node per sample, and sweep it as a dimension.
-2. Rerun all four think levels with five repeats per node, to locate where
-   the remote advantage ends.
-3. Check `bench_grid` on hebrides for the same two levels. UBQ's head words
+1. Rerun all four think levels with five repeats per node
+   (`--counter-node 0,1`), to locate where the remote advantage ends.
+2. Check `bench_grid` on hebrides for the same two levels. UBQ's head words
    and blocks are allocated by whichever thread gets there first.
-4. Figure: backoff/FAA throughput ratio against updater count, one panel per
+3. Figure: backoff/FAA throughput ratio against updater count, one panel per
    counter node, one line per think level, same-updater fraction as marker
    fill.
-5. Repeat on Grace and MareNostrum 5 through `slurm/focused_contention.sbatch`
+4. Repeat on Grace and MareNostrum 5 through `slurm/focused_contention.sbatch`
    with memory bound.
-6. Queue-level check: build UBQ with the producer reservation switched to CAS
+5. Queue-level check: build UBQ with the producer reservation switched to CAS
    with backoff and compare under scenarios that carry payloads.
 
 ## Draft paragraph for the paper
