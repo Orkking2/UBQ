@@ -14,8 +14,9 @@ say.
 - Which method wins on hebrides depends on which NUMA node holds the counter.
   With the counter on the updaters' node, the backoff methods win only at 2
   to 8 updaters with no work between updates; everywhere else they are level
-  with FAA or behind it, by up to 25x. With the counter on the other node, the backoff methods win at 4
-  to 64 updaters by 2x to 5x, with or without work.
+  with FAA or behind it, by up to about 30x. With the counter on the other
+  node, the backoff methods win at 4 to 64 updaters by 1.6x to 5x, with or
+  without work.
 - Placement is now part of the benchmark (schema v5): `--counter-node` binds
   the counter's page to a node, and every sample records the node the kernel
   reports for it, so the two cases, about 10x apart in FAA throughput, can no
@@ -78,7 +79,11 @@ memory access.
 ## Running it
 
 On a multi-socket machine, choose the counter's node. Unplaced, its page
-lands wherever its first write happens to run, so its node is arbitrary.
+lands wherever its first write happens to run, so its node is arbitrary. That
+write comes from the unpinned main thread and, since schema v5, goes to a
+fresh mapping in every trial, so an unplaced run can change node from one
+trial to the next; before v5 the node followed the heap address the counter
+happened to reuse.
 
 ```bash
 cargo build --release --features bench_tools --bin bench_atomic_updates
@@ -151,13 +156,13 @@ where the address changed between repeats. Snapshots of that run's
 pages on node 1 early in the run, then 5 on node 0 and 23 on node 1). Those
 counts are for the whole heap mapping, not per page, so they fit "the unbound
 levels are the two nodes" without proving which page held which counter; the
-`--counter-node` runs below settle it. With the counter on the other node
+`--counter-node` runs settle it. With the counter on the other node
 one FAA update costs roughly 0.3 to 0.7 us whoever makes it, and total
 throughput barely moves from 2 to 64 updaters.
 
 ### Prediction 1: holds
 
-In all five runs, every cell in which a backoff method beats FAA by 1.5x or
+In every run, every cell in which a backoff method beats FAA by 1.5x or
 more has a same-updater fraction of 0.82 or higher for that method. FAA's own
 fraction in those cells is at most 0.64 with zero work and at most 0.01 with
 work.
@@ -168,8 +173,8 @@ local and 63 ns of work, CAS with backoff keeps a same-updater fraction of
 
 ### Prediction 2: holds in the controlled runs
 
-With memory bound to either node, plain CAS is between 0.36x and 1.01x FAA in
-every cell. The exceptions seen earlier were all in unbound runs: one cell
+With the counter's node fixed, by `numactl` or by `--counter-node`, plain CAS
+is between 0.36x and 1.01x FAA in every cell. The exceptions seen earlier were all in unbound runs: one cell
 that changed placement between repeats, and cells at about 1 us of work, a
 think level the bound runs did not include.
 
@@ -184,7 +189,23 @@ think level the bound runs did not include.
 
 With the counter local, 63 ns of work is enough: the backoff methods are at
 best level with FAA and at 16 or more updaters FAA is 4x to 25x ahead. With
-the counter remote, the same 63 ns changes nothing from 4 updaters up. The
+the counter remote, the same 63 ns changes nothing from 4 updaters up.
+
+The table is from the `numactl` runs. The `--counter-node` sweep is an
+independent repeat of all four rows and agrees in shape:
+
+| Counter's node | Think | CAS+backoff / FAA at 2, 4, 8, 16, 32, 64 updaters | SegQueue-style / FAA |
+| --- | ---: | --- | --- |
+| `--counter-node 0` | 0 | 2.96, 4.47, 3.70, 1.08, 0.12, 0.05 | 2.41, 3.71, 2.65, 0.81, 0.14, 0.04 |
+| `--counter-node 0` | 63 ns | 0.74, 1.02, 0.62, 0.26, 0.10, 0.03 | 0.72, 1.03, 0.61, 0.24, 0.10, 0.03 |
+| `--counter-node 1` | 0 | 3.36, 2.31, 4.69, 4.76, 2.96, 1.61 | 9.67, 3.86, 4.35, 4.63, 3.38, 1.82 |
+| `--counter-node 1` | 63 ns | 0.54, 2.11, 2.92, 3.31, 3.32, 2.31 | 0.55, 2.13, 2.94, 3.40, 3.60, 3.60 |
+
+Two cells move the ranges quoted elsewhere in this note. Locally with work,
+FAA's lead at 64 updaters is about 30x in this run against 25x in the first.
+Remotely with zero work, the backoff methods' lead at 64 updaters is 1.6x to
+1.8x in this run against 1.9x to 2.3x in the first. Three repeats do not
+separate those. The
 earlier unbound run suggests the remote advantage is gone by about 250 ns
 (ratios of 0.94 to 1.09), but that run's placement was not recorded.
 
@@ -241,7 +262,8 @@ both below 0.8x with 58 ns of work).
 
 ## Draft paragraph for the paper
 
-Supported by the bound runs above; three repeats, one machine.
+Supported by the `numactl` runs and the `--counter-node` repeat above; three
+repeats each, one machine.
 
 > Where a CAS loop with spin backoff, or SegQueue's reservation, outruns FAA
 > on a contended head word, it does so by serialising access rather than by
@@ -252,9 +274,9 @@ Supported by the bound runs above; three repeats, one machine.
 > machine with the head word on the updaters' own NUMA node, the backoff
 > methods lead only at up to eight threads and with no work between
 > reservations (2.3x to 4.5x); with 63 ns of thread-local work they are at
-> best level with FAA, and from 16 threads FAA is 4x to 25x faster. With the
+> best level with FAA, and from 16 threads FAA is 4x to 30x faster. With the
 > head word on the other node, where one update costs several hundred
-> nanoseconds, the backoff methods lead by 2x to 5x from 4 to 64 threads with
+> nanoseconds, the backoff methods lead by 1.6x to 5x from 4 to 64 threads with
 > or without that work. Zero-work microbenchmarks of a head word, and any
 > multi-socket measurement that does not fix memory placement, therefore say
 > little about which primitive a queue should use.

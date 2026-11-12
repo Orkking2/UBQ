@@ -48,5 +48,3 @@ hebrides-numa | ordering ubq | block 4095 | counter node 1 (remote)
     32      63   16 |        1.44        1.28        4.76        4.90        |            0.89            3.31            3.40 | faa=0.00(0.06/0.06)  cas=0.01(0.06/0.06)  cas_backoff=0.83(0.11/0.06)  segqueue=0.83(0.12/0.06)
     32      63   32 |        1.43        1.27        4.74        5.15        |            0.89            3.32            3.60 | faa=0.00(0.03/0.03)  cas=0.00(0.03/0.03)  cas_backoff=0.83(0.06/0.03)  segqueue=0.83(0.06/0.03)
     32      63   64 |        1.43        1.26        3.30        5.14        |            0.88            2.31            3.60 | faa=0.00(0.02/0.02)  cas=0.00(0.02/0.02)  cas_backoff=0.83(0.03/0.02)  segqueue=0.83(0.03/0.02)
-
-Wrote CSV: /private/tmp/claude-501/-Users-neb-GitHub-RBBQ/7526eb3f-da88-4246-97dc-a8967185de63/scratchpad/numa_val/sweep.csv
