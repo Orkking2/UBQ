@@ -10,6 +10,13 @@ and the largest share of updates taken by one updater.
 A method that is faster than FAA only where its same-updater fraction is near
 one is being measured in a regime where one core keeps the counter's cache
 line; that is a property of the zero-work loop, not of the update method.
+
+Rows are kept apart by the NUMA node that held the counter (schema v5), since
+on a multi-socket machine that node decides which method wins. A row is
+flagged when samples that asked for the same placement (for example the
+default `unplaced`) landed on more than one node, or when the counter's page
+moved between nodes during a sample. A deliberate `--counter-node 0,1` sweep
+is not flagged.
 """
 
 import argparse
@@ -21,7 +28,9 @@ from collections import defaultdict
 from pathlib import Path
 
 BENCHMARK_NAME = "atomic_updates"
-SCHEMA_VERSION = 4
+# v5 adds the counter's NUMA node; v4 rows have none and group as "unknown".
+SCHEMA_VERSIONS = (4, 5)
+UNKNOWN_NODE = "unknown"
 METHODS = ("faa", "cas", "cas_backoff", "segqueue")
 REFERENCE_METHOD = "faa"
 CSV_FIELDS = (
@@ -43,16 +52,20 @@ CSV_FIELDS = (
     "max_updater_share",
     "fair_share",
     "counter_addresses",
+    "counter_node",
+    "counter_relation",
+    "moved_samples",
+    "config_nodes",
 )
 
 
 def load_rows(path):
-    """Return one dict per sample, or [] when the file is not a v4 atomic run."""
+    """Return one dict per sample, or [] when the file is not a v4/v5 atomic run."""
     with Path(path).open(encoding="utf-8") as stream:
         data = json.load(stream)
     if (
         data.get("benchmark") != BENCHMARK_NAME
-        or str(data.get("schema_version")) != str(SCHEMA_VERSION)
+        or str(data.get("schema_version")) not in {str(v) for v in SCHEMA_VERSIONS}
     ):
         return []
     meta = data.get("meta", {})
@@ -81,6 +94,14 @@ def load_rows(path):
                 / operations,
                 "max_updater_share": float(result["max_updater_share"]),
                 "counter_address": result.get("counter_address_hex"),
+                "counter_node": (
+                    UNKNOWN_NODE
+                    if result.get("counter_node") is None
+                    else str(result["counter_node"])
+                ),
+                "counter_relation": str(result.get("counter_relation") or UNKNOWN_NODE),
+                "counter_moved": bool(result.get("counter_node_moved", False)),
+                "counter_placement": str(result.get("counter_placement") or "unplaced"),
             }
         )
     return rows
@@ -102,13 +123,21 @@ def summarize(rows, layout="u64", block_size=None):
             row["think_iters"],
             row["updaters"],
             row["method"],
+            row["counter_node"],
         )
         grouped[key].append(row)
+
+    # How many counter nodes each configuration landed on per requested
+    # placement; more than one means placement was not under control.
+    config_nodes = defaultdict(set)
+    for key, samples in grouped.items():
+        for sample in samples:
+            config_nodes[key[:-1] + (sample["counter_placement"],)].add(key[-1])
 
     summaries = []
     for key in sorted(grouped):
         samples = grouped[key]
-        machine, ordering, group_layout, block, think_iters, updaters, method = key
+        machine, ordering, group_layout, block, think_iters, updaters, method, node = key
         throughput = [sample["mops"] for sample in samples]
         summaries.append(
             {
@@ -141,27 +170,34 @@ def summarize(rows, layout="u64", block_size=None):
                 "counter_addresses": len(
                     {s["counter_address"] for s in samples if s["counter_address"]}
                 ),
+                "counter_node": node,
+                "counter_relation": "/".join(
+                    sorted({s["counter_relation"] for s in samples})
+                ),
+                "moved_samples": sum(s["counter_moved"] for s in samples),
+                "config_nodes": max(
+                    len(config_nodes[key[:-1] + (placement,)])
+                    for placement in {s["counter_placement"] for s in samples}
+                ),
             }
         )
 
+    def config(s):
+        return (
+            s["machine"],
+            s["ordering"],
+            s["layout"],
+            s["block_size"],
+            s["think_iters"],
+            s["updaters"],
+            s["counter_node"],
+        )
+
     reference = {
-        (s["machine"], s["ordering"], s["layout"], s["block_size"], s["think_iters"], s["updaters"]): s[
-            "median_mops"
-        ]
-        for s in summaries
-        if s["method"] == REFERENCE_METHOD
+        config(s): s["median_mops"] for s in summaries if s["method"] == REFERENCE_METHOD
     }
     for summary in summaries:
-        base = reference.get(
-            (
-                summary["machine"],
-                summary["ordering"],
-                summary["layout"],
-                summary["block_size"],
-                summary["think_iters"],
-                summary["updaters"],
-            )
-        )
+        base = reference.get(config(summary))
         if base:
             summary["ratio_to_faa"] = summary["median_mops"] / base
     return summaries
@@ -188,6 +224,7 @@ def format_table(summaries):
             summary["machine"],
             summary["ordering"],
             summary["block_size"],
+            summary["counter_node"],
             summary["think_iters"],
             summary["think_ns"],
             summary["updaters"],
@@ -195,14 +232,26 @@ def format_table(summaries):
         by_config[config][summary["method"]] = summary
 
     lines = []
+    flagged = []
     current_group = None
     for config in sorted(by_config):
-        machine, ordering, block, think_iters, think_ns, updaters = config
-        group = (machine, ordering, block)
+        machine, ordering, block, node, think_iters, think_ns, updaters = config
+        group = (machine, ordering, block, node)
         if group != current_group:
             current_group = group
+            relations = sorted(
+                {
+                    s["counter_relation"]
+                    for (m, o, b, n, *_), methods in by_config.items()
+                    if (m, o, b, n) == group
+                    for s in methods.values()
+                }
+            )
             lines.append("")
-            lines.append(f"{machine} | ordering {ordering} | block {block}")
+            lines.append(
+                f"{machine} | ordering {ordering} | block {block} | "
+                f"counter node {node} ({'/'.join(relations)})"
+            )
             lines.append(
                 f"{'think':>6} {'~ns':>7} {'upd':>4} |"
                 + "".join(f" {method:>11}" for method in METHODS)
@@ -227,9 +276,26 @@ def format_table(summaries):
             for m in METHODS
             if m in methods
         )
+        moved = sum(s["moved_samples"] for s in methods.values())
+        spread = max(s["config_nodes"] for s in methods.values())
+        marks = []
+        if spread > 1:
+            marks.append(f"one placement landed on {spread} counter nodes")
+        if moved:
+            marks.append(f"{moved} sample(s) moved node")
+        mark = " *" if marks else ""
         lines.append(
-            f"{think_iters:>6} {think_ns:>7.0f} {updaters:>4} |{throughput}        |{ratios} | {fairness}"
+            f"{think_iters:>6} {think_ns:>7.0f} {updaters:>4} |{throughput}        |{ratios} | {fairness}{mark}"
         )
+        if marks:
+            flagged.append(
+                f"  * node {node}, think {think_iters}, {updaters} updater(s): "
+                + "; ".join(marks)
+            )
+    if flagged:
+        lines.append("")
+        lines.append("Flagged rows (placement not uniform):")
+        lines.extend(flagged)
     return "\n".join(lines).lstrip("\n")
 
 
@@ -248,7 +314,7 @@ def main():
         rows.extend(load_rows(path))
     summaries = summarize(rows, layout=args.layout, block_size=args.block_size)
     if not summaries:
-        print("No schema-v4 atomic update samples matched.", file=sys.stderr)
+        print("No schema v4 or v5 atomic update samples matched.", file=sys.stderr)
         return 1
     print(format_table(summaries))
     if args.csv:

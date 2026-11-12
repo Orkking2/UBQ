@@ -221,6 +221,24 @@ class AtomicUpdatePlotTests(unittest.TestCase):
         self.assertEqual([s["ops_per_sec"] for s in paced_samples], [12.0])
         self.assertEqual(missing_samples, [])
 
+    def test_schema_v5_samples_are_filtered_by_counter_node(self):
+        local = dict(result("u64", "faa", 31, 2, 1, 13.0), counter_node=0)
+        remote = dict(result("u64", "faa", 31, 2, 1, 2.5), counter_node=1)
+        payload = {
+            "benchmark": "atomic_updates",
+            "schema_version": 5,
+            "meta": {"machine_label": "test-box", "alignment": 4096},
+            "results": [local, remote],
+        }
+        with tempfile.TemporaryDirectory() as raw_dir:
+            path = Path(raw_dir) / "run.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            both = load_samples(path)
+            remote_only = load_samples(path, counter_node=1)
+
+        self.assertEqual(sorted(s["counter_node"] for s in both), [0, 1])
+        self.assertEqual([s["ops_per_sec"] for s in remote_only], [2.5])
+
     def test_non_atomic_schema_is_ignored(self):
         payload = {
             "benchmark": "queue",

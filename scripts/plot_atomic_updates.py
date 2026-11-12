@@ -12,8 +12,9 @@ from pathlib import Path
 
 BENCHMARK_NAME = "atomic_updates"
 # v4 adds per-sample think_iters and same-updater fairness fields; a v3 sample
-# is a zero-think sample.
-SCHEMA_VERSIONS = (3, 4)
+# is a zero-think sample. v5 adds the NUMA node that held the counter, which
+# v3/v4 samples lack (None).
+SCHEMA_VERSIONS = (3, 4, 5)
 LAYOUTS = ("u64", "mixed_u128_u64")
 METHODS = ("cas", "cas_backoff", "faa", "segqueue")
 CAS_METHODS = ("cas", "cas_backoff", "segqueue")
@@ -74,7 +75,7 @@ def collect_jsons(paths, runs_dirs):
     return sorted(files)
 
 
-def load_samples(path, think_iters=0):
+def load_samples(path, think_iters=0, counter_node=None):
     try:
         with Path(path).open(encoding="utf-8") as stream:
             data = json.load(stream)
@@ -111,9 +112,13 @@ def load_samples(path, think_iters=0):
             cas_failures = int(result.get("cas_failures", 0))
             wide_loads = int(result.get("wide_loads", 0))
             sample_think_iters = int(result.get("think_iters", 0))
+            sample_node = result.get("counter_node")
+            sample_node = None if sample_node is None else int(sample_node)
         except (KeyError, TypeError, ValueError):
             continue
         if sample_think_iters != think_iters:
+            continue
+        if counter_node is not None and sample_node != counter_node:
             continue
         if (
             block_size <= 0
@@ -125,6 +130,7 @@ def load_samples(path, think_iters=0):
             continue
         loaded.append(
             {
+                "counter_node": sample_node,
                 "machine": machine,
                 "ordering": ordering,
                 "alignment": alignment,
@@ -625,6 +631,16 @@ def main():
             "written to atomic_updates/think_<n>)"
         ),
     )
+    parser.add_argument(
+        "--counter-node",
+        type=int,
+        help=(
+            "Plot only samples whose counter was on this NUMA node "
+            "(schema v5; written to atomic_updates/node_<n>). Required when "
+            "the inputs span more than one node, since the node decides "
+            "which update method wins."
+        ),
+    )
     args = parser.parse_args()
 
     files = collect_jsons(args.files, args.runs_dir)
@@ -632,13 +648,24 @@ def main():
         parser.error("provide JSON files or at least one --runs-dir")
     samples = []
     for path in files:
-        samples.extend(load_samples(path, args.think_iters))
+        samples.extend(load_samples(path, args.think_iters, args.counter_node))
     if not samples:
         print(
-            "No schema-v3/v4 atomic update benchmark samples found "
-            f"for think level {args.think_iters}."
+            "No atomic update benchmark samples found "
+            f"for think level {args.think_iters}"
+            + (
+                f" with the counter on node {args.counter_node}."
+                if args.counter_node is not None
+                else "."
+            )
         )
         return 1
+    nodes = sorted({s["counter_node"] for s in samples if s["counter_node"] is not None})
+    if args.counter_node is None and len(nodes) > 1:
+        parser.error(
+            f"samples come from counter NUMA nodes {nodes}; "
+            "choose one with --counter-node"
+        )
 
     aggregated = aggregate(samples)
     out_root = Path(args.out_dir)
@@ -653,6 +680,8 @@ def main():
 
     for machine in sorted(aggregated):
         machine_dir = out_root / machine / "atomic_updates"
+        if args.counter_node is not None:
+            machine_dir = machine_dir / f"node_{args.counter_node}"
         if args.think_iters:
             machine_dir = machine_dir / f"think_{args.think_iters}"
         machine_dir.mkdir(parents=True, exist_ok=True)

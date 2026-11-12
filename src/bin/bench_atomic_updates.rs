@@ -1,5 +1,7 @@
+mod atomic_numa;
 mod atomic_views;
 
+use atomic_numa::{NodeCpus, PlacedPage, Placement};
 use atomic_views::AtomicInt;
 use clap::{Parser, ValueEnum};
 use crossbeam_utils::{Backoff, CachePadded};
@@ -13,7 +15,7 @@ use std::sync::{Arc, Barrier, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const UPDATE_CHUNK: usize = 4096;
 const DEFAULT_THINK_ITERS: &str = "0";
 const THINK_CALIBRATION_ITERS: u32 = 1 << 22;
@@ -83,6 +85,14 @@ struct Args {
     /// sweeps where one updater completes few updates per millisecond.
     #[arg(long, default_value_t = UPDATE_CHUNK)]
     update_chunk: usize,
+
+    /// Comma-separated placements of the shared counter, swept like think
+    /// levels: `unplaced` (default: wherever its first write lands), `local`
+    /// (bound to the first updater's NUMA node), or a node number. Binding
+    /// uses mbind and needs Linux. Every sample records the node the kernel
+    /// reports for the counter's page, placed or not.
+    #[arg(long, value_delimiter = ',', default_value = "unplaced")]
+    counter_node: Vec<Placement>,
 
     /// Print the resolved plan without running or writing results.
     #[arg(long)]
@@ -454,6 +464,12 @@ struct RunMeta {
     update_chunk: usize,
     think_iters: Vec<u32>,
     think_iteration_ns: f64,
+    counter_placements: Vec<String>,
+    numa_node_count: usize,
+    numa_nodes: Vec<NodeCpus>,
+    /// /proc/sys/kernel/numa_balancing; nonzero lets the kernel migrate an
+    /// unplaced counter toward its updaters.
+    numa_balancing: Option<u32>,
     wide_atomic_lock_free: bool,
     mixed_width_memory_model_supported: bool,
 }
@@ -491,6 +507,19 @@ struct Sample {
     /// Virtual address of the sample's counter allocation. Throughput modes
     /// that follow the allocation rather than the method show up here.
     counter_address_hex: String,
+    /// Requested placement: `unplaced`, `local`, or `nodeN`.
+    counter_placement: String,
+    /// NUMA node holding the counter's page as the kernel reports it, before
+    /// and after the measured interval; null where the OS does not say.
+    counter_node: Option<usize>,
+    counter_node_after: Option<usize>,
+    /// The page was on a different node after the sample than before it.
+    counter_node_moved: bool,
+    /// Distinct NUMA nodes of the updaters' pinned CPUs.
+    updater_nodes: Vec<usize>,
+    /// `local` (counter on the updaters' one node), `remote`, `mixed`
+    /// (updaters span nodes), or `unknown`.
+    counter_relation: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -980,17 +1009,103 @@ struct Pacing {
     update_chunk: usize,
 }
 
+/// Where a trial puts its counter, and the topology used to label samples.
+struct CounterPlan<'a> {
+    label: String,
+    bind_node: Option<usize>,
+    nodes: &'a [NodeCpus],
+}
+
+impl CounterPlan<'_> {
+    #[cfg(test)]
+    fn unplaced() -> CounterPlan<'static> {
+        CounterPlan {
+            label: Placement::Unplaced.to_string(),
+            bind_node: None,
+            nodes: &[],
+        }
+    }
+}
+
+/// Turns `--counter-node` into one plan per distinct placement, failing where
+/// a placement cannot be honoured rather than silently running unplaced.
+fn resolve_counter_plans<'a>(
+    placements: &[Placement],
+    nodes: &'a [NodeCpus],
+    core_ids: &[core_affinity::CoreId],
+) -> Result<Vec<CounterPlan<'a>>, String> {
+    let mut plans: Vec<CounterPlan<'a>> = Vec::new();
+    for &placement in placements {
+        if placement != Placement::Unplaced && !cfg!(target_os = "linux") {
+            return Err(format!(
+                "--counter-node {placement} needs Linux; only `unplaced` runs here"
+            ));
+        }
+        let bind_node = match placement {
+            Placement::Unplaced => None,
+            Placement::Node(node) => {
+                if !nodes.iter().any(|known| known.node == node) {
+                    return Err(format!(
+                        "--counter-node {node}: no such NUMA node (found {})",
+                        if nodes.is_empty() {
+                            "none".to_string()
+                        } else {
+                            nodes
+                                .iter()
+                                .map(|known| known.node.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        }
+                    ));
+                }
+                Some(node)
+            }
+            Placement::Local => {
+                let first = core_ids
+                    .first()
+                    .ok_or("--counter-node local needs pinned updaters")?;
+                Some(atomic_numa::cpu_node(nodes, first.id).ok_or_else(|| {
+                    format!(
+                        "--counter-node local: CPU {} has no known NUMA node",
+                        first.id
+                    )
+                })?)
+            }
+        };
+        let label = placement.to_string();
+        if !plans.iter().any(|plan| plan.label == label) {
+            plans.push(CounterPlan {
+                label,
+                bind_node,
+                nodes,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return Err("--counter-node must name at least one placement".to_string());
+    }
+    Ok(plans)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_trial(
     updater_count: usize,
     case: BenchmarkCase,
     profile: OrderingProfile,
     block: BlockConfig,
     pacing: Pacing,
+    plan: &CounterPlan<'_>,
     duration: Duration,
     core_ids: &[core_affinity::CoreId],
 ) -> Result<Sample, String> {
-    let counter = Arc::new(CachePadded::new(Counter::new(case.layout, block)));
-    let counter_address = Arc::as_ptr(&counter) as usize;
+    // A page of its own, bound before its first write when a node is asked
+    // for, so placement is the requested node and not wherever the heap is.
+    let counter = Arc::new(PlacedPage::new(
+        Counter::new(case.layout, block),
+        plan.bind_node,
+    )?);
+    let counter_address = counter.address();
+    let counter_node = counter.node();
     let stop = Arc::new(CachePadded::new(AtomicBool::new(false)));
     let ready = Arc::new(Barrier::new(updater_count + 1));
     let start_gate = Arc::new(Barrier::new(updater_count + 1));
@@ -1057,6 +1172,26 @@ fn run_trial(
                 .map_err(|_| "atomic updater thread panicked".to_string())?,
         );
     }
+    let counter_node_after = counter.node();
+    let updater_node_list = outcomes
+        .iter()
+        .zip(core_ids)
+        .map(|(outcome, core)| {
+            outcome
+                .pinned
+                .then(|| atomic_numa::cpu_node(plan.nodes, core.id))
+                .flatten()
+        })
+        .chain(std::iter::repeat(None))
+        .take(updater_count)
+        .collect::<Vec<_>>();
+    let updater_nodes = updater_node_list
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     let operations: u64 = outcomes
         .iter()
@@ -1192,6 +1327,14 @@ fn run_trial(
             .collect(),
         pinned_threads: outcomes.iter().filter(|outcome| outcome.pinned).count(),
         counter_address_hex: format!("{counter_address:#x}"),
+        counter_placement: plan.label.clone(),
+        counter_node,
+        counter_node_after,
+        counter_node_moved: counter_node.is_some()
+            && counter_node_after.is_some()
+            && counter_node != counter_node_after,
+        updater_nodes,
+        counter_relation: atomic_numa::relation(counter_node, &updater_node_list),
     })
 }
 
@@ -1315,6 +1458,9 @@ fn run(args: Args) -> Result<(), String> {
         .unwrap_or(detected_limit)
         .min(detected_limit);
     let counts = updater_counts(effective_thread_limit)?;
+    let numa_nodes = atomic_numa::nodes();
+    let numa_balancing = atomic_numa::numa_balancing();
+    let plans = resolve_counter_plans(&args.counter_node, &numa_nodes, &core_ids)?;
     let largest_block = u64::from(*block_sizes.last().expect("nonempty block sizes"));
     if largest_block
         .checked_add(u64::try_from(effective_thread_limit).unwrap_or(u64::MAX))
@@ -1361,6 +1507,41 @@ fn run(args: Args) -> Result<(), String> {
             .join(","),
         args.update_chunk
     );
+    println!(
+        "NUMA nodes: {}; automatic balancing: {}",
+        if numa_nodes.is_empty() {
+            "not reported".to_string()
+        } else {
+            numa_nodes
+                .iter()
+                .map(|node| format!("{} ({} CPUs)", node.node, node.cpus.len()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+        numa_balancing.map_or("unknown".to_string(), |value| value.to_string())
+    );
+    println!(
+        "counter placements: {}",
+        plans
+            .iter()
+            .map(|plan| match plan.bind_node {
+                Some(node) => format!("{} (bound to node {node})", plan.label),
+                None => format!("{} (first write decides)", plan.label),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let widest_nodes = core_ids
+        .iter()
+        .take(effective_thread_limit)
+        .filter_map(|core| atomic_numa::cpu_node(&numa_nodes, core.id))
+        .collect::<BTreeSet<_>>();
+    if widest_nodes.len() > 1 {
+        eprintln!(
+            "warning: at {effective_thread_limit} updaters the pinned CPUs span NUMA nodes {widest_nodes:?}; \
+             those samples are labelled `mixed`. Use --max-updaters to stay on one node."
+        );
+    }
     println!("AtomicU128 lock-free: yes");
     println!(
         "sample timing: {}ms warm-up + {}ms measured, {} repeat(s)",
@@ -1379,61 +1560,76 @@ fn run(args: Args) -> Result<(), String> {
     let think_iteration_ns = calibrate_think_iteration_ns();
     println!("calibrated think iteration: {think_iteration_ns:.3} ns");
     let mut results = Vec::with_capacity(
-        counts.len() * think_levels.len() * args.repeats * blocks.len() * CASES.len(),
+        counts.len() * plans.len() * think_levels.len() * args.repeats * blocks.len() * CASES.len(),
     );
 
     for &updaters in &counts {
-        for (&think_iters, repeat_index) in think_levels
-            .iter()
-            .flat_map(|think_iters| (1..=args.repeats).map(move |repeat| (think_iters, repeat)))
-        {
-            let pacing = Pacing {
-                think_iters,
-                update_chunk: args.update_chunk,
-            };
-            for (block_position, block) in
-                block_order(&blocks, repeat_index).into_iter().enumerate()
+        for plan in &plans {
+            for (&think_iters, repeat_index) in think_levels
+                .iter()
+                .flat_map(|think_iters| (1..=args.repeats).map(move |repeat| (think_iters, repeat)))
             {
-                for case in case_order(repeat_index - 1 + block_position) {
-                    if !warmup_duration.is_zero() {
-                        run_trial(
+                let pacing = Pacing {
+                    think_iters,
+                    update_chunk: args.update_chunk,
+                };
+                for (block_position, block) in
+                    block_order(&blocks, repeat_index).into_iter().enumerate()
+                {
+                    for case in case_order(repeat_index - 1 + block_position) {
+                        if !warmup_duration.is_zero() {
+                            run_trial(
+                                updaters,
+                                case,
+                                args.ordering,
+                                block,
+                                pacing,
+                                plan,
+                                warmup_duration,
+                                &core_ids,
+                            )?;
+                        }
+                        let mut sample = run_trial(
                             updaters,
                             case,
                             args.ordering,
                             block,
                             pacing,
-                            warmup_duration,
+                            plan,
+                            measured_duration,
                             &core_ids,
                         )?;
-                    }
-                    let mut sample = run_trial(
-                        updaters,
-                        case,
-                        args.ordering,
-                        block,
-                        pacing,
-                        measured_duration,
-                        &core_ids,
-                    )?;
-                    sample.repeat_index = repeat_index;
-                    println!(
-                        "{:>3} updater(s) | think {:>5} | repeat {:>2} | block {:>4} | {:>15} | \
-                         {:>11} | {:>11.3} Mops/s | same updater {:>5.3} | \
+                        sample.repeat_index = repeat_index;
+                        println!(
+                            "{:>3} updater(s) | {:>8} on {:>4} ({:>7}) | think {:>5} | repeat {:>2} | \
+                         block {:>4} | {:>15} | {:>11} | {:>11.3} Mops/s | same updater {:>5.3} | \
                          wide loads/update {:>9}",
-                        updaters,
-                        think_iters,
-                        repeat_index,
-                        block.block_size,
-                        case.layout.name(),
-                        case.method.name().to_ascii_uppercase(),
-                        sample.ops_per_sec / 1_000_000.0,
-                        sample.same_updater_fraction,
-                        sample
-                            .wide_loads_per_update
-                            .map(|value| format!("{value:.6}"))
-                            .unwrap_or_else(|| "-".to_string()),
-                    );
-                    results.push(sample);
+                            updaters,
+                            plan.label,
+                            sample
+                                .counter_node
+                                .map_or("?".to_string(), |node| format!("n{node}")),
+                            sample.counter_relation,
+                            think_iters,
+                            repeat_index,
+                            block.block_size,
+                            case.layout.name(),
+                            case.method.name().to_ascii_uppercase(),
+                            sample.ops_per_sec / 1_000_000.0,
+                            sample.same_updater_fraction,
+                            sample
+                                .wide_loads_per_update
+                                .map(|value| format!("{value:.6}"))
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
+                        if sample.counter_node_moved {
+                            eprintln!(
+                                "warning: the counter page moved from node {:?} to {:?} during this sample",
+                                sample.counter_node, sample.counter_node_after
+                            );
+                        }
+                        results.push(sample);
+                    }
                 }
             }
         }
@@ -1471,6 +1667,10 @@ fn run(args: Args) -> Result<(), String> {
             update_chunk: args.update_chunk,
             think_iters: think_levels,
             think_iteration_ns,
+            counter_placements: plans.iter().map(|plan| plan.label.clone()).collect(),
+            numa_node_count: numa_nodes.len(),
+            numa_nodes: numa_nodes.clone(),
+            numa_balancing,
             wide_atomic_lock_free: true,
             mixed_width_memory_model_supported: false,
         },
@@ -1775,6 +1975,7 @@ mod tests {
             OrderingProfile::Ubq,
             block,
             pacing,
+            &CounterPlan::unplaced(),
             Duration::from_millis(5),
             &[],
         )
@@ -1788,6 +1989,48 @@ mod tests {
             usize::from_str_radix(sample.counter_address_hex.trim_start_matches("0x"), 16)
                 .expect("hex counter address");
         assert_ne!(address, 0);
-        assert_eq!(address % std::mem::align_of::<CachePadded<Counter>>(), 0);
+        assert_eq!(address % 4096, 0, "the counter has a page of its own");
+        assert_eq!(sample.counter_placement, "unplaced");
+        assert!(!sample.counter_node_moved);
+        // Unpinned updaters have no known node, so nothing can be claimed.
+        assert!(sample.updater_nodes.is_empty());
+        assert_eq!(sample.counter_relation, "unknown");
+    }
+
+    #[test]
+    fn counter_node_accepts_a_sweep_and_rejects_what_it_cannot_honour() {
+        let args = Args::try_parse_from([
+            "bench_atomic_updates",
+            "--machine-label",
+            "local",
+            "--counter-node",
+            "unplaced,0,local",
+        ])
+        .expect("arguments");
+        assert_eq!(
+            args.counter_node,
+            vec![Placement::Unplaced, Placement::Node(0), Placement::Local]
+        );
+        let default = Args::try_parse_from(["bench_atomic_updates", "--machine-label", "local"])
+            .expect("arguments");
+        assert_eq!(default.counter_node, vec![Placement::Unplaced]);
+
+        let nodes = [NodeCpus {
+            node: 0,
+            cpus: vec![0, 1],
+        }];
+        let plans = resolve_counter_plans(&[Placement::Unplaced, Placement::Unplaced], &nodes, &[])
+            .expect("unplaced runs everywhere");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].bind_node, None);
+        assert!(resolve_counter_plans(&[Placement::Node(7)], &nodes, &[]).is_err());
+        assert!(resolve_counter_plans(&[Placement::Local], &nodes, &[]).is_err());
+        if cfg!(target_os = "linux") {
+            let plans = resolve_counter_plans(&[Placement::Node(0)], &nodes, &[]).unwrap();
+            assert_eq!(plans[0].bind_node, Some(0));
+            assert_eq!(plans[0].label, "node0");
+        } else {
+            assert!(resolve_counter_plans(&[Placement::Node(0)], &nodes, &[]).is_err());
+        }
     }
 }

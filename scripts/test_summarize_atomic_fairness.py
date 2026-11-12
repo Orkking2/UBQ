@@ -85,7 +85,10 @@ class AtomicFairnessSummaryTests(unittest.TestCase):
         self.assertEqual(by_key[(0, "faa")]["ratio_to_faa"], 1.0)
 
         table = format_table(summaries)
-        self.assertIn("test-box | ordering ubq | block 4095", table)
+        self.assertIn(
+            "test-box | ordering ubq | block 4095 | counter node unknown (unknown)", table
+        )
+        self.assertNotIn("Flagged rows", table)
         self.assertIn("cas_backoff=1.00(0.72/0.50)", table)
 
     def test_other_layouts_and_blocks_are_filtered(self):
@@ -109,6 +112,50 @@ class AtomicFairnessSummaryTests(unittest.TestCase):
             sample["counter_address_hex"] = address
         summaries = summarize(self.load(payload(results)))
         self.assertEqual(summaries[0]["counter_addresses"], 2)
+
+    def test_counter_nodes_are_kept_apart_and_mixed_placement_is_flagged(self):
+        def on(node, repeat, mops, moved=False):
+            sample = result("faa", 0, 16, repeat, mops, 0.1, 0.07)
+            sample["counter_node"] = node
+            sample["counter_node_moved"] = moved
+            sample["counter_relation"] = "local" if node == 0 else "remote"
+            return sample
+
+        rows = self.load(
+            payload([on(0, 1, 13.0), on(0, 2, 13.2), on(1, 3, 2.5, moved=True)], 5)
+        )
+        summaries = summarize(rows)
+        by_node = {s["counter_node"]: s for s in summaries}
+        self.assertEqual(set(by_node), {"0", "1"})
+        self.assertEqual(by_node["0"]["median_mops"], 13.1)
+        self.assertEqual(by_node["0"]["counter_relation"], "local")
+        self.assertEqual(by_node["1"]["moved_samples"], 1)
+        self.assertEqual(by_node["0"]["config_nodes"], 2)
+
+        table = format_table(summaries)
+        self.assertIn("counter node 0 (local)", table)
+        self.assertIn("counter node 1 (remote)", table)
+        self.assertIn("Flagged rows (placement not uniform):", table)
+        self.assertIn(
+            "node 1, think 0, 16 updater(s): one placement landed on 2 counter nodes; "
+            "1 sample(s) moved node",
+            table,
+        )
+
+    def test_a_deliberate_node_sweep_is_not_flagged(self):
+        def placed(node, repeat, mops):
+            sample = result("faa", 0, 16, repeat, mops, 0.1, 0.07)
+            sample.update(
+                counter_node=node,
+                counter_placement=f"node{node}",
+                counter_relation="local" if node == 0 else "remote",
+            )
+            return sample
+
+        rows = self.load(payload([placed(0, 1, 13.0), placed(1, 1, 2.5)], 5))
+        summaries = summarize(rows)
+        self.assertEqual([s["config_nodes"] for s in summaries], [1, 1])
+        self.assertNotIn("Flagged rows", format_table(summaries))
 
     def test_older_schemas_are_ignored(self):
         self.assertEqual(
