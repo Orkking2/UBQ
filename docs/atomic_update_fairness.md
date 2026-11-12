@@ -2,10 +2,13 @@
 
 `bench_atomic_updates` in its zero-work loop shows CAS with spin backoff, and
 the SegQueue-style reservation that uses the same backoff, outrunning FAA.
-UBQ reserves producer slots with FAA, so the result needs an explanation
-before it is either dismissed or acted on. This note states the hypothesis,
-what the benchmark records to test it, and what the measurements on hebrides
-say.
+UBQ's producer currently reserves slots with a CAS loop and spin backoff on
+its packed head (`UBQ::push_batch` in `src/queue.rs`; `push` is a batch of
+one), and its consumer reserves with CAS as well. The producer's CAS
+reservation dates from the queue refactor of 2026-08-16 (`9025b3c`) and was
+chosen on the strength of this benchmark's zero-work result. This note states
+the hypothesis behind that result, what the benchmark records to test it, and
+what the measurements on hebrides say.
 
 **Status (2026-11-12).**
 
@@ -17,6 +20,11 @@ say.
   with FAA or behind it, by up to about 30x. With the counter on the other
   node, the backoff methods win at 4 to 64 updaters by 1.6x to 5x, with or
   without work.
+- The measurement that motivated UBQ's CAS reservation mixes two effects.
+  With the counter on the updaters' node, the backoff lead exists only with
+  zero work at up to 8 updaters; with the counter on the other node, it
+  exists at 4 or more. The reservation choice should be re-tested at queue
+  level, with memory placement controlled.
 - Placement is now part of the benchmark (schema v5): `--counter-node` binds
   the counter's page to a node, and every sample records the node the kernel
   reports for it, so the two cases, about 10x apart in FAA throughput, can no
@@ -222,8 +230,8 @@ A standalone single-file microbenchmark (one padded `AtomicU64`, a bare
 the same day showed FAA at 84 to 94 Mops/s from 2 to 64 threads with zero
 work, CAS with backoff ahead only at 2 and 4 threads, and FAA ahead everywhere
 with 60 ns of work. It was a single unbound process, and its FAA loop differs
-from the one here, which loads the counter before every `fetch_add` as UBQ's
-producer path does. Its numbers should not be combined with the tables above.
+from the one here, which loads the counter before every update, as UBQ's
+producer path loads its head before each CAS. Its numbers should not be combined with the tables above.
 
 On a 4-vCPU Sapphire Rapids VM this binary shows the local-node shape (CAS
 with backoff 2.1x and SegQueue-style 1.4x FAA at 2 updaters with zero work,
@@ -257,8 +265,10 @@ both below 0.8x with 58 ns of work).
    fill.
 4. Repeat on Grace and MareNostrum 5 through `slurm/focused_contention.sbatch`
    with memory bound.
-5. Queue-level check: build UBQ with the producer reservation switched to CAS
-   with backoff and compare under scenarios that carry payloads.
+5. Queue-level check: compare UBQ's current CAS reservation with an FAA
+   reservation of the same packed head, with memory placement controlled and
+   under scenarios that carry payloads. No FAA variant of the head exists in
+   the queue registry today.
 
 ## Draft paragraph for the paper
 
