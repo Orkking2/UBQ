@@ -194,6 +194,33 @@ class AtomicUpdatePlotTests(unittest.TestCase):
         self.assertEqual(winner["block_size"], 511)
         self.assertGreater(winner["score"], 0.96)
 
+    def test_schema_v4_samples_are_filtered_by_think_level(self):
+        zero_work = result("u64", "faa", 31, 2, 1, 30.0)
+        zero_work["think_iters"] = 0
+        paced = result("u64", "faa", 31, 2, 1, 12.0)
+        paced["think_iters"] = 32
+        payload = {
+            "benchmark": "atomic_updates",
+            "schema_version": 4,
+            "meta": {
+                "machine_label": "test-box",
+                "ordering": "ubq",
+                "alignment": 4096,
+                "think_iters": [0, 32],
+            },
+            "results": [zero_work, paced],
+        }
+        with tempfile.TemporaryDirectory() as raw_dir:
+            path = Path(raw_dir) / "run.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            default_samples = load_samples(path)
+            paced_samples = load_samples(path, think_iters=32)
+            missing_samples = load_samples(path, think_iters=128)
+
+        self.assertEqual([s["ops_per_sec"] for s in default_samples], [30.0])
+        self.assertEqual([s["ops_per_sec"] for s in paced_samples], [12.0])
+        self.assertEqual(missing_samples, [])
+
     def test_non_atomic_schema_is_ignored(self):
         payload = {
             "benchmark": "queue",

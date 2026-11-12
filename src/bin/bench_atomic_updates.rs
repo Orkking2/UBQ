@@ -13,8 +13,11 @@ use std::sync::{Arc, Barrier, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const UPDATE_CHUNK: usize = 4096;
+const DEFAULT_THINK_ITERS: &str = "0";
+const THINK_CALIBRATION_ITERS: u32 = 1 << 22;
+const THINK_CALIBRATION_ROUNDS: usize = 5;
 const DEFAULT_RUNS_DIR: &str = "bench_results/runs";
 const DEFAULT_BLOCK_SIZES: &str = "31,127,511,2047,4095";
 const DEFAULT_ALIGNMENT: u64 = 4096;
@@ -70,6 +73,16 @@ struct Args {
     /// Atomic ordering profile to benchmark.
     #[arg(long, value_enum, default_value_t = OrderingProfile::Ubq)]
     ordering: OrderingProfile,
+
+    /// Comma-separated counts of thread-local work iterations run after every
+    /// successful update. 0 is the zero-work closed loop.
+    #[arg(long, value_delimiter = ',', default_value = DEFAULT_THINK_ITERS)]
+    think_iters: Vec<u32>,
+
+    /// Successful updates between checks of the stop flag. Lower it for
+    /// sweeps where one updater completes few updates per millisecond.
+    #[arg(long, default_value_t = UPDATE_CHUNK)]
+    update_chunk: usize,
 
     /// Print the resolved plan without running or writing results.
     #[arg(long)]
@@ -323,9 +336,85 @@ struct CachedHead {
     pointer: u64,
 }
 
+/// Updater-private state: pacing between updates and the word this updater
+/// last left in the counter. Nothing here is shared between threads.
+#[derive(Clone, Copy, Debug)]
+struct UpdaterLocal {
+    update_chunk: usize,
+    think_iters: u32,
+    think_state: u64,
+    last_written: Option<u64>,
+}
+
+impl UpdaterLocal {
+    fn new(update_chunk: usize, think_iters: u32, seed: u64) -> Self {
+        Self {
+            update_chunk,
+            think_iters,
+            // xorshift needs a nonzero state.
+            think_state: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
+            last_written: None,
+        }
+    }
+
+    /// Record a successful update that observed `before` and left `after`.
+    /// The update counts as a same-updater succession when no other thread
+    /// wrote the counter since this updater's previous write.
+    #[inline(always)]
+    fn record_update(&mut self, before: u64, after: u64, stats: &mut UpdateStats) {
+        if self.last_written == Some(before) {
+            stats.same_updater_updates = stats.same_updater_updates.wrapping_add(1);
+        }
+        self.last_written = Some(after);
+    }
+
+    #[inline(always)]
+    fn think(&mut self) {
+        if self.think_iters != 0 {
+            self.think_state = think(self.think_state, self.think_iters);
+        }
+    }
+}
+
+/// Thread-local work that models using a reservation: a dependent xorshift
+/// chain the optimizer cannot remove or vectorize.
+#[inline(always)]
+fn think(mut state: u64, iterations: u32) -> u64 {
+    for _ in 0..iterations {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state = std::hint::black_box(state);
+    }
+    state
+}
+
+/// Best-of-N single-thread cost of one think iteration, in nanoseconds.
+fn calibrate_think_iteration_ns() -> f64 {
+    let mut best = f64::INFINITY;
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for _ in 0..THINK_CALIBRATION_ROUNDS {
+        let started = Instant::now();
+        state = think(state, THINK_CALIBRATION_ITERS);
+        let elapsed = started.elapsed().as_nanos() as f64;
+        best = best.min(elapsed / f64::from(THINK_CALIBRATION_ITERS));
+    }
+    std::hint::black_box(state);
+    best
+}
+
+fn normalize_think_iters(values: &[u32]) -> Result<Vec<u32>, String> {
+    let levels = values.iter().copied().collect::<BTreeSet<_>>();
+    if levels.is_empty() {
+        return Err("--think-iters must contain at least one level".to_string());
+    }
+    Ok(levels.into_iter().collect())
+}
+
 #[derive(Default, Debug)]
 struct UpdateStats {
     operations: u64,
+    same_updater_updates: u64,
     cas_failures: u64,
     boundary_stores: u64,
     boundary_waits: u64,
@@ -363,6 +452,8 @@ struct RunMeta {
     repeats: usize,
     ordering: OrderingProfile,
     update_chunk: usize,
+    think_iters: Vec<u32>,
+    think_iteration_ns: f64,
     wide_atomic_lock_free: bool,
     mixed_width_memory_model_supported: bool,
 }
@@ -374,9 +465,14 @@ struct Sample {
     block_size: u32,
     layout: CounterLayout,
     method: UpdateMethod,
+    think_iters: u32,
     operations: u64,
     elapsed_ns: u64,
     ops_per_sec: f64,
+    same_updater_updates: u64,
+    same_updater_fraction: f64,
+    min_updater_share: f64,
+    max_updater_share: f64,
     cas_failures: u64,
     cas_attempts_per_update: Option<f64>,
     boundary_stores: u64,
@@ -665,9 +761,10 @@ fn run_cas_chunk<C: BlockCounter>(
     block: BlockConfig,
     cache: &mut CachedHead,
     stats: &mut UpdateStats,
+    local: &mut UpdaterLocal,
 ) {
     let backoff = Backoff::new();
-    for _ in 0..UPDATE_CHUNK {
+    for _ in 0..local.update_chunk {
         let observed = atomic.narrow_load(profile.load_ordering());
         let mut current =
             atomic.synchronize_generation(observed, profile.load_ordering(), block, cache, stats);
@@ -694,9 +791,13 @@ fn run_cas_chunk<C: BlockCounter>(
                 profile.failure_ordering(),
             ) {
                 Ok(_) => {
-                    if index + 1 == block.block_size {
+                    let written = if index + 1 == block.block_size {
                         atomic.publish_next(current, profile.store_ordering(), block, cache, stats);
-                    }
+                        block.next_low(current)
+                    } else {
+                        current.wrapping_add(1)
+                    };
+                    local.record_update(current, written, stats);
                     stats.operations = stats.operations.wrapping_add(1);
                     backoff.reset();
                     break;
@@ -716,6 +817,7 @@ fn run_cas_chunk<C: BlockCounter>(
                 }
             }
         }
+        local.think();
     }
 }
 
@@ -726,9 +828,10 @@ fn run_faa_chunk<C: BlockCounter>(
     block: BlockConfig,
     cache: &mut CachedHead,
     stats: &mut UpdateStats,
+    local: &mut UpdaterLocal,
 ) {
     let backoff = Backoff::new();
-    for _ in 0..UPDATE_CHUNK {
+    for _ in 0..local.update_chunk {
         loop {
             let observed = atomic.narrow_load(profile.load_ordering());
             let current = atomic.synchronize_generation(
@@ -757,18 +860,25 @@ fn run_faa_chunk<C: BlockCounter>(
             }
             let index = block.index(reserved);
             if index >= block.block_size {
+                // An overshooting FAA still writes the counter.
+                local.last_written = Some(reserved.wrapping_add(1));
                 stats.invalid_faa_reservations = stats.invalid_faa_reservations.wrapping_add(1);
                 backoff.snooze();
                 continue;
             }
 
-            if index + 1 == block.block_size {
+            let written = if index + 1 == block.block_size {
                 atomic.publish_next(reserved, profile.store_ordering(), block, cache, stats);
-            }
+                block.next_low(reserved)
+            } else {
+                reserved.wrapping_add(1)
+            };
+            local.record_update(reserved, written, stats);
             stats.operations = stats.operations.wrapping_add(1);
             backoff.reset();
             break;
         }
+        local.think();
     }
 }
 
@@ -778,9 +888,10 @@ fn run_segqueue_chunk<C: BlockCounter>(
     profile: OrderingProfile,
     block: BlockConfig,
     stats: &mut UpdateStats,
+    local: &mut UpdaterLocal,
 ) {
     let backoff = Backoff::new();
-    for _ in 0..UPDATE_CHUNK {
+    for _ in 0..local.update_chunk {
         let mut tail = atomic.narrow_load(profile.load_ordering());
         loop {
             let offset = block.segqueue_offset(tail);
@@ -799,13 +910,15 @@ fn run_segqueue_chunk<C: BlockCounter>(
                 profile.failure_ordering(),
             ) {
                 Ok(_) => {
-                    if offset + 1 == block.block_size {
-                        atomic.narrow_store(
-                            new_tail.wrapping_add(SEGQUEUE_INDEX_STEP),
-                            profile.store_ordering(),
-                        );
+                    let written = if offset + 1 == block.block_size {
+                        let published = new_tail.wrapping_add(SEGQUEUE_INDEX_STEP);
+                        atomic.narrow_store(published, profile.store_ordering());
                         stats.boundary_stores = stats.boundary_stores.wrapping_add(1);
-                    }
+                        published
+                    } else {
+                        new_tail
+                    };
+                    local.record_update(tail, written, stats);
                     stats.operations = stats.operations.wrapping_add(1);
                     backoff.reset();
                     break;
@@ -817,6 +930,7 @@ fn run_segqueue_chunk<C: BlockCounter>(
                 }
             }
         }
+        local.think();
     }
 }
 
@@ -826,29 +940,41 @@ fn run_worker<C: BlockCounter>(
     profile: OrderingProfile,
     block: BlockConfig,
     stop: &AtomicBool,
+    mut local: UpdaterLocal,
 ) -> UpdateStats {
     let mut stats = UpdateStats::default();
     let mut cache = CachedHead::default();
     counter.initialize(profile.load_ordering(), block, &mut cache, &mut stats);
+    let local = &mut local;
 
     match method {
         UpdateMethod::Cas | UpdateMethod::CasBackoff => {
             while !stop.load(Ordering::Acquire) {
-                run_cas_chunk(counter, method, profile, block, &mut cache, &mut stats);
+                run_cas_chunk(
+                    counter, method, profile, block, &mut cache, &mut stats, local,
+                );
             }
         }
         UpdateMethod::Faa => {
             while !stop.load(Ordering::Acquire) {
-                run_faa_chunk(counter, profile, block, &mut cache, &mut stats);
+                run_faa_chunk(counter, profile, block, &mut cache, &mut stats, local);
             }
         }
         UpdateMethod::SegQueue => {
             while !stop.load(Ordering::Acquire) {
-                run_segqueue_chunk(counter, profile, block, &mut stats);
+                run_segqueue_chunk(counter, profile, block, &mut stats, local);
             }
         }
     }
+    std::hint::black_box(local.think_state);
     stats
+}
+
+/// Per-trial updater pacing: local work per update and stop-check interval.
+#[derive(Clone, Copy, Debug)]
+struct Pacing {
+    think_iters: u32,
+    update_chunk: usize,
 }
 
 fn run_trial(
@@ -856,6 +982,7 @@ fn run_trial(
     case: BenchmarkCase,
     profile: OrderingProfile,
     block: BlockConfig,
+    pacing: Pacing,
     duration: Duration,
     core_ids: &[core_affinity::CoreId],
 ) -> Result<Sample, String> {
@@ -886,12 +1013,17 @@ fn run_trial(
                     ready.wait();
                     start_gate.wait();
                     let started = *common_start.get().expect("benchmark start initialized");
+                    let local = UpdaterLocal::new(
+                        pacing.update_chunk,
+                        pacing.think_iters,
+                        thread_index as u64 + 1,
+                    );
                     let stats = match &**counter {
                         Counter::Word(counter) => {
-                            run_worker(counter, case.method, profile, block, &stop)
+                            run_worker(counter, case.method, profile, block, &stop, local)
                         }
                         Counter::Mixed(counter) => {
-                            run_worker(counter, case.method, profile, block, &stop)
+                            run_worker(counter, case.method, profile, block, &stop, local)
                         }
                     };
 
@@ -922,10 +1054,24 @@ fn run_trial(
         );
     }
 
-    let operations = outcomes
+    let operations: u64 = outcomes
         .iter()
         .map(|outcome| outcome.stats.operations)
         .sum();
+    let same_updater_updates: u64 = outcomes
+        .iter()
+        .map(|outcome| outcome.stats.same_updater_updates)
+        .sum();
+    let min_updater_operations = outcomes
+        .iter()
+        .map(|outcome| outcome.stats.operations)
+        .min()
+        .unwrap_or(0);
+    let max_updater_operations = outcomes
+        .iter()
+        .map(|outcome| outcome.stats.operations)
+        .max()
+        .unwrap_or(0);
     let cas_failures = outcomes
         .iter()
         .map(|outcome| outcome.stats.cas_failures)
@@ -1010,9 +1156,14 @@ fn run_trial(
         block_size: block.block_size,
         layout: case.layout,
         method: case.method,
+        think_iters: pacing.think_iters,
         operations,
         elapsed_ns,
         ops_per_sec: operations as f64 * 1_000_000_000.0 / elapsed_ns as f64,
+        same_updater_updates,
+        same_updater_fraction: same_updater_updates as f64 / operations as f64,
+        min_updater_share: min_updater_operations as f64 / operations as f64,
+        max_updater_share: max_updater_operations as f64 / operations as f64,
         cas_failures,
         cas_attempts_per_update: case
             .method
@@ -1128,6 +1279,10 @@ fn run(args: Args) -> Result<(), String> {
     if args.max_updaters == Some(0) {
         return Err("--max-updaters must be greater than zero".to_string());
     }
+    if args.update_chunk == 0 {
+        return Err("--update-chunk must be greater than zero".to_string());
+    }
+    let think_levels = normalize_think_iters(&args.think_iters)?;
     let block_sizes = normalize_block_sizes(&args.block_sizes)?;
     let blocks = block_sizes
         .iter()
@@ -1192,6 +1347,15 @@ fn run(args: Args) -> Result<(), String> {
         args.alignment
     );
     println!("ordering: {}", args.ordering.name());
+    println!(
+        "think iterations per update: {}; stop check every {} update(s)",
+        think_levels
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        args.update_chunk
+    );
     println!("AtomicU128 lock-free: yes");
     println!(
         "sample timing: {}ms warm-up + {}ms measured, {} repeat(s)",
@@ -1207,10 +1371,21 @@ fn run(args: Args) -> Result<(), String> {
 
     let measured_duration = Duration::from_millis(args.duration_ms);
     let warmup_duration = Duration::from_millis(args.warmup_ms);
-    let mut results = Vec::with_capacity(counts.len() * args.repeats * blocks.len() * CASES.len());
+    let think_iteration_ns = calibrate_think_iteration_ns();
+    println!("calibrated think iteration: {think_iteration_ns:.3} ns");
+    let mut results = Vec::with_capacity(
+        counts.len() * think_levels.len() * args.repeats * blocks.len() * CASES.len(),
+    );
 
     for &updaters in &counts {
-        for repeat_index in 1..=args.repeats {
+        for (&think_iters, repeat_index) in think_levels
+            .iter()
+            .flat_map(|think_iters| (1..=args.repeats).map(move |repeat| (think_iters, repeat)))
+        {
+            let pacing = Pacing {
+                think_iters,
+                update_chunk: args.update_chunk,
+            };
             for (block_position, block) in
                 block_order(&blocks, repeat_index).into_iter().enumerate()
             {
@@ -1221,6 +1396,7 @@ fn run(args: Args) -> Result<(), String> {
                             case,
                             args.ordering,
                             block,
+                            pacing,
                             warmup_duration,
                             &core_ids,
                         )?;
@@ -1230,19 +1406,23 @@ fn run(args: Args) -> Result<(), String> {
                         case,
                         args.ordering,
                         block,
+                        pacing,
                         measured_duration,
                         &core_ids,
                     )?;
                     sample.repeat_index = repeat_index;
                     println!(
-                        "{:>3} updater(s) | repeat {:>2} | block {:>4} | {:>15} | \
-                         {:>11} | {:>11.3} Mops/s | wide loads/update {:>9}",
+                        "{:>3} updater(s) | think {:>5} | repeat {:>2} | block {:>4} | {:>15} | \
+                         {:>11} | {:>11.3} Mops/s | same updater {:>5.3} | \
+                         wide loads/update {:>9}",
                         updaters,
+                        think_iters,
                         repeat_index,
                         block.block_size,
                         case.layout.name(),
                         case.method.name().to_ascii_uppercase(),
                         sample.ops_per_sec / 1_000_000.0,
+                        sample.same_updater_fraction,
                         sample
                             .wide_loads_per_update
                             .map(|value| format!("{value:.6}"))
@@ -1283,7 +1463,9 @@ fn run(args: Args) -> Result<(), String> {
             warmup_ms: args.warmup_ms,
             repeats: args.repeats,
             ordering: args.ordering,
-            update_chunk: UPDATE_CHUNK,
+            update_chunk: args.update_chunk,
+            think_iters: think_levels,
+            think_iteration_ns,
             wide_atomic_lock_free: true,
             mixed_width_memory_model_supported: false,
         },
@@ -1356,6 +1538,7 @@ mod tests {
             let counter = Counter::new(case.layout, block);
             let mut stats = UpdateStats::default();
             let mut cache = CachedHead::default();
+            let local = &mut UpdaterLocal::new(UPDATE_CHUNK, 0, 1);
             match &counter {
                 Counter::Word(counter) => {
                     counter.initialize(Ordering::Relaxed, block, &mut cache, &mut stats);
@@ -1367,6 +1550,7 @@ mod tests {
                             block,
                             &mut cache,
                             &mut stats,
+                            local,
                         ),
                         UpdateMethod::Faa => run_faa_chunk(
                             counter,
@@ -1374,10 +1558,15 @@ mod tests {
                             block,
                             &mut cache,
                             &mut stats,
+                            local,
                         ),
-                        UpdateMethod::SegQueue => {
-                            run_segqueue_chunk(counter, OrderingProfile::Relaxed, block, &mut stats)
-                        }
+                        UpdateMethod::SegQueue => run_segqueue_chunk(
+                            counter,
+                            OrderingProfile::Relaxed,
+                            block,
+                            &mut stats,
+                            local,
+                        ),
                     }
                 }
                 Counter::Mixed(counter) => {
@@ -1390,6 +1579,7 @@ mod tests {
                             block,
                             &mut cache,
                             &mut stats,
+                            local,
                         ),
                         UpdateMethod::Faa => run_faa_chunk(
                             counter,
@@ -1397,14 +1587,22 @@ mod tests {
                             block,
                             &mut cache,
                             &mut stats,
+                            local,
                         ),
-                        UpdateMethod::SegQueue => {
-                            run_segqueue_chunk(counter, OrderingProfile::Relaxed, block, &mut stats)
-                        }
+                        UpdateMethod::SegQueue => run_segqueue_chunk(
+                            counter,
+                            OrderingProfile::Relaxed,
+                            block,
+                            &mut stats,
+                            local,
+                        ),
                     }
                 }
             }
             assert_eq!(stats.operations, UPDATE_CHUNK as u64);
+            // A lone updater succeeds itself on every update after its first,
+            // including across block boundaries.
+            assert_eq!(stats.same_updater_updates, UPDATE_CHUNK as u64 - 1);
             assert_eq!(
                 stats.boundary_stores,
                 UPDATE_CHUNK as u64 / u64::from(block.block_size)
@@ -1439,8 +1637,15 @@ mod tests {
         let block = BlockConfig::new(7, 64).unwrap();
         let counter = WordCounter::new(0);
         let mut stats = UpdateStats::default();
+        let mut local = UpdaterLocal::new(UPDATE_CHUNK, 0, 1);
 
-        run_segqueue_chunk(&counter, OrderingProfile::Relaxed, block, &mut stats);
+        run_segqueue_chunk(
+            &counter,
+            OrderingProfile::Relaxed,
+            block,
+            &mut stats,
+            &mut local,
+        );
 
         let final_position = counter.final_values().0;
         assert_eq!(
@@ -1466,5 +1671,113 @@ mod tests {
         assert_eq!(args.duration_ms, 500);
         assert_eq!(args.warmup_ms, 100);
         assert_eq!(args.repeats, 5);
+        assert_eq!(args.think_iters, vec![0]);
+        assert_eq!(args.update_chunk, UPDATE_CHUNK);
+    }
+
+    #[test]
+    fn think_levels_are_sorted_and_deduplicated() {
+        assert_eq!(
+            normalize_think_iters(&[128, 0, 32, 128]).unwrap(),
+            vec![0, 32, 128]
+        );
+        assert!(normalize_think_iters(&[]).is_err());
+    }
+
+    #[test]
+    fn think_work_is_deterministic_and_scales_with_iterations() {
+        assert_eq!(think(7, 0), 7);
+        assert_eq!(think(7, 64), think(think(7, 32), 32));
+        assert_ne!(think(7, 1), 7);
+        let mut local = UpdaterLocal::new(1, 16, 3);
+        let before = local.think_state;
+        assert_ne!(before, 0);
+        local.think();
+        assert_eq!(local.think_state, think(before, 16));
+        assert!(calibrate_think_iteration_ns() > 0.0);
+    }
+
+    #[test]
+    fn alternating_updaters_never_succeed_themselves() {
+        let block = BlockConfig::new(7, 64).unwrap();
+        const ROUNDS: u64 = 500;
+        for method in [
+            UpdateMethod::Cas,
+            UpdateMethod::CasBackoff,
+            UpdateMethod::Faa,
+            UpdateMethod::SegQueue,
+        ] {
+            let counter = WordCounter::new(0);
+            let mut stats = [UpdateStats::default(), UpdateStats::default()];
+            let mut caches = [CachedHead::default(), CachedHead::default()];
+            // One update per chunk lets two logical updaters strictly alternate.
+            let mut locals = [UpdaterLocal::new(1, 0, 1), UpdaterLocal::new(1, 0, 2)];
+            for _ in 0..ROUNDS {
+                for updater in 0..2 {
+                    let (cache, stats, local) = (
+                        &mut caches[updater],
+                        &mut stats[updater],
+                        &mut locals[updater],
+                    );
+                    match method {
+                        UpdateMethod::Cas | UpdateMethod::CasBackoff => run_cas_chunk(
+                            &counter,
+                            method,
+                            OrderingProfile::Relaxed,
+                            block,
+                            cache,
+                            stats,
+                            local,
+                        ),
+                        UpdateMethod::Faa => run_faa_chunk(
+                            &counter,
+                            OrderingProfile::Relaxed,
+                            block,
+                            cache,
+                            stats,
+                            local,
+                        ),
+                        UpdateMethod::SegQueue => run_segqueue_chunk(
+                            &counter,
+                            OrderingProfile::Relaxed,
+                            block,
+                            stats,
+                            local,
+                        ),
+                    }
+                }
+            }
+            for stats in &stats {
+                assert_eq!(stats.operations, ROUNDS);
+                assert_eq!(stats.same_updater_updates, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn trial_reports_think_level_and_updater_shares() {
+        let block = BlockConfig::new(31, 4096).unwrap();
+        let pacing = Pacing {
+            think_iters: 8,
+            update_chunk: 16,
+        };
+        let sample = run_trial(
+            1,
+            BenchmarkCase {
+                layout: CounterLayout::U64,
+                method: UpdateMethod::Faa,
+            },
+            OrderingProfile::Ubq,
+            block,
+            pacing,
+            Duration::from_millis(5),
+            &[],
+        )
+        .expect("single-updater trial");
+        assert_eq!(sample.think_iters, 8);
+        assert!(sample.operations >= 16);
+        assert_eq!(sample.same_updater_updates, sample.operations - 1);
+        assert_eq!(sample.min_updater_share, 1.0);
+        assert_eq!(sample.max_updater_share, 1.0);
     }
 }

@@ -11,7 +11,9 @@ from pathlib import Path
 
 
 BENCHMARK_NAME = "atomic_updates"
-SCHEMA_VERSION = 3
+# v4 adds per-sample think_iters and same-updater fairness fields; a v3 sample
+# is a zero-think sample.
+SCHEMA_VERSIONS = (3, 4)
 LAYOUTS = ("u64", "mixed_u128_u64")
 METHODS = ("cas", "cas_backoff", "faa", "segqueue")
 CAS_METHODS = ("cas", "cas_backoff", "segqueue")
@@ -72,7 +74,7 @@ def collect_jsons(paths, runs_dirs):
     return sorted(files)
 
 
-def load_samples(path):
+def load_samples(path, think_iters=0):
     try:
         with Path(path).open(encoding="utf-8") as stream:
             data = json.load(stream)
@@ -82,7 +84,7 @@ def load_samples(path):
 
     if (
         data.get("benchmark") != BENCHMARK_NAME
-        or data.get("schema_version") not in (SCHEMA_VERSION, str(SCHEMA_VERSION))
+        or str(data.get("schema_version")) not in {str(v) for v in SCHEMA_VERSIONS}
     ):
         return []
 
@@ -108,7 +110,10 @@ def load_samples(path):
             ops_per_sec = float(result["ops_per_sec"])
             cas_failures = int(result.get("cas_failures", 0))
             wide_loads = int(result.get("wide_loads", 0))
+            sample_think_iters = int(result.get("think_iters", 0))
         except (KeyError, TypeError, ValueError):
+            continue
+        if sample_think_iters != think_iters:
             continue
         if (
             block_size <= 0
@@ -610,6 +615,16 @@ def main():
         default="sem",
         help="Error bar statistic (default: sem)",
     )
+    parser.add_argument(
+        "--think-iters",
+        type=int,
+        default=0,
+        help=(
+            "Plot only samples measured with this many think iterations per "
+            "update (default: 0, the zero-work loop; nonzero levels are "
+            "written to atomic_updates/think_<n>)"
+        ),
+    )
     args = parser.parse_args()
 
     files = collect_jsons(args.files, args.runs_dir)
@@ -617,9 +632,12 @@ def main():
         parser.error("provide JSON files or at least one --runs-dir")
     samples = []
     for path in files:
-        samples.extend(load_samples(path))
+        samples.extend(load_samples(path, args.think_iters))
     if not samples:
-        print("No schema-v3 atomic update benchmark samples found.")
+        print(
+            "No schema-v3/v4 atomic update benchmark samples found "
+            f"for think level {args.think_iters}."
+        )
         return 1
 
     aggregated = aggregate(samples)
@@ -635,6 +653,8 @@ def main():
 
     for machine in sorted(aggregated):
         machine_dir = out_root / machine / "atomic_updates"
+        if args.think_iters:
+            machine_dir = machine_dir / f"think_{args.think_iters}"
         machine_dir.mkdir(parents=True, exist_ok=True)
         samples_csv = machine_dir / "atomic_updates.csv"
         winners_csv = machine_dir / "atomic_update_winners.csv"
