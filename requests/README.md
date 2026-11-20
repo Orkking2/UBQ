@@ -1,80 +1,45 @@
 # Benchmark requests for BSC
 
-These files ask an agent with a shell on BSC's login nodes to run a benchmark lab on Grace and MareNostrum 5, and to send the results back. Nicolas, the author of UBQ, wrote them for Guillem, who runs them under his own account. The agent that runs them is a Claude Code session, so each request is written for it: read the whole file, run what it says, and stop when something fails rather than improvising.
+These files ask an agent with a shell on BSC's login nodes to run benchmarks on Grace and MareNostrum 5, and to send the results back. Nicolas, the author of UBQ, wrote them for Guillem, who runs them under his own account. The agent that runs them is a Claude Code session, so each request is written for it.
 
-**This directory holds one request: `2026-11-10-step-overhead.md`.** It is a short diagnosis on debug nodes, and it ends the request of 2026-10-30: its step 2 archives everything that request's runs have finished, then cancels the rest. Launch nothing from earlier requests. The description of the lab below is the earlier request's; this request uses its directory, `$ROOT` on `/gpfs/projects`, and changes nothing in it.
+**This directory holds one request: `2026-11-20-v11-focused.md`.** It measures v11, the newest version of Nicolas's queue, in two jobs per cluster. It ends the request of 2026-10-30, whose remaining runs on Grace are no longer needed: its step 0 cancels them and archives what they finished. It replaces the request of 2026-11-10 (a diagnosis of the step overhead), whose question it carries as an optional last step. Launch nothing from earlier requests.
 
 ## What is being measured
 
-UBQ is an unbounded multi-producer, multi-consumer FIFO queue (this repository). The request measures it, in several configurations, against other strict FIFO queues on two machines, for a paper.
+UBQ is a family of multi-producer, multi-consumer FIFO queues (this repository). v11 is version 11 of UBQ, the newest, meant to take the place of the earlier versions if it proves better: producers reserve with one fetch-and-add, a queue is built for a capacity but holds memory only for what is in it, and blocks it is done with can be given back to the system. The request asks four questions, one plan each: whether v11 delivers every element exactly once on these machines; where its throughput stands beside other strict FIFO queues; what moves v11 itself (the batch size, the block length, and what its own counters say); and what each queue holds in memory.
 
-One run measures one queue over a fixed matrix: 23 producer/consumer shapes, several batch sizes and four item sizes, three replicates each, every cell on an exclusive node. Every cell also checks that each item is delivered exactly once. A memory section records what each queue holds at seven element sizes. A second stage then profiles chosen cells with `perf` and, on Grace, Arm Performix. The lab's own documentation is `lab/README.md` in this repository.
+## How this request runs
 
-## The lab on the cluster side
-
-Everything the cluster needs ships in a bundle, extracted into a directory of the agent's own on the shared scratch, called `$ROOT` below:
+It does not use the lab of the earlier requests (`runs/<id>/tool/ab.py`). It has a kit of four files:
 
 ```text
 $ROOT/
-  vendor/<hash>/        the crate's vendored dependencies (builds are offline)
-  sources/<hash>/       the frozen source of the crate; its `vendor` entry links to the above
-  runs/<id>/run.json    one run's complete specification, arms, and cluster settings
-  runs/<id>/tool/       the lab's cluster-side code: standard-library Python 3.9, nothing to install
-  builds/<cluster>/     written by the build job: one runner binary per source and feature set
-  cache/<cluster>/      the Cargo target directory of the builds
+  bundle.tar.gz         the frozen source of the crate, its vendored dependencies, and the kit
+  kit/job.sh            the one job script: `run <cluster> <root> <rep>` does everything in one job
+  kit/make_plans.py     writes the plans on the node, from the node's own cores
+  kit/drive.py          runs one plan, a trial at a time, on the node's own disk
+  kit/summarize.py      tables from the result files
+  builds/<cluster>/     the runner binary, stored under its hash, and build.json, which names it
+  results/<cluster>/    one result file per plan and job: a JSON line per trial
+  logs/<cluster>/       each job's log, and a directory per job (node.txt, probe.tsv, the plans as run)
 ```
 
-One command per run and cluster launches it:
+A job has a node to itself. If no job has built the runner for its cluster yet, it builds it on the node, tests it and runs a smoke test; then it runs the four plans in order. It keeps everything a trial touches on the node's own disk (`$TMPDIR`), and writes to GPFS between trials only: one result file, copied and renamed into place. A job cut short by its time limit is submitted again and continues from its result files. A trial that has not ended after 180 s is killed and recorded; a cell two of whose trials were killed is not run again in that job, and its other trials are recorded as `not run`.
 
-```sh
-python3 $ROOT/runs/<id>/tool/ab.py remote deploy $ROOT/runs/<id> grace   # on grace1.bsc.es
-python3 $ROOT/runs/<id>/tool/ab.py remote deploy $ROOT/runs/<id> mn5     # on glogin1.bsc.es
-```
+A **plan** is a list of cells (a queue, a shape such as `16p16c` for sixteen producers and sixteen consumers, a batch size, a delay) and a number of trials. Every (cell, trial) pair is one run of the runner binary, of about a second, in a shuffled order. The shapes are computed on the node: `S` is the cores of one socket and `N` those of both.
 
-It writes `$ROOT/runs/<id>/<cluster>/` (`plan.json`, `state.json`, `logs/`, later `tasks/`), submits the build job with `sbatch`, and prints one JSON line of status. After that the run advances itself: every job that ends submits what comes next, and a one-core watchdog job follows each array. Deploying a run cancels any older, unfinished run of the same queue on that cluster.
-
-To see where a run stands, or to push it along after a quota refusal:
-
-```sh
-python3 $ROOT/runs/<id>/tool/ab.py remote advance $ROOT/runs/<id>/<cluster>
-```
-
-The reply names the phase, counts the tasks by status, lists failures, and repeats the latest notes. The phase is one of:
-- `building`;
-- `measuring` (stage 1);
-- `deep` (stage 2, the profiling);
-- `done`;
-- `failed`, `superseded` or `cancelled`.
-
-Two more commands take the same argument:
-- `remote cancel` cancels a run's jobs.
-- `remote retry` gives every failed task of the run one more attempt. Each task already has one automatic retry; `remote retry` is the only other one.
-
-The jobs are submitted with the account, partition, QOS and node constraint written in `run.json` under `config.clusters.<cluster>`:
-- account `bsc18`;
-- partitions `ngpp` (Grace) and `gpp` (MareNostrum 5);
-- QOS `ngp_bsccs` and `gp_bsccs` for measurements, `ngp_debug` and `gp_debug` for the build;
-- the node constraint `perfparanoid`, which gives nodes where `perf` runs unprivileged.
-
-If `sacctmgr show assoc user=$USER format=account,partition,qos -P` shows other values for your account, change those fields in each `run.json` before launching; nothing else in `run.json` should change. MareNostrum 5's task time limits are three times Grace's (`time_factor` in its cluster settings), because its processes started up to a minute late in October.
+The jobs are submitted with account `bsc18` and partitions `ngpp` (Grace) and `gpp` (MareNostrum 5). The measurement QOS are `ngp_bsccs` and `gp_bsccs`; the request tries the debug QOS (`ngp_debug`, `gp_debug`) for one of the two jobs, because its queue is short. If `sacctmgr show assoc user=$USER format=account,partition,qos -P` shows other values for your account, use those.
 
 ## What comes back
 
-For every run and cluster, one archive of the cluster directory without the raw profiler captures:
-
-```sh
-cd $ROOT/runs/<id>
-tar czf ~/<id>-<cluster>.tar.gz --exclude='perf.data*' --exclude=lock --exclude='.*.tmp' <cluster>
-sha256sum ~/<id>-<cluster>.tar.gz
-```
-
-The archives go in one zip, sent to Nicolas through Guillem over Zulip, with the status replies and the checksums in the message. The results are JSON and logs, tens of megabytes per run. Back on Nicolas's machine the archives drop into the lab and produce the reports and figures.
+One zip, sent to Nicolas through Guillem over Zulip: the result files, the logs, the kit as it was run, and the archives of the earlier request's runs. Megabytes, not gigabytes.
 
 ## Rules for the agent
 
-- **Reply once per request, when the request is complete**, as the request defines it. Send no progress messages and no partial results.
-- Run the commands as written, in order. Do not change `tool/`, `sources/`, `vendor/` or `run.json`, except the account and QOS fields named above.
-- Do not delete, move or change anything under `/gpfs/scratch/bsc18/bsc614227/` or `/gpfs/projects/bsc18/bsc614227/`, Nicolas's former directories.
-- If a command of the request itself fails, stop there and report it in the one reply. A queue that crashes, hangs or miscounts inside a measurement is a result the lab records, not a failure of the request.
-- Builds happen inside a Slurm job (the job script loads the `gcc` and `rust` modules); nothing is compiled on a login node.
-- Scratch may be purged, so copy each archive to `$HOME` as soon as its run is done, and send them all together at the end.
+- **Reply once, when the request is complete on both clusters.** Send no progress messages and no partial results. Message earlier only if something stops the request and you cannot repair it.
+- **Repair the machinery, not the measurement.** The request says what you may change (the kit's handling of files, directories, modules and the scheduler) and what you may not (the source, the binary, and what is measured). Record every change.
+- **Get the jobs started by whatever QOS starts them soonest** among those your account may use for a one-node job of two hours or less. Nicolas needs the results before December 7.
+- A queue that crashes, hangs or miscounts inside a trial is a result, not a failure of the request.
+- Do not delete, move or change anything under `/gpfs/scratch/bsc18/bsc614227/` or `/gpfs/projects/bsc18/bsc614227/`, Nicolas's former directories, or under the earlier request's directory beyond what step 0 says.
+- Builds happen inside a Slurm job; nothing is compiled on a login node.
+- Copy the final zip to `$HOME` before you send it; scratch may be purged.
